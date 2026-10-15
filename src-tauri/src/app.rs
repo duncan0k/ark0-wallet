@@ -16,11 +16,14 @@ use crate::vault::{self, VaultError};
 use crate::wallet::{self, Account, Amount, Plan, PlanError, SignError, FEE_RATE};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
+use std::future::{poll_fn, Future};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::task::Poll;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager, State};
+use tokio::sync::watch;
 use zeroize::Zeroizing;
 
 pub const EXPLORER: &str = "https://explorer.ark0.si";
@@ -164,6 +167,8 @@ pub struct AppState {
     /// Counts locks. Work that began before a lock (an unlock's key derivation, a send waiting on the
     /// network or the user) neither opens a session nor signs after it.
     generation: AtomicU64,
+    /// Wakes every sensitive command waiting for a system dialog when the wallet locks.
+    locked: watch::Sender<()>,
     /// Kept open until shutdown; the lock file itself is never removed or replaced.
     _wallet_lock: std::fs::File,
 }
@@ -183,6 +188,7 @@ impl AppState {
             vault_ops: Mutex::new(()),
             sent_ops: Mutex::new(()),
             generation: AtomicU64::new(0),
+            locked: watch::channel(()).0,
             _wallet_lock: wallet_lock,
         };
         // The startup migration goes through the size check too; when the record does not fit, the readable file stays as it was.
@@ -214,13 +220,17 @@ impl AppState {
     }
 
     fn lock(&self) {
+        // Serialize locking with the final session check and mutation of a confirmed wallet change.
+        let mut session = guard(&self.session);
         self.generation.fetch_add(1, Ordering::SeqCst);
-        *guard(&self.session) = None;
+        self.locked.send_replace(());
+        *session = None;
+        drop(session);
         *guard(&self.pending) = None;
         self.cancel_new_wallet();
     }
 
-    fn cancel_new_wallet(&self) {
+    pub(crate) fn cancel_new_wallet(&self) {
         *guard(&self.new_wallet) = None;
     }
 
@@ -431,7 +441,7 @@ pub async fn reveal_recovery(app: AppHandle, state: State<'_, AppState>, passwor
     reveal_secret(&state, password, locale.as_deref(), |dialog| crate::confirm::ask(&app, dialog)).await
 }
 
-async fn reveal_secret<F: std::future::Future<Output = bool>>(
+async fn reveal_secret<F: Future<Output = bool>>(
     state: &AppState,
     password: String,
     locale: Option<&str>,
@@ -443,12 +453,8 @@ async fn reveal_secret<F: std::future::Future<Output = bool>>(
         return Err(Failure::new("locked"));
     }
     let secret = vault::open(&state.vault_path(), &password)?;
-    if state.generation() != generation || !state.unlocked() {
-        return Err(Failure::new("locked"));
-    }
-    if !ask(crate::confirm::recovery(state.dialog_locale(locale), secret.is_legacy())).await {
-        return Err(Failure::new("cancelled"));
-    }
+    drop(password);
+    confirm_unlocked(state, generation, crate::confirm::recovery(state.dialog_locale(locale), secret.is_legacy()), ask).await?;
     let session = guard(&state.session);
     if session.is_none() || state.generation() != generation {
         return Err(Failure::new("locked"));
@@ -456,26 +462,99 @@ async fn reveal_secret<F: std::future::Future<Output = bool>>(
     Ok(secret.recovery_text().to_string())
 }
 
-#[tauri::command(async)]
-pub fn change_password(state: State<'_, AppState>, old: String, new: String) -> Res<()> {
+/// A lock ends the request without waiting for the native dialog's answer. The dialog owns no secrets;
+/// dropping its future leaves any later answer with no command to authorize.
+async fn confirm_unlocked<F: Future<Output = bool>>(
+    state: &AppState,
+    generation: u64,
+    dialog: crate::confirm::Dialog,
+    ask: impl FnOnce(crate::confirm::Dialog) -> F,
+) -> Res<()> {
+    // Subscribe before checking the generation so that a lock cannot be missed between them.
+    let mut locked = state.locked.subscribe();
+    if state.generation() != generation || !state.unlocked() {
+        return Err(Failure::new("locked"));
+    }
+    let mut answer = std::pin::pin!(ask(dialog));
+    let mut changed = std::pin::pin!(locked.changed());
+    let confirmed = poll_fn(|cx| {
+        // Locking wins when both the lock and the dialog answer are ready.
+        if changed.as_mut().poll(cx).is_ready() || state.generation() != generation {
+            return Poll::Ready(Err(Failure::new("locked")));
+        }
+        answer.as_mut().poll(cx).map(Ok)
+    }).await?;
+    if state.generation() != generation || !state.unlocked() {
+        return Err(Failure::new("locked"));
+    }
+    if !confirmed {
+        return Err(Failure::new("cancelled"));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn change_password(app: AppHandle, state: State<'_, AppState>, old: String, new: String, locale: Option<String>) -> Res<()> {
+    change_wallet_password(&state, old, new, locale.as_deref(), |dialog| crate::confirm::ask(&app, dialog)).await
+}
+
+async fn change_wallet_password<F: Future<Output = bool>>(
+    state: &AppState,
+    old: String,
+    new: String,
+    locale: Option<&str>,
+    ask: impl FnOnce(crate::confirm::Dialog) -> F,
+) -> Res<()> {
     let (old, new) = (Zeroizing::new(old), Zeroizing::new(new));
+    let generation = state.generation();
+    if !state.unlocked() {
+        return Err(Failure::new("locked"));
+    }
+    // Check the password before asking, and drop the decrypted secret immediately.
+    vault::open(&state.vault_path(), &old)?;
+    confirm_unlocked(state, generation, crate::confirm::password_change(state.dialog_locale(locale)), ask).await?;
     let _one_at_a_time = guard(&state.vault_ops);
+    let session = guard(&state.session);
+    if session.is_none() || state.generation() != generation {
+        return Err(Failure::new("locked"));
+    }
     Ok(vault::change_password(&state.vault_path(), &old, &new)?)
 }
 
 /// Removes the wallet from this device: the vault and the record of sent transactions.
-#[tauri::command(async)]
-pub fn delete_wallet(state: State<'_, AppState>, password: String) -> Res<Status> {
+#[tauri::command]
+pub async fn delete_wallet(app: AppHandle, state: State<'_, AppState>, password: String, locale: Option<String>) -> Res<Status> {
+    remove_wallet(&state, password, locale.as_deref(), |dialog| crate::confirm::ask(&app, dialog)).await?;
+    Ok(wallet_status(state))
+}
+
+async fn remove_wallet<F: Future<Output = bool>>(
+    state: &AppState,
+    password: String,
+    locale: Option<&str>,
+    ask: impl FnOnce(crate::confirm::Dialog) -> F,
+) -> Res<()> {
     let password = Zeroizing::new(password);
+    let generation = state.generation();
+    if !state.unlocked() {
+        return Err(Failure::new("locked"));
+    }
+    vault::open(&state.vault_path(), &password)?;
+    confirm_unlocked(state, generation, crate::confirm::removal(state.dialog_locale(locale)), ask).await?;
     {
         let _one_at_a_time = guard(&state.vault_ops);
+        let session = guard(&state.session);
+        if session.is_none() || state.generation() != generation {
+            return Err(Failure::new("locked"));
+        }
         vault::delete(&state.vault_path(), &password)?;
+        drop(session);
         // Locked before the record goes, so that no send begun earlier records into a fresh one.
         state.lock();
         let _sent = guard(&state.sent_ops);
         let _ = std::fs::remove_file(state.sent_path());
     }
-    Ok(wallet_status(state))
+    Ok(())
 }
 
 /// For a forgotten password: removes the wallet without it, only while it is locked, and only after the
@@ -1363,6 +1442,150 @@ mod tests {
                 std::future::ready(true)
             }));
             assert_eq!(locked.unwrap_err().code, "locked");
+            std::fs::remove_dir_all(&state.dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn deletion_requires_password_native_confirmation_and_an_uninterrupted_session() {
+        let state = test_state("delete-confirm");
+        let secret = Secret::new_bip39().unwrap();
+        vault::create(&state.vault_path(), "correct horse", &secret).unwrap();
+        std::fs::write(state.sent_path(), b"[]").unwrap();
+        let original = std::fs::read(state.vault_path()).unwrap();
+        let remove = |password: &str, confirmed| {
+            tauri::async_runtime::block_on(remove_wallet(&state, password.into(), Some("en"), |_| std::future::ready(confirmed)))
+        };
+        let locked = tauri::async_runtime::block_on(remove_wallet(&state, "correct horse".into(), Some("en"), |_| async {
+            panic!("a locked wallet must not open a dialog")
+        }));
+        assert_eq!(locked.unwrap_err().code, "locked");
+        state.open_session(&secret, state.generation()).unwrap();
+        let wrong = tauri::async_runtime::block_on(remove_wallet(&state, "wrong password".into(), Some("en"), |_| async {
+            panic!("a wrong password must not open a dialog")
+        }));
+        assert_eq!(wrong.unwrap_err().code, "wrong_password");
+        assert_eq!(remove("correct horse", false).unwrap_err().code, "cancelled");
+        assert_eq!(std::fs::read(state.vault_path()).unwrap(), original);
+        assert!(state.unlocked());
+        assert_eq!(std::fs::read(state.sent_path()).unwrap(), b"[]");
+        let relocked = tauri::async_runtime::block_on(remove_wallet(&state, "correct horse".into(), Some("en"), |_| {
+            state.lock();
+            state.open_session(&secret, state.generation()).unwrap();
+            std::future::ready(true)
+        }));
+        assert_eq!(relocked.unwrap_err().code, "locked");
+        assert_eq!(std::fs::read(state.vault_path()).unwrap(), original);
+        assert!(state.sent_path().is_file());
+        remove("correct horse", true).unwrap();
+        assert!(!vault::exists(&state.vault_path()));
+        assert!(!state.sent_path().exists());
+        assert!(!state.unlocked());
+        std::fs::remove_dir_all(&state.dir).unwrap();
+    }
+
+    #[test]
+    fn password_changes_require_password_native_confirmation_and_an_uninterrupted_session() {
+        let state = test_state("password-confirm");
+        let secret = Secret::new_bip39().unwrap();
+        vault::create(&state.vault_path(), "correct horse", &secret).unwrap();
+        std::fs::write(state.sent_path(), b"[]").unwrap();
+        let original = std::fs::read(state.vault_path()).unwrap();
+        let change = |password: &str, confirmed| {
+            tauri::async_runtime::block_on(change_wallet_password(&state, password.into(), "battery staple".into(), Some("en"), |_| std::future::ready(confirmed)))
+        };
+        let locked = tauri::async_runtime::block_on(change_wallet_password(&state, "correct horse".into(), "battery staple".into(), Some("en"), |_| async {
+            panic!("a locked wallet must not open a dialog")
+        }));
+        assert_eq!(locked.unwrap_err().code, "locked");
+        state.open_session(&secret, state.generation()).unwrap();
+        let wrong = tauri::async_runtime::block_on(change_wallet_password(&state, "wrong password".into(), "battery staple".into(), Some("en"), |_| async {
+            panic!("a wrong password must not open a dialog")
+        }));
+        assert_eq!(wrong.unwrap_err().code, "wrong_password");
+        assert_eq!(change("correct horse", false).unwrap_err().code, "cancelled");
+        assert_eq!(std::fs::read(state.vault_path()).unwrap(), original);
+        let relocked = tauri::async_runtime::block_on(change_wallet_password(&state, "correct horse".into(), "battery staple".into(), Some("en"), |_| {
+            state.lock();
+            state.open_session(&secret, state.generation()).unwrap();
+            std::future::ready(true)
+        }));
+        assert_eq!(relocked.unwrap_err().code, "locked");
+        assert_eq!(std::fs::read(state.vault_path()).unwrap(), original);
+        change("correct horse", true).unwrap();
+        assert!(state.unlocked());
+        assert_eq!(vault::open(&state.vault_path(), "correct horse").err(), Some(VaultError::WrongPassword));
+        assert_eq!(vault::open(&state.vault_path(), "battery staple").unwrap().recovery_text(), secret.recovery_text());
+        assert_eq!(std::fs::read(state.sent_path()).unwrap(), b"[]");
+        std::fs::remove_dir_all(&state.dir).unwrap();
+    }
+
+    #[test]
+    fn locking_wakes_all_waiting_sensitive_requests_and_discards_late_answers() {
+        use std::sync::atomic::AtomicUsize;
+        use std::task::{Context, Wake, Waker};
+        use tokio::sync::oneshot;
+
+        struct Wakes(AtomicUsize);
+        impl Wake for Wakes {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        for legacy in [false, true] {
+            let state = test_state("lock-dialogs");
+            let secret = if legacy {
+                Secret::Legacy { seed: crate::keys::SecretBytes(Zeroizing::new([7; 32])) }
+            } else {
+                Secret::new_bip39().unwrap()
+            };
+            vault::create(&state.vault_path(), "correct horse", &secret).unwrap();
+            state.open_session(&secret, state.generation()).unwrap();
+            std::fs::write(state.sent_path(), b"[]").unwrap();
+            let original = std::fs::read(state.vault_path()).unwrap();
+            let (recovery_answer, recovery_wait) = oneshot::channel();
+            let (delete_answer, delete_wait) = oneshot::channel();
+            let (password_answer, password_wait) = oneshot::channel();
+            let recovery_wakes = Arc::new(Wakes(AtomicUsize::new(0)));
+            let delete_wakes = Arc::new(Wakes(AtomicUsize::new(0)));
+            let password_wakes = Arc::new(Wakes(AtomicUsize::new(0)));
+            let recovery_waker = Waker::from(recovery_wakes.clone());
+            let delete_waker = Waker::from(delete_wakes.clone());
+            let password_waker = Waker::from(password_wakes.clone());
+            let mut recovery = std::pin::pin!(reveal_secret(&state, "correct horse".into(), Some("en"), |_| async move {
+                recovery_wait.await.unwrap_or(false)
+            }));
+            let mut delete = std::pin::pin!(remove_wallet(&state, "correct horse".into(), Some("en"), |_| async move {
+                delete_wait.await.unwrap_or(false)
+            }));
+            let mut password = std::pin::pin!(change_wallet_password(&state, "correct horse".into(), "battery staple".into(), Some("en"), |_| async move {
+                password_wait.await.unwrap_or(false)
+            }));
+            assert!(recovery.as_mut().poll(&mut Context::from_waker(&recovery_waker)).is_pending());
+            assert!(delete.as_mut().poll(&mut Context::from_waker(&delete_waker)).is_pending());
+            assert!(password.as_mut().poll(&mut Context::from_waker(&password_waker)).is_pending());
+            state.lock();
+            for wakes in [&recovery_wakes, &delete_wakes, &password_wakes] {
+                assert!(wakes.0.load(Ordering::SeqCst) > 0, "locking must wake each request without a dialog answer");
+            }
+            // Reopening the wallet does not revive any of the earlier requests.
+            state.open_session(&secret, state.generation()).unwrap();
+            for result in [
+                recovery.as_mut().poll(&mut Context::from_waker(&recovery_waker)).map(|r| r.map(|_| ())),
+                delete.as_mut().poll(&mut Context::from_waker(&delete_waker)),
+                password.as_mut().poll(&mut Context::from_waker(&password_waker)),
+            ] {
+                match result {
+                    Poll::Ready(Err(error)) => assert_eq!(error.code, "locked"),
+                    _ => panic!("locking must end every request before its dialog is answered"),
+                }
+            }
+            assert!(recovery_answer.send(true).is_err());
+            assert!(delete_answer.send(true).is_err());
+            assert!(password_answer.send(true).is_err());
+            assert_eq!(std::fs::read(state.vault_path()).unwrap(), original);
+            assert_eq!(std::fs::read(state.sent_path()).unwrap(), b"[]");
             std::fs::remove_dir_all(&state.dir).unwrap();
         }
     }

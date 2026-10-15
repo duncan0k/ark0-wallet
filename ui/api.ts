@@ -118,8 +118,8 @@ export const core = {
   lock: () => invoke<void>('lock'),
   touch: () => invoke<void>('touch'),
   revealRecovery: (password: string, locale: string) => invoke<string>('reveal_recovery', { password, locale }),
-  changePassword: (old: string, next: string) => invoke<void>('change_password', { old, new: next }),
-  deleteWallet: (password: string) => invoke<Status>('delete_wallet', { password }),
+  changePassword: (old: string, next: string, locale: string) => invoke<void>('change_password', { old, new: next, locale }),
+  deleteWallet: (password: string, locale: string) => invoke<Status>('delete_wallet', { password, locale }),
   // The core asks the user in a system dialog first, in this language when the setting follows the system.
   forgetWallet: (locale: string) => invoke<Status>('forget_wallet', { locale }),
   overview: () => invoke<Overview>('overview'),

@@ -17,6 +17,7 @@ cc = "=1.5.1"
 
 [dependencies]
 tauri = { version = "=2.12.1", features = [] }
+tokio = { version = "=1.53.3", default-features = false, features = ["sync"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 # libsecp256k1 (Bitcoin Core's library) for BIP-340 Schnorr.

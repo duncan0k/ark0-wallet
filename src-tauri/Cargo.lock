@@ -614,6 +614,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-dialog",
  "tauri-plugin-opener",
+ "tokio",
  "webpki-roots",
  "windows-sys 0.61.2",
  "zeroize",

@@ -1,5 +1,6 @@
 //! Confirmations in a dialog of the operating system, outside the web view: what the web view cannot
-//! answer for the user. A payment is signed, and a wallet removed without its password, only after one.
+//! answer for the user. Signing, revealing recovery material, removing a wallet and changing its password
+//! require one.
 //! The wording is the core's own, in the interface's language, with the figures of the frozen plan.
 use crate::sources::Flags;
 use tauri::{AppHandle, Manager};
@@ -158,7 +159,7 @@ pub fn payment(locale: &str, send: u64, to: &str, fee: u64, change: u64, caution
     }
 }
 
-/// The confirmation of removing a wallet whose password is forgotten.
+/// The confirmation of removing a wallet, with its password or when the password is forgotten.
 pub fn removal(locale: &str) -> Dialog {
     match locale {
         "zh-Hans" => Dialog {
@@ -177,6 +178,30 @@ pub fn removal(locale: &str) -> Dialog {
             title: "Remove the wallet from this device",
             body: "The wallet file on this device will be deleted. Only the recovery words or the backup code bring it back; without them, its coins are lost for good. Its record of payments goes too: a payment whose outcome is still unclear is no longer guarded against being paid twice.".into(),
             ok: "Remove",
+            cancel: "Cancel",
+        },
+    }
+}
+
+/// The confirmation of changing the password that opens this wallet on this device.
+pub fn password_change(locale: &str) -> Dialog {
+    match locale {
+        "zh-Hans" => Dialog {
+            title: "修改密码",
+            body: "从现在起，只有新密码能在这台设备上打开这个钱包，旧密码将不再有效。".into(),
+            ok: "修改",
+            cancel: "取消",
+        },
+        "zh-Hant" => Dialog {
+            title: "修改密碼",
+            body: "從現在起，只有新密碼能在這台裝置上開啟這個錢包，舊密碼將不再有效。".into(),
+            ok: "修改",
+            cancel: "取消",
+        },
+        _ => Dialog {
+            title: "Change the password",
+            body: "From now on only the new password will open this wallet on this device; the old one will no longer work.".into(),
+            ok: "Change",
             cancel: "Cancel",
         },
     }
@@ -201,6 +226,18 @@ pub async fn ask(app: &AppHandle, dialog: Dialog) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn password_change_dialogs_in_each_language() {
+        for (locale, title, body, ok, cancel) in [
+            ("en", "Change the password", "From now on only the new password will open this wallet on this device; the old one will no longer work.", "Change", "Cancel"),
+            ("zh-Hans", "修改密码", "从现在起，只有新密码能在这台设备上打开这个钱包，旧密码将不再有效。", "修改", "取消"),
+            ("zh-Hant", "修改密碼", "從現在起，只有新密碼能在這台裝置上開啟這個錢包，舊密碼將不再有效。", "修改", "取消"),
+        ] {
+            let dialog = password_change(locale);
+            assert_eq!((dialog.title, dialog.body.as_str(), dialog.ok, dialog.cancel), (title, body, ok, cancel));
+        }
+    }
 
     #[test]
     fn recovery_dialogs_name_the_secret_and_warn_in_each_language() {

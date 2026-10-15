@@ -15,6 +15,21 @@ mod wallet;
 
 use tauri::Manager;
 
+/// Mobile development uses Tauri's local proxy; only desktop development uses the dev server's origin.
+fn app_origin(dev_url: Option<&tauri::Url>, dev: bool, target_os: &str, use_https_scheme: bool) -> tauri::Url {
+    if dev && !matches!(target_os, "android" | "ios") {
+        if let Some(url) = dev_url {
+            return url.clone();
+        }
+    }
+    let local = if matches!(target_os, "windows" | "android") {
+        if use_https_scheme { "https://tauri.localhost" } else { "http://tauri.localhost" }
+    } else {
+        "tauri://localhost"
+    };
+    tauri::Url::parse(local).expect("the local app origin is a valid URL")
+}
+
 /// Compare the exact origin, including custom protocols, whose URL origins are otherwise opaque.
 fn navigation_allowed(origin: &tauri::Url, url: &tauri::Url) -> bool {
     url.scheme() == origin.scheme()
@@ -89,14 +104,14 @@ pub fn run() {
             app::start_idle_lock(app.handle().clone());
             // Build the window here so the restrictions are installed before its first page loads.
             let config = &app.config().app.windows[0];
-            let local = if cfg!(any(windows, target_os = "android")) {
-                if config.use_https_scheme { "https://tauri.localhost" } else { "http://tauri.localhost" }
-            } else {
-                "tauri://localhost"
-            };
-            let origin = app.config().build.dev_url.as_ref().filter(|_| tauri::is_dev()).cloned().unwrap_or(tauri::Url::parse(local)?);
+            let origin = app_origin(app.config().build.dev_url.as_ref(), tauri::is_dev(), std::env::consts::OS, config.use_https_scheme);
             tauri::WebviewWindowBuilder::from_config(app, config)?
                 .on_navigation(move |url| navigation_allowed(&origin, url))
+                .on_page_load(|window, payload| {
+                    if matches!(payload.event(), tauri::webview::PageLoadEvent::Started) {
+                        window.state::<app::AppState>().cancel_new_wallet();
+                    }
+                })
                 .on_new_window(|_, _| tauri::webview::NewWindowResponse::Deny)
                 .build()?;
             // On Android the self-test result goes to logcat as well, where the emulator test reads it.
@@ -142,6 +157,28 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn app_origin_matches_desktop_and_android_in_dev_and_release() {
+        let dev_url = tauri::Url::parse("http://localhost:1420").unwrap();
+        for target_os in ["windows", "linux", "macos", "android"] {
+            for dev in [false, true] {
+                for https in [false, true] {
+                    for configured_dev_url in [None, Some(&dev_url)] {
+                        let expected = if dev && target_os != "android" && configured_dev_url.is_some() {
+                            dev_url.as_str()
+                        } else if matches!(target_os, "windows" | "android") {
+                            if https { "https://tauri.localhost/" } else { "http://tauri.localhost/" }
+                        } else {
+                            "tauri://localhost"
+                        };
+                        assert_eq!(app_origin(configured_dev_url, dev, target_os, https), tauri::Url::parse(expected).unwrap(),
+                            "{target_os}, dev={dev}, https={https}, dev_url={configured_dev_url:?}");
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn navigation_stays_on_the_exact_app_origin() {

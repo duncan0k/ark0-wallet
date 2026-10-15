@@ -124,7 +124,7 @@ function PasswordDialog({ onClose }: { onClose: () => void }) {
     e.preventDefault();
     setBusy(true);
     try {
-      await core.changePassword(old, p1);
+      await core.changePassword(old, p1, locale());
       toast(m().settings.saved, 'good');
       onClose();
     } catch (err) {
@@ -153,7 +153,7 @@ function RemoveDialog({ onClose, onRemoved }: { onClose: () => void; onRemoved: 
     e.preventDefault();
     setBusy(true);
     try {
-      onRemoved(await core.deleteWallet(password));
+      onRemoved(await core.deleteWallet(password, locale()));
     } catch (err) {
       setError(errorText(codeOf(err)));
       setBusy(false);
