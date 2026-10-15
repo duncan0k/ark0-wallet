@@ -1011,6 +1011,10 @@ fn edit_sent<R>(state: &AppState, change: impl FnOnce(&mut Vec<Sent>) -> R) -> s
             prune(&mut sent, now());
             bytes = serde_json::to_vec_pretty(&sent)?;
         }
+        // Records that cannot be pruned may still fit without indentation.
+        if bytes.len() as u64 > store::MAX_FILE_BYTES {
+            bytes = serde_json::to_vec(&sent)?;
+        }
         // Never a file the wallet could not read back: the change is refused instead.
         if bytes.len() as u64 > store::MAX_FILE_BYTES {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "the record of payments is full"));
@@ -3021,6 +3025,48 @@ mod tests {
     }
 
     #[test]
+    fn lookup_marks_use_compact_json_only_when_pretty_json_does_not_fit() {
+        use crate::api::tests::{response, serve};
+
+        for count in [2, 8_000] {
+            let mut state = test_state("lookup-record-size");
+            // Mempool payments cannot be pruned, however old they are.
+            let mut records: Vec<Sent> = (0..count).map(|i| Sent {
+                txid: format!("{i:064x}"), outpoints: vec![format!("{i:064x}:0")], ..record('a', "mempool")
+            }).collect();
+            let mut legacy = serde_json::to_value(&records).unwrap();
+            for s in legacy.as_array_mut().unwrap() { s.as_object_mut().unwrap().remove("lookup_mark"); }
+            let original = serde_json::to_vec_pretty(&legacy).unwrap();
+            assert!(original.len() as u64 <= store::MAX_FILE_BYTES);
+            assert!(serde_json::to_vec(&records).unwrap().len() as u64 <= store::MAX_FILE_BYTES);
+            store::write_atomic(&state.sent_path(), &original).unwrap();
+            let replies = vec![response(200, r#"{"status":"mempool"}"#); 2];
+            let (a, first) = serve(replies.clone());
+            let (b, second) = serve(replies);
+            state.sources = Arc::new(Sources::new(a, b));
+            for started in 1..=2 {
+                let at = Instant::now();
+                let mut ticks = [at, at, at + LOOKUP_BUDGET + Duration::from_secs(1)].into_iter();
+                let sent = tauri::async_runtime::block_on(refresh_sent_with_clock(&state, |_| true, &mut Flags::default(), || ticks.next().unwrap()));
+                records[started - 1].lookup_mark = started as u64;
+                assert_eq!(sent, records);
+                assert_eq!(store::load_existing::<Vec<Sent>>(&state.sent_path()).unwrap(), records);
+                let pretty = serde_json::to_vec_pretty(&records).unwrap();
+                assert_eq!(pretty.len() as u64 > store::MAX_FILE_BYTES, count == 8_000);
+                let expected = if count == 8_000 { serde_json::to_vec(&records).unwrap() } else { pretty };
+                assert_eq!(std::fs::read(state.sent_path()).unwrap(), expected);
+            }
+            for requests in [first.join().unwrap(), second.join().unwrap()] {
+                assert_eq!(requests.len(), 2);
+                for (request, s) in requests.iter().zip(&records) {
+                    assert!(request.starts_with(&format!("GET /api/tx?txid={} ", s.txid)));
+                }
+            }
+            std::fs::remove_dir_all(&state.dir).unwrap();
+        }
+    }
+
+    #[test]
     fn lookup_order_survives_a_restart_and_older_records_load_without_marks() {
         use crate::api::tests::{response, serve};
 
@@ -3792,6 +3838,7 @@ mod tests {
         let state = AppState::new(dir.clone()).unwrap();
         let saved: Vec<Sent> = store::load_existing(&state.sent_path()).unwrap();
         assert!(std::fs::metadata(state.sent_path()).unwrap().len() <= PRUNE_ABOVE_BYTES as u64);
+        assert_eq!(std::fs::read(state.sent_path()).unwrap(), serde_json::to_vec_pretty(&saved).unwrap());
         assert!(saved.len() < records.len());
         let unproven = saved.iter().find(|s| s.txid == records[0].txid).unwrap();
         assert!(unproven.doubted && !unproven.proven());
@@ -3803,13 +3850,14 @@ mod tests {
     fn a_migration_that_cannot_fit_preserves_the_readable_original() {
         let mut old = serde_json::to_value(Sent { confirmations: 100, ..record('a', "confirmed") }).unwrap();
         old.as_object_mut().unwrap().remove("proof_verified");
-        let one = serde_json::to_vec_pretty(&vec![old.clone()]).unwrap().len();
-        let count = (store::MAX_FILE_BYTES as usize - 2) / (one - 2);
-        let original = serde_json::to_vec_pretty(&vec![old; count]).unwrap();
+        let one = serde_json::to_vec(&vec![old.clone()]).unwrap().len();
+        let count = (store::MAX_FILE_BYTES as usize - 1) / (one - 1);
+        let original = serde_json::to_vec(&vec![old; count]).unwrap();
         assert!(original.len() as u64 <= store::MAX_FILE_BYTES);
         let mut migrated: Vec<Sent> = serde_json::from_slice(&original).unwrap();
         for s in &mut migrated { prepare_record(s); }
         assert!(serde_json::to_vec_pretty(&migrated).unwrap().len() as u64 > store::MAX_FILE_BYTES);
+        assert!(serde_json::to_vec(&migrated).unwrap().len() as u64 > store::MAX_FILE_BYTES);
         let mut nonce = [0; 8];
         getrandom::fill(&mut nonce).unwrap();
         let dir = std::env::temp_dir().join(format!("pqw-full-migration-{}", hex::encode(nonce)));
