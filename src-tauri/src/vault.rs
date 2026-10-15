@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use zeroize::Zeroizing;
 
-const FORMAT: &str = "cipherscope-wallet-vault";
+const FORMAT: &str = "ark0-wallet-vault";
 const VERSION: u32 = 1;
 const MEMORY_KIB: u32 = 64 * 1024;
 const ITERATIONS: u32 = 3;

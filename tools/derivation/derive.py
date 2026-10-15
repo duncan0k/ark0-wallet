@@ -17,7 +17,7 @@ import json
 import struct
 
 CHALLENGE = "5121026fc5d8e79a9fbc8bc3dea07d82641d16717ce0b000c13c512d8e8c1788c6e5da51ae"
-SALT = b"CipherScope Wallet key derivation v1"
+SALT = b"ark0-wallet key derivation v1"
 CURVE_ORDER = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
 # Each template and the algorithms of its leaves.
 TEMPLATES = [("c0-schnorr", ["schnorr"]), ("c0-mldsa44", ["mldsa44"]), ("e0-hybrid", ["schnorr", "mldsa44"])]
@@ -47,7 +47,7 @@ def hkdf_sha512(ikm, salt, info_bytes, length):
 
 
 def key(seed, network, algorithm, template, attempt):
-    label = info([b"cipherscope-wallet", b"v1", network, algorithm.encode(), template.encode(),
+    label = info([b"ark0-wallet", b"v1", network, algorithm.encode(), template.encode(),
                   struct.pack(">I", 0), struct.pack(">I", 0), struct.pack(">I", 0), bytes([attempt])])
     return label, hkdf_sha512(seed, SALT, label, 32)
 

@@ -28,8 +28,8 @@ use zeroize::{Zeroize, Zeroizing};
 /// The signet challenge of Ark-0: a 1-of-1 multisig of its block signing key.
 pub const ARK0_CHALLENGE: &str = "5121026fc5d8e79a9fbc8bc3dea07d82641d16717ce0b000c13c512d8e8c1788c6e5da51ae";
 pub const WORDS: usize = 24;
-const HKDF_SALT: &[u8] = b"CipherScope Wallet key derivation v1";
-const LABEL_WALLET: &[u8] = b"cipherscope-wallet";
+const HKDF_SALT: &[u8] = b"ark0-wallet key derivation v1";
+const LABEL_WALLET: &[u8] = b"ark0-wallet";
 const LABEL_VERSION: &[u8] = b"v1";
 const LEGACY_SCHNORR_LABEL: &[u8] = b"ark0-wallet v1 schnorr";
 const LEGACY_MLDSA44_LABEL: &[u8] = b"ark0-wallet v1 mldsa44";
