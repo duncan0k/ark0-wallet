@@ -381,6 +381,8 @@ pub(crate) mod tests {
                         Err(e) => panic!("HTTP test did not receive its request: {e}"),
                     }
                 };
+                // On macOS an accepted socket inherits the listener's non-blocking mode; the reads below block.
+                socket.set_nonblocking(false).unwrap();
                 socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
                 let mut request = Vec::new();
                 while !request.ends_with(b"\r\n\r\n") {
