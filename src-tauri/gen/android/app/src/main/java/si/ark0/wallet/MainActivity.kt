@@ -3,12 +3,20 @@ package si.ark0.wallet
 import android.graphics.Color
 import android.os.Bundle
 import android.view.View
+import android.webkit.WebView
 import androidx.activity.SystemBarStyle
 import androidx.activity.enableEdgeToEdge
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 
 class MainActivity : TauriActivity() {
+  override fun onWebViewCreate(webView: WebView) {
+    super.onWebViewCreate(webView)
+    // Route popup requests to WebChromeClient.onCreateWindow, whose default denies them. Without this,
+    // Android treats target="_blank" and window.open as navigations of the current web view instead.
+    webView.settings.setSupportMultipleWindows(true)
+  }
+
   override fun onCreate(savedInstanceState: Bundle?) {
     // The interface is dark: light status and navigation bar icons on it.
     enableEdgeToEdge(

@@ -42,6 +42,8 @@ pub enum KeyError {
     InvalidPhrase,
     /// Not an `ark0w1-` code, or its checksum does not match.
     InvalidBackupCode,
+    /// The system could not provide random numbers for a new wallet.
+    Randomness,
     /// No valid BIP-340 key within 256 attempts (each misses with a probability of about 2^-128).
     NoKey,
     /// A Schnorr signature could not be made, or did not verify.
@@ -79,10 +81,14 @@ pub enum Secret {
 }
 
 impl Secret {
-    pub fn new_bip39() -> Self {
+    pub fn new_bip39() -> Result<Self, KeyError> {
+        Self::new_bip39_with(getrandom::fill)
+    }
+
+    fn new_bip39_with<E>(fill: impl FnOnce(&mut [u8]) -> Result<(), E>) -> Result<Self, KeyError> {
         let mut entropy = Zeroizing::new([0u8; 32]);
-        getrandom::fill(entropy.as_mut()).expect("the system's random source");
-        Secret::Bip39 { entropy: SecretBytes(entropy) }
+        fill(entropy.as_mut()).map_err(|_| KeyError::Randomness)?;
+        Ok(Secret::Bip39 { entropy: SecretBytes(entropy) })
     }
 
     /// 24 words of the English list, in any case and spacing.
@@ -469,6 +475,21 @@ mod tests {
     }
 
     #[test]
+    fn new_wallet_randomness_is_fallible() {
+        let failed = Secret::new_bip39_with(|bytes| {
+            bytes[..8].fill(7);
+            Err(())
+        });
+        assert_eq!(failed.err(), Some(KeyError::Randomness));
+        assert_eq!(serde_json::to_string(&KeyError::Randomness).unwrap(), "\"randomness\"");
+        let secret = Secret::new_bip39_with(|bytes| {
+            bytes.fill(9);
+            Ok::<(), ()>(())
+        }).unwrap();
+        assert!(matches!(secret, Secret::Bip39 { entropy } if *entropy.0 == [9; 32]));
+    }
+
+    #[test]
     fn phrases_round_trip() {
         let zero = bip39([0u8; 32]);
         let words = zero.recovery_text();
@@ -478,7 +499,7 @@ mod tests {
         assert_eq!(Secret::from_phrase("abandon abandon").err(), Some(KeyError::InvalidPhrase));
         let twelve = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
         assert_eq!(Secret::from_phrase(twelve).err(), Some(KeyError::InvalidPhrase));
-        let fresh = Secret::new_bip39();
+        let fresh = Secret::new_bip39().unwrap();
         let again = Secret::from_phrase(&fresh.recovery_text()).unwrap();
         for kind in [Kind::Schnorr, Kind::Mldsa44, Kind::Mixed] {
             assert_eq!(Keys::from_secret(&fresh).unwrap().template(kind).address, Keys::from_secret(&again).unwrap().template(kind).address);
@@ -487,7 +508,7 @@ mod tests {
 
     #[test]
     fn signatures_verify() {
-        let keys = Keys::from_secret(&Secret::new_bip39()).unwrap();
+        let keys = Keys::from_secret(&Secret::new_bip39().unwrap()).unwrap();
         let message = [7u8; 32];
         for kind in [Kind::Schnorr, Kind::Mixed] {
             let sig = schnorr::Signature::from_byte_array(keys.sign_schnorr(kind, &message).unwrap());

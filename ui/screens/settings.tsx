@@ -4,7 +4,7 @@ import type { ComponentChildren } from 'preact';
 import { useState } from 'preact/hooks';
 import { codeOf, core, type AppInfo, type SelftestReport, type Settings as SettingsData, type Status } from '../api';
 import { Button, Card, Field, Modal, Mono, Notice, PasswordInput, StrengthMeter, useToast } from '../components';
-import { errorText, fill, m } from '../i18n';
+import { errorText, fill, locale, m } from '../i18n';
 import { ms } from '../format';
 
 const LOCK_CHOICES = [5, 15, 30, 60, 0];
@@ -87,7 +87,7 @@ function RecoveryDialog({ onClose }: { onClose: () => void }) {
     e.preventDefault();
     setBusy(true);
     try {
-      setWords(await core.revealRecovery(password));
+      setWords(await core.revealRecovery(password, locale()));
       setError(null);
     } catch (err) {
       setError(errorText(codeOf(err)));

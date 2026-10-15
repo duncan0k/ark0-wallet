@@ -48,8 +48,7 @@ pub struct Sent {
     pub sign_ms: f64,
     /// "submitting" (being handed to the API), "mempool", "confirmed", "unknown" (no answer said what
     /// happened, or the node no longer has it), "rejected" (the node refused it), "failed" (the API did not
-    /// pass it on) or "replaced" (unknown, and another of the wallet's payments, with the network, spends
-    /// one of its coins).
+    /// pass it on) or "replaced" (unknown, and a proven payment of the wallet spends one of its coins).
     pub status: String,
     pub confirmations: u32,
     /// Older versions took the count from the API; true only once six signed blocks have been verified.
@@ -75,6 +74,18 @@ impl Sent {
 /// The most the wallet reads of one of its files; its own files are far smaller.
 pub const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
 
+/// Held before any wallet file is read. Closing the file releases the OS lock, including after a crash.
+pub fn lock_wallet(dir: &Path) -> Result<std::fs::File, std::fs::TryLockError> {
+    std::fs::create_dir_all(dir).map_err(std::fs::TryLockError::Error)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let file = options.open(dir.join("wallet.lock")).map_err(std::fs::TryLockError::Error)?;
+    file.try_lock()?;
+    Ok(file)
+}
+
 /// A file of the wallet's, read whole, unless it is larger than any the wallet writes.
 pub fn read_capped(path: &Path) -> std::io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
@@ -86,9 +97,14 @@ pub fn read_capped(path: &Path) -> std::io::Result<Vec<u8>> {
 }
 
 /// Writes a file whole: a new temporary file beside it under a random name (readable by its owner only
-/// on Unix), flushed, renamed over the file, then the directory flushed. The file is either the old one
-/// or the new one, never a mixture, and nothing already in the directory is followed or overwritten.
+/// on Unix), flushed, then durably replaced (a directory sync on Unix, write-through on Windows).
+/// The file is either the old one or the new one, never a mixture, and nothing already in the directory
+/// is followed or overwritten.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    write_atomic_with(path, bytes, sync_directory)
+}
+
+fn write_atomic_with(path: &Path, bytes: &[u8], sync_dir: impl FnOnce(&Path) -> std::io::Result<()>) -> std::io::Result<()> {
     let dir = path.parent().ok_or(std::io::ErrorKind::InvalidInput)?;
     let name = path.file_name().ok_or(std::io::ErrorKind::InvalidInput)?.to_string_lossy();
     std::fs::create_dir_all(dir)?;
@@ -103,15 +119,48 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         let mut file = options.open(&tmp)?;
         file.write_all(bytes)?;
         file.sync_all()?;
-        std::fs::rename(&tmp, path)
+        replace(&tmp, path)
     })();
     if written.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
     written?;
+    sync_dir(dir)
+}
+
+fn sync_directory(dir: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
-    if let Ok(d) = std::fs::File::open(dir) {
-        let _ = d.sync_all();
+    std::fs::File::open(dir)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::rename(from, to)
+}
+
+#[cfg(windows)]
+fn replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH};
+    let wide = |path: &Path| -> std::io::Result<Vec<u16>> {
+        let mut name: Vec<u16> = path.as_os_str().encode_wide().collect();
+        if name.contains(&0) {
+            return Err(std::io::ErrorKind::InvalidInput.into());
+        }
+        name.push(0);
+        Ok(name)
+    };
+    // Canonical parents give Win32 extended paths too, preserving support for long file names.
+    let from = std::fs::canonicalize(from)?;
+    let to = std::fs::canonicalize(to.parent().ok_or(std::io::ErrorKind::InvalidInput)?)?
+        .join(to.file_name().ok_or(std::io::ErrorKind::InvalidInput)?);
+    let (from, to) = (wide(&from)?, wide(&to)?);
+    // SAFETY: both names are NUL-terminated and live until the synchronous call returns.
+    if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) } == 0 {
+        return Err(std::io::Error::last_os_error());
     }
     Ok(())
 }
@@ -137,6 +186,42 @@ pub fn save<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_replacement_is_whole_and_failed_replacements_leave_no_temporary_file() {
+        let mut nonce = [0; 8];
+        getrandom::fill(&mut nonce).unwrap();
+        let dir = std::env::temp_dir().join(format!("pqw-atomic-test-{}", hex::encode(nonce)));
+        let path = dir.join("sent.json");
+        write_atomic(&path, b"old").unwrap();
+        write_atomic(&path, b"new").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        let blocked = dir.join("directory");
+        std::fs::create_dir(&blocked).unwrap();
+        assert!(write_atomic(&blocked, b"cannot replace a directory").is_err());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_open_and_sync_failures_fail_the_save_even_after_rename() {
+        let mut nonce = [0; 8];
+        getrandom::fill(&mut nonce).unwrap();
+        let dir = std::env::temp_dir().join(format!("pqw-directory-sync-{}", hex::encode(nonce)));
+        let path = dir.join("sent.json");
+        let error = write_atomic_with(&path, b"open failed", |dir| sync_directory(&dir.join("missing"))).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        let error = write_atomic_with(&path, b"sync failed", |dir| {
+            let _directory = std::fs::File::open(dir)?;
+            Err(std::io::Error::new(std::io::ErrorKind::Other, "directory sync failed"))
+        }).unwrap_err();
+        assert_eq!(error.to_string(), "directory sync failed");
+        assert_eq!(std::fs::read(&path).unwrap(), b"sync failed");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn a_file_that_cannot_be_read_is_not_taken_for_an_empty_one() {

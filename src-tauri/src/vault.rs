@@ -186,7 +186,7 @@ mod tests {
     #[test]
     fn round_trips_and_refuses_the_wrong_password() {
         let path = temp_path("round");
-        let secret = Secret::new_bip39();
+        let secret = Secret::new_bip39().unwrap();
         create(&path, "correct horse", &secret).unwrap();
         assert_eq!(create(&path, "correct horse", &secret).err(), Some(VaultError::Exists));
         let opened = open(&path, "correct horse").unwrap();
@@ -204,7 +204,7 @@ mod tests {
     #[test]
     fn a_changed_header_or_ciphertext_does_not_open() {
         let path = temp_path("tamper");
-        create(&path, "correct horse", &Secret::new_bip39()).unwrap();
+        create(&path, "correct horse", &Secret::new_bip39().unwrap()).unwrap();
         let original = std::fs::read_to_string(&path).unwrap();
         let mut file: serde_json::Value = serde_json::from_str(&original).unwrap();
         file["kdf"]["iterations"] = serde_json::json!(4);
@@ -228,7 +228,7 @@ mod tests {
     fn only_the_owner_can_read_the_file() {
         use std::os::unix::fs::PermissionsExt;
         let path = temp_path("mode");
-        create(&path, "correct horse", &Secret::new_bip39()).unwrap();
+        create(&path, "correct horse", &Secret::new_bip39().unwrap()).unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
@@ -236,7 +236,7 @@ mod tests {
     #[test]
     fn short_passwords_are_refused() {
         let path = temp_path("short");
-        assert_eq!(create(&path, "1234567", &Secret::new_bip39()).err(), Some(VaultError::PasswordTooShort));
+        assert_eq!(create(&path, "1234567", &Secret::new_bip39().unwrap()).err(), Some(VaultError::PasswordTooShort));
         assert!(!exists(&path));
     }
 }

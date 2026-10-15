@@ -292,6 +292,7 @@ export const zhHant: Messages = {
     recoveryWarning: '確認周圍沒有人和攝影機。這些詞能動用錢包裡的幣。',
   },
   errors: {
+    randomness: '系統沒能提供隨機數，錢包沒有建立。請重試。',
     wrong_password: '密碼不對',
     unreadable: '錢包檔案無法讀取',
     exists: '這台裝置上已經有錢包了',

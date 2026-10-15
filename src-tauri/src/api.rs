@@ -212,14 +212,18 @@ pub struct Api {
     client: reqwest::Client,
 }
 
+fn client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .use_preconfigured_tls(tls_config())
+        .redirect(reqwest::redirect::Policy::none())
+        .https_only(true)
+        .timeout(TIMEOUT)
+        .user_agent(concat!("ark0-wallet/", env!("CARGO_PKG_VERSION")))
+}
+
 impl Api {
     pub fn new(base: &str) -> Self {
-        let client = reqwest::Client::builder()
-            .use_preconfigured_tls(tls_config())
-            .timeout(TIMEOUT)
-            .user_agent(concat!("ark0-wallet/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .expect("an HTTP client");
+        let client = client_builder().build().expect("an HTTP client");
         Api { base: base.trim_end_matches('/').to_string(), client }
     }
 
@@ -362,7 +366,7 @@ pub(crate) mod tests {
     /// An API for a local test socket, not through any system proxy the build host may set.
     fn loopback(listener: &TcpListener) -> Api {
         let mut api = Api::new(&format!("http://{}", listener.local_addr().unwrap()));
-        api.client = reqwest::Client::builder().use_preconfigured_tls(tls_config()).no_proxy().timeout(TIMEOUT).build().unwrap();
+        api.client = client_builder().https_only(false).no_proxy().build().unwrap();
         api
     }
 
@@ -406,6 +410,36 @@ pub(crate) mod tests {
             requests
         });
         (api, server)
+    }
+
+    #[test]
+    fn the_production_client_refuses_http_before_connecting() {
+        let (local, listener) = idle();
+        let api = Api::new(local.base());
+        tauri::async_runtime::block_on(async {
+            assert_eq!(api.state().await, Err(ApiError::Unreachable));
+            assert_eq!(api.broadcast("00", &"a".repeat(64)).await, BroadcastResult::Unknown);
+        });
+        assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn redirects_never_receive_a_get_or_a_transaction_body() {
+        let (target, listener) = idle();
+        let txid = "a".repeat(64);
+        for status in [301, 302, 303, 307, 308] {
+            let redirect = format!("HTTP/1.1 {status} Redirect\r\nLocation: {}/redirected\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}", target.base());
+            let (api, server) = serve(vec![redirect.clone(), redirect]);
+            tauri::async_runtime::block_on(async {
+                assert_eq!(api.state().await, Err(ApiError::Malformed));
+                assert_eq!(api.broadcast("00", &txid).await, BroadcastResult::Unknown);
+            });
+            let requests = server.join().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert!(requests[0].starts_with("GET /api/state "));
+            assert!(requests[1].starts_with("POST /api/broadcast "));
+            assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        }
     }
 
     #[test]

@@ -15,6 +15,15 @@ mod wallet;
 
 use tauri::Manager;
 
+/// Compare the exact origin, including custom protocols, whose URL origins are otherwise opaque.
+fn navigation_allowed(origin: &tauri::Url, url: &tauri::Url) -> bool {
+    url.scheme() == origin.scheme()
+        && url.host_str() == origin.host_str()
+        && url.port_or_known_default() == origin.port_or_known_default()
+        && url.username().is_empty()
+        && url.password().is_none()
+}
+
 #[tauri::command(async)]
 fn selftest() -> selftest::Report {
     selftest::run()
@@ -69,8 +78,27 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let dir = app.path().app_data_dir()?;
-            app.manage(app::AppState::new(dir));
+            match app::AppState::new(dir) {
+                Ok(state) => { app.manage(state); }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    confirm::already_running(app.handle());
+                    return Ok(());
+                }
+                Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
+            }
             app::start_idle_lock(app.handle().clone());
+            // Build the window here so the restrictions are installed before its first page loads.
+            let config = &app.config().app.windows[0];
+            let local = if cfg!(any(windows, target_os = "android")) {
+                if config.use_https_scheme { "https://tauri.localhost" } else { "http://tauri.localhost" }
+            } else {
+                "tauri://localhost"
+            };
+            let origin = app.config().build.dev_url.as_ref().filter(|_| tauri::is_dev()).cloned().unwrap_or(tauri::Url::parse(local)?);
+            tauri::WebviewWindowBuilder::from_config(app, config)?
+                .on_navigation(move |url| navigation_allowed(&origin, url))
+                .on_new_window(|_, _| tauri::webview::NewWindowResponse::Deny)
+                .build()?;
             // On Android the self-test result goes to logcat as well, where the emulator test reads it.
             #[cfg(target_os = "android")]
             {
@@ -84,6 +112,7 @@ pub fn run() {
             app::app_info,
             app::wallet_status,
             app::new_phrase,
+            app::cancel_new_wallet,
             app::confirm_phrase,
             app::create_wallet,
             app::check_recovery,
@@ -108,4 +137,37 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running the application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn navigation_stays_on_the_exact_app_origin() {
+        // Linux/macOS, Windows/Android (HTTP or HTTPS), and a configured development server.
+        for root in ["tauri://localhost", "http://tauri.localhost", "https://tauri.localhost", "http://localhost:1420"] {
+            let origin = tauri::Url::parse(root).unwrap();
+            for path in ["/", "/index.html", "/settings?tab=recovery#words"] {
+                assert!(navigation_allowed(&origin, &tauri::Url::parse(&format!("{root}{path}")).unwrap()));
+            }
+            for other in [
+                "https://example.com/", "http://tauri.localhost.evil/", "tauri://evil/",
+                "tauri://localhost.evil/", "http://localhost:1421/", "http://127.0.0.1:1420/",
+                "https://tauri.localhost:444/", "http://tauri.localhost:81/",
+                "data:text/html,secret", "javascript:alert(1)", "about:blank", "file:///tmp/index.html",
+                "blob:http://tauri.localhost/secret", "https://tauri.localhost@evil/",
+            ] {
+                assert!(!navigation_allowed(&origin, &tauri::Url::parse(other).unwrap()), "{root}: {other}");
+            }
+            for other in ["tauri://localhost", "http://tauri.localhost", "https://tauri.localhost"] {
+                if other != root {
+                    assert!(!navigation_allowed(&origin, &tauri::Url::parse(other).unwrap()));
+                }
+            }
+            let mut credentials = origin.clone();
+            credentials.set_username("user").unwrap();
+            assert!(!navigation_allowed(&origin, &credentials));
+        }
+    }
 }

@@ -292,6 +292,7 @@ export const zhHans: Messages = {
     recoveryWarning: '确认周围没有人和摄像头。这些词能动用钱包里的币。',
   },
   errors: {
+    randomness: '系统没能提供随机数，钱包没有创建。请重试。',
     wrong_password: '密码不对',
     unreadable: '钱包文件无法读取',
     exists: '这台设备上已经有钱包了',

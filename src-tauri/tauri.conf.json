@@ -11,6 +11,7 @@
     "windows": [
       {
         "label": "main",
+        "create": false,
         "title": "Ark-0 Wallet",
         "width": 1180,
         "height": 780,

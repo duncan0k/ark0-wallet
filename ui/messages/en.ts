@@ -290,6 +290,7 @@ export const en = {
     recoveryWarning: 'Make sure nobody and no camera can see your screen. These words can move the wallet’s coins.',
   },
   errors: {
+    randomness: 'The system could not provide random numbers, so no wallet was made. Try again.',
     wrong_password: 'Wrong password',
     unreadable: 'The wallet file cannot be read',
     exists: 'There is a wallet on this device already',

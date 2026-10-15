@@ -2,7 +2,7 @@
 import { useState } from 'preact/hooks';
 import { codeOf, core, type DrillResult, type Overview, type Path } from '../api';
 import { Button, Card, Chip, Icon, Notice } from '../components';
-import { errorText, fill, m } from '../i18n';
+import { errorText, fill, locale, m } from '../i18n';
 import { group, ms } from '../format';
 import { LegacyNotice } from './overview';
 
@@ -16,7 +16,7 @@ export function Drill({ data, legacy }: { data: Overview | null; legacy: boolean
   const run = async (path: Path) => {
     setBusy(path);
     try {
-      const r = await core.drillCheck(path);
+      const r = await core.drillCheck(path, locale());
       setResults((x) => ({ ...x, [path]: r }));
     } catch (err) {
       setResults((x) => ({ ...x, [path]: errorText(codeOf(err)) }));

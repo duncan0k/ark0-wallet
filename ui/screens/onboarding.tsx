@@ -1,6 +1,6 @@
 // Before the wallet is open: the welcome screen, making a wallet, restoring one, and unlocking.
 import type { ComponentChildren } from 'preact';
-import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { codeOf, core, type Status } from '../api';
 import { Brand, Button, Field, Icon, Modal, Notice, PasswordInput, StrengthMeter, Text } from '../components';
 import { errorText, fill, locale, m } from '../i18n';
@@ -146,14 +146,34 @@ export function CreateFlow({ onDone, onBack }: { onDone: (s: Status) => void; on
   const [answers, setAnswers] = useState<string[]>(['', '', '']);
   const [checkError, setCheckError] = useState<string | null>(null);
   const [checking, setChecking] = useState(false);
+  const [creating, setCreating] = useState(false);
+  const [createError, setCreateError] = useState<string | null>(null);
+  const active = useRef(true);
 
-  // The words disappear from the screen state as soon as this flow is left.
-  useEffect(() => () => setWords([]), []);
+  // Drop the core's pending secret as well as the words when this flow is left.
+  useLayoutEffect(() => () => {
+    active.current = false;
+    setWords([]);
+    core.cancelNewWallet();
+  }, []);
 
   const toWords = async () => {
-    setWords(await core.newPhrase());
-    setRevealed(false);
-    setStep(1);
+    setCreating(true);
+    setCreateError(null);
+    try {
+      const next = await core.newPhrase();
+      if (!active.current) {
+        await core.cancelNewWallet();
+        return;
+      }
+      setWords(next);
+      setRevealed(false);
+      setStep(1);
+    } catch (err) {
+      if (active.current) setCreateError(errorText(codeOf(err)));
+    } finally {
+      if (active.current) setCreating(false);
+    }
   };
 
   const check = async (e: Event) => {
@@ -182,7 +202,8 @@ export function CreateFlow({ onDone, onBack }: { onDone: (s: Status) => void; on
             <input type="checkbox" checked={agreed} onChange={(e) => setAgreed((e.target as HTMLInputElement).checked)} />
             <span>{m().create.understood}</span>
           </label>
-          <Button kind="primary" size="lg" disabled={!agreed} onClick={toWords} block>{m().common.continue}</Button>
+          {createError && <Notice tone="bad">{createError}</Notice>}
+          <Button kind="primary" size="lg" busy={creating} disabled={!agreed} onClick={toWords} block>{m().common.continue}</Button>
         </div>
       )}
       {step === 1 && (

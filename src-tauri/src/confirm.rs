@@ -2,9 +2,7 @@
 //! answer for the user. A payment is signed, and a wallet removed without its password, only after one.
 //! The wording is the core's own, in the interface's language, with the figures of the frozen plan.
 use crate::sources::Flags;
-use tauri::AppHandle;
-#[cfg(desktop)]
-use tauri::Manager;
+use tauri::{AppHandle, Manager};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 
 /// The language of a dialog: the interface's setting, or for "auto" the language the interface resolved.
@@ -15,6 +13,21 @@ pub fn locale(setting: &str, resolved: Option<&str>) -> &'static str {
         "zh-Hant" => "zh-Hant",
         _ => "en",
     }
+}
+
+/// The message for a second instance, in every language the wallet has: it runs before any window exists, so
+/// there is no language setting or system language to read.
+const RUNNING_MESSAGE: &str = "钱包已经在运行，请使用已经打开的窗口。\n錢包已經在執行，請使用已經開啟的視窗。\nThe wallet is already running. Use the window that is already open.";
+
+/// No AppState is installed in this instance, so no command can read or change wallet files. The process ends
+/// once the message is closed.
+pub fn already_running(app: &AppHandle) {
+    let builder = app.dialog().message(RUNNING_MESSAGE)
+        .title(app.config().product_name.as_deref().unwrap_or(env!("CARGO_PKG_NAME")))
+        .kind(MessageDialogKind::Warning)
+        .buttons(MessageDialogButtons::OkCustom("OK".into()));
+    let app = app.clone();
+    builder.show(move |_| app.exit(0));
 }
 
 /// Coins from satoshis, as the interface writes them: 150000000 is "1.5".
@@ -33,6 +46,73 @@ pub struct Dialog {
     body: String,
     ok: &'static str,
     cancel: &'static str,
+}
+
+/// Recovery material is shown only after the user confirms outside the web view.
+pub fn recovery(locale: &str, legacy: bool) -> Dialog {
+    match (locale, legacy) {
+        ("zh-Hans", false) => Dialog {
+            title: "显示助记词",
+            body: "这个钱包的助记词将显示在窗口里。看到它的人能拿走钱包里的全部币。请确认周围没有人，屏幕也没有在录制或共享。".into(),
+            ok: "显示",
+            cancel: "取消",
+        },
+        ("zh-Hans", true) => Dialog {
+            title: "显示备份码",
+            body: "这个钱包的备份码将显示在窗口里。看到它的人能拿走钱包里的全部币。请确认周围没有人，屏幕也没有在录制或共享。".into(),
+            ok: "显示",
+            cancel: "取消",
+        },
+        ("zh-Hant", false) => Dialog {
+            title: "顯示助記詞",
+            body: "這個錢包的助記詞將顯示在視窗裡。看到它的人能拿走錢包裡的全部幣。請確認周圍沒有人，螢幕也沒有在錄製或共享。".into(),
+            ok: "顯示",
+            cancel: "取消",
+        },
+        ("zh-Hant", true) => Dialog {
+            title: "顯示備份碼",
+            body: "這個錢包的備份碼將顯示在視窗裡。看到它的人能拿走錢包裡的全部幣。請確認周圍沒有人，螢幕也沒有在錄製或共享。".into(),
+            ok: "顯示",
+            cancel: "取消",
+        },
+        (_, false) => Dialog {
+            title: "Show the recovery words",
+            body: "This wallet's recovery words will be shown in the window. Anyone who sees them can take every coin in the wallet. Make sure no one is watching and the screen is not being recorded or shared.".into(),
+            ok: "Show",
+            cancel: "Cancel",
+        },
+        (_, true) => Dialog {
+            title: "Show the backup code",
+            body: "This wallet's backup code will be shown in the window. Anyone who sees it can take every coin in the wallet. Make sure no one is watching and the screen is not being recorded or shared.".into(),
+            ok: "Show",
+            cancel: "Cancel",
+        },
+    }
+}
+
+/// The node receives a broadcastable transaction even though the wallet does not broadcast it.
+pub fn drill(locale: &str, amount: u64, fee: u64) -> Dialog {
+    let (amount, fee) = (coins(amount), coins(fee));
+    match locale {
+        "zh-Hans" => Dialog {
+            title: "演练：签一笔转回自己的交易",
+            body: format!("将用混合地址里最大的一枚币（{amount} 测试币）签一笔转回同一地址的交易，交给节点核对，钱包不会广播它。\n\n交给节点的是一笔有效交易，节点或别人仍可能把它发出去：那样这枚币会回到同一地址，扣掉手续费 {fee} 测试币。"),
+            ok: "签名并交给节点核对",
+            cancel: "取消",
+        },
+        "zh-Hant" => Dialog {
+            title: "演練：簽一筆轉回自己的交易",
+            body: format!("將用混合地址裡最大的一枚幣（{amount} 測試幣）簽一筆轉回同一地址的交易，交給節點核對，錢包不會廣播它。\n\n交給節點的是一筆有效交易，節點或別人仍可能把它發出去：那樣這枚幣會回到同一地址，扣掉手續費 {fee} 測試幣。"),
+            ok: "簽章並交給節點核對",
+            cancel: "取消",
+        },
+        _ => Dialog {
+            title: "Drill: sign a transfer back to yourself",
+            body: format!("The largest coin in the mixed address ({amount} test coins) will be signed over to the same address and given to the node to check. The wallet will not broadcast it.\n\nWhat the node gets is a valid transaction, and the node or anyone else may still send it: the coin would then come back to the same address, less the fee of {fee} test coins."),
+            ok: "Sign and give to the node",
+            cancel: "Cancel",
+        },
+    }
 }
 
 /// The confirmation of a payment; `caution` adds that an earlier payment may have gone out after all.
@@ -121,6 +201,55 @@ pub async fn ask(app: &AppHandle, dialog: Dialog) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovery_dialogs_name_the_secret_and_warn_in_each_language() {
+        for (locale, words_title, code_title, words_body, code_body, ok, cancel) in [
+            ("en", "Show the recovery words", "Show the backup code",
+                "This wallet's recovery words will be shown in the window. Anyone who sees them can take every coin in the wallet. Make sure no one is watching and the screen is not being recorded or shared.",
+                "This wallet's backup code will be shown in the window. Anyone who sees it can take every coin in the wallet. Make sure no one is watching and the screen is not being recorded or shared.", "Show", "Cancel"),
+            ("zh-Hans", "显示助记词", "显示备份码",
+                "这个钱包的助记词将显示在窗口里。看到它的人能拿走钱包里的全部币。请确认周围没有人，屏幕也没有在录制或共享。",
+                "这个钱包的备份码将显示在窗口里。看到它的人能拿走钱包里的全部币。请确认周围没有人，屏幕也没有在录制或共享。", "显示", "取消"),
+            ("zh-Hant", "顯示助記詞", "顯示備份碼",
+                "這個錢包的助記詞將顯示在視窗裡。看到它的人能拿走錢包裡的全部幣。請確認周圍沒有人，螢幕也沒有在錄製或共享。",
+                "這個錢包的備份碼將顯示在視窗裡。看到它的人能拿走錢包裡的全部幣。請確認周圍沒有人，螢幕也沒有在錄製或共享。", "顯示", "取消"),
+        ] {
+            for (legacy, title, body) in [(false, words_title, words_body), (true, code_title, code_body)] {
+                let dialog = recovery(locale, legacy);
+                assert_eq!((dialog.title, dialog.body.as_str(), dialog.ok, dialog.cancel), (title, body, ok, cancel));
+            }
+        }
+    }
+
+    #[test]
+    fn drill_dialogs_show_the_coin_fee_and_broadcast_warning_in_two_paragraphs() {
+        for (locale, title, first, second, ok, cancel) in [
+            ("en", "Drill: sign a transfer back to yourself",
+                "The largest coin in the mixed address (1.5 test coins) will be signed over to the same address and given to the node to check. The wallet will not broadcast it.",
+                "What the node gets is a valid transaction, and the node or anyone else may still send it: the coin would then come back to the same address, less the fee of 0.0000209 test coins.", "Sign and give to the node", "Cancel"),
+            ("zh-Hans", "演练：签一笔转回自己的交易",
+                "将用混合地址里最大的一枚币（1.5 测试币）签一笔转回同一地址的交易，交给节点核对，钱包不会广播它。",
+                "交给节点的是一笔有效交易，节点或别人仍可能把它发出去：那样这枚币会回到同一地址，扣掉手续费 0.0000209 测试币。", "签名并交给节点核对", "取消"),
+            ("zh-Hant", "演練：簽一筆轉回自己的交易",
+                "將用混合地址裡最大的一枚幣（1.5 測試幣）簽一筆轉回同一地址的交易，交給節點核對，錢包不會廣播它。",
+                "交給節點的是一筆有效交易，節點或別人仍可能把它發出去：那樣這枚幣會回到同一地址，扣掉手續費 0.0000209 測試幣。", "簽章並交給節點核對", "取消"),
+        ] {
+            let dialog = drill(locale, 150_000_000, 2_090);
+            assert_eq!((dialog.title, dialog.ok, dialog.cancel), (title, ok, cancel));
+            assert_eq!(dialog.body.split("\n\n").collect::<Vec<_>>(), vec![first, second]);
+        }
+    }
+
+    #[test]
+    fn already_running_says_it_in_every_language() {
+        let lines: Vec<&str> = RUNNING_MESSAGE.split('\n').collect();
+        assert_eq!(lines, vec![
+            "钱包已经在运行，请使用已经打开的窗口。",
+            "錢包已經在執行，請使用已經開啟的視窗。",
+            "The wallet is already running. Use the window that is already open.",
+        ]);
+    }
 
     #[test]
     fn figures_and_languages() {

@@ -615,6 +615,7 @@ dependencies = [
  "tauri-plugin-dialog",
  "tauri-plugin-opener",
  "webpki-roots",
+ "windows-sys 0.61.2",
  "zeroize",
 ]
 
