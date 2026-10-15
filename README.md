@@ -2,8 +2,7 @@
 
 A wallet for the Ark-0 test network, for Windows, macOS, Linux and Android.
 
-Ark-0 is a test network, for trying things out only, and it may be reset at any time. Its coins have no
-value.
+Ark-0 is a test network for trying things out. It may be reset at any time.
 
 ## What it does
 
