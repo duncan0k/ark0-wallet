@@ -29,6 +29,8 @@
     "targets": "all",
     "category": "Finance",
     "shortDescription": "Ark-0 Wallet",
+    "publisher": "The ark0-wallet developers",
+    "copyright": "Copyright (c) 2026 The ark0-wallet developers",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
