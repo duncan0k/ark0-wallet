@@ -364,6 +364,11 @@ pub fn confirm_phrase(state: State<'_, AppState>, positions: Vec<usize>, words: 
 
 #[tauri::command(async)]
 pub fn create_wallet(state: State<'_, AppState>, password: String) -> Res<Status> {
+    create_confirmed_wallet(&state, password)?;
+    Ok(wallet_status(state))
+}
+
+fn create_confirmed_wallet(state: &AppState, password: String) -> Res<()> {
     let password = Zeroizing::new(password);
     let generation = state.generation();
     let new = {
@@ -374,11 +379,11 @@ pub fn create_wallet(state: State<'_, AppState>, password: String) -> Res<Status
             return Err(Failure::new("phrase_not_confirmed"));
         }
         // Keep the words for another try on failure, under the same lock as cancellation and locking.
+        remove_orphaned_record(state)?;
         vault::create(&state.vault_path(), &password, &new.secret)?;
         pending.take().expect("the pending wallet was checked above")
     };
-    state.open_session(&new.secret, generation)?;
-    Ok(wallet_status(state))
+    state.open_session(&new.secret, generation)
 }
 
 #[derive(Serialize)]
@@ -403,15 +408,20 @@ pub fn check_recovery(text: String) -> Res<RecoveryKind> {
 
 #[tauri::command(async)]
 pub fn restore_wallet(state: State<'_, AppState>, text: String, password: String) -> Res<Status> {
+    restore_wallet_from_text(&state, text, password)?;
+    Ok(wallet_status(state))
+}
+
+fn restore_wallet_from_text(state: &AppState, text: String, password: String) -> Res<()> {
     let (text, password) = (Zeroizing::new(text), Zeroizing::new(password));
     let generation = state.generation();
     let secret = parse_recovery(&text)?;
     {
         let _one_at_a_time = guard(&state.vault_ops);
+        remove_orphaned_record(state)?;
         vault::create(&state.vault_path(), &password, &secret)?;
     }
-    state.open_session(&secret, generation)?;
-    Ok(wallet_status(state))
+    state.open_session(&secret, generation)
 }
 
 #[tauri::command]
@@ -618,10 +628,26 @@ async fn forget_locked_wallet<F: Future<Output = bool>>(
     Ok(())
 }
 
-/// Called under vault_ops after locking; a record that cannot be removed must leave the vault intact.
+/// Called under vault_ops before creating a vault; only NotFound means the old vault is gone.
+fn remove_orphaned_record(state: &AppState) -> Res<()> {
+    match std::fs::symlink_metadata(state.vault_path()) {
+        Ok(_) => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+        Err(_) => return Err(Failure::new("io")),
+    }
+    let _sent = guard(&state.sent_ops);
+    if let Err(error) = std::fs::remove_file(state.sent_path()) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            return Err(Failure::new("io"));
+        }
+    }
+    Ok(())
+}
+
+/// Called under vault_ops after locking; a vault that cannot be removed must leave the record intact.
 fn remove_wallet_files(state: &AppState) -> Res<()> {
     let _sent = guard(&state.sent_ops);
-    for path in [state.sent_path(), state.vault_path()] {
+    for path in [state.vault_path(), state.sent_path()] {
         if let Err(error) = std::fs::remove_file(path) {
             if error.kind() != std::io::ErrorKind::NotFound {
                 return Err(Failure::new("io"));
@@ -1102,18 +1128,22 @@ fn mark_replaced(sent: &mut [Sent]) {
 #[derive(Default)]
 struct PendingCoins {
     coins: Vec<Coin>,
-    spent_by: HashMap<String, String>,
+    spent_by: HashMap<String, HashSet<String>>,
+    unnamed_spenders: HashSet<String>,
 }
 
 /// The coins being spent by mempool transactions from any of the wallet's addresses (`coins` are those
 /// of `paying`, already fetched): a payment made before the wallet was restored here, or on another
 /// device, may have gone from any of them. No answer means no plan.
 async fn pending_everywhere(sources: &Sources, coins: &Coins, own: &[Template], paying: &str, flags: &mut Flags) -> Res<PendingCoins> {
-    let mut pending = PendingCoins { coins: coins.pending.clone(), spent_by: coins.spent_by.clone() };
+    let mut pending = PendingCoins {
+        coins: coins.pending.clone(), spent_by: coins.spent_by.clone(), unnamed_spenders: coins.unnamed_spenders.clone(),
+    };
     for t in own.iter().filter(|t| t.address != paying) {
         let coins = flags.take(sources.coins(&t.address).await)?;
         pending.coins.extend(coins.pending);
-        pending.spent_by.extend(coins.spent_by);
+        for (outpoint, txids) in coins.spent_by { pending.spent_by.entry(outpoint).or_default().extend(txids); }
+        pending.unnamed_spenders.extend(coins.unnamed_spenders);
     }
     Ok(pending)
 }
@@ -1174,10 +1204,14 @@ fn earlier_payments(sent: &[Sent], account: &str, spendable: &[Coin], pending: &
     let in_flight = coins_of(&["submitting", "mempool"]);
     let taken: HashSet<String> = sent.iter().filter(|s| s.proven()).flat_map(|s| s.outpoints.iter().cloned()).collect();
     let usable: Vec<Coin> = spendable.iter().filter(|c| !in_flight.contains(&c.outpoint())).cloned().collect();
-    let recorded: HashSet<&str> = sent.iter().map(|s| s.txid.as_str()).collect();
-    let unrecorded = pending.coins.iter().any(|c| match pending.spent_by.get(&c.outpoint()) {
-        Some(txid) => !recorded.contains(txid.as_str()),
-        None => !in_flight.contains(&c.outpoint()),
+    let recorded: HashSet<(&str, &str)> = sent.iter().flat_map(|s| s.outpoints.iter().map(move |o| (s.txid.as_str(), o.as_str()))).collect();
+    let unrecorded = pending.coins.iter().any(|c| {
+        let outpoint = c.outpoint();
+        if taken.contains(&outpoint) { return false; }
+        pending.unnamed_spenders.contains(&outpoint) || match pending.spent_by.get(&outpoint) {
+            Some(txids) => txids.is_empty() || txids.iter().any(|txid| !recorded.contains(&(txid.as_str(), outpoint.as_str()))),
+            None => true,
+        }
     });
     let spending: HashSet<String> = pending.coins.iter().map(Coin::outpoint).chain(in_flight).collect();
     let mut e = Earlier { usable: Vec::new(), required: Vec::new(), replaces: Vec::new(), spent: false, elsewhere: false, unrecorded };
@@ -1209,6 +1243,10 @@ fn earlier_payments(sent: &[Sent], account: &str, spendable: &[Coin], pending: &
 /// of at most 20. Applies what changed to the record as it is by then, by txid: the lookups take a while,
 /// and a payment may be recorded meanwhile. One being handed to the API is left to the command doing that.
 async fn refresh_sent(state: &AppState, due: impl Fn(&Sent) -> bool, flags: &mut Flags) -> Vec<Sent> {
+    refresh_sent_with_clock(state, due, flags, Instant::now).await
+}
+
+async fn refresh_sent_with_clock(state: &AppState, due: impl Fn(&Sent) -> bool, flags: &mut Flags, mut clock: impl FnMut() -> Instant) -> Vec<Sent> {
     let picked = edit_sent(state, |sent| {
         // Still being handed to the API long after any answer would have come: the send was cut short.
         let at = now();
@@ -1221,8 +1259,8 @@ async fn refresh_sent(state: &AppState, due: impl Fn(&Sent) -> bool, flags: &mut
         let mut picked: Vec<_> = sent.iter().filter(|s| {
             s.status != "submitting" && (due(s) || (refused(s) && !s.outpoints.iter().any(|o| taken.contains(o.as_str()))))
         }).map(|s| (s.txid.clone(), (s.status.clone(), s.confirmations, s.proof_verified))).collect();
-        if picked.len() > 20 {
-            let offset = (state.sent_lookup_offset.fetch_add(20, Ordering::Relaxed) % picked.len() as u64) as usize;
+        if !picked.is_empty() {
+            let offset = (state.sent_lookup_offset.load(Ordering::Relaxed) % picked.len() as u64) as usize;
             picked.rotate_left(offset);
             picked.truncate(20);
         }
@@ -1230,11 +1268,12 @@ async fn refresh_sent(state: &AppState, due: impl Fn(&Sent) -> bool, flags: &mut
     })
     .unwrap_or_default();
     let mut found = Vec::new();
-    let deadline = Instant::now() + LOOKUP_BUDGET;
+    let deadline = clock() + LOOKUP_BUDGET;
     for (txid, was) in picked {
-        if Instant::now() > deadline {
+        if clock() > deadline {
             break;
         }
+        state.sent_lookup_offset.fetch_add(1, Ordering::Relaxed);
         if let Ok(status) = lookup_sent(&state.sources, &txid, flags).await {
             found.push((txid, was, status));
         }
@@ -1808,8 +1847,8 @@ mod tests {
     }
 
     #[test]
-    fn removals_keep_the_vault_when_the_payment_record_cannot_be_removed() {
-        for forgotten in [false, true] {
+    fn removals_leave_an_orphaned_record_that_blocks_creation_and_restore() {
+        for (forgotten, restoring) in [(false, false), (false, true), (true, false), (true, true)] {
             let state = test_state("remove-record-io");
             let secret = Secret::new_bip39().unwrap();
             vault::create(&state.vault_path(), "correct horse", &secret).unwrap();
@@ -1817,7 +1856,6 @@ mod tests {
             std::fs::remove_file(state.sent_path()).unwrap();
             // A directory reliably fails remove_file on every platform, even when tests run as root.
             std::fs::create_dir(state.sent_path()).unwrap();
-            let original = std::fs::read(state.vault_path()).unwrap();
             let remove = || {
                 if forgotten {
                     tauri::async_runtime::block_on(forget_locked_wallet(&state, Some("en"), |_| std::future::ready(true)))
@@ -1832,18 +1870,78 @@ mod tests {
             assert_eq!(remove().unwrap_err().code, "io");
             assert_ne!(state.generation(), generation);
             assert!(!state.unlocked());
-            assert_eq!(std::fs::read(state.vault_path()).unwrap(), original);
-            assert!(state.sent_path().is_dir());
-            std::fs::remove_dir(state.sent_path()).unwrap();
-            // NotFound is harmless, and the same wallet can be removed on a retry.
-            if !forgotten {
-                unlock_wallet(&state, "correct horse".into()).unwrap();
-            }
-            remove().unwrap();
             assert!(!state.vault_path().exists());
+            assert!(state.sent_path().is_dir());
+            let new_secret = Secret::new_bip39().unwrap();
+            let recovery = new_secret.recovery_text().to_string();
+            if !restoring {
+                *guard(&state.new_wallet) = Some(NewWallet { secret: new_secret, confirmed: true });
+            }
+            let make = || {
+                if restoring {
+                    restore_wallet_from_text(&state, recovery.clone(), "battery staple".into())
+                } else {
+                    create_confirmed_wallet(&state, "battery staple".into())
+                }
+            };
+            assert_eq!(make().unwrap_err().code, "io");
+            assert!(!state.vault_path().exists());
+            assert!(!state.unlocked());
+            assert!(state.sent_path().is_dir());
+            if !restoring { assert!(guard(&state.new_wallet).as_ref().unwrap().confirmed); }
+            std::fs::remove_dir(state.sent_path()).unwrap();
+            // A removable orphan is discarded before either kind of new wallet takes its place.
+            store::save(&state.sent_path(), &vec![paid('1', "unknown", "schnorr", &['a'])]).unwrap();
+            make().unwrap();
+            assert!(state.vault_path().is_file());
+            assert!(state.unlocked());
+            assert_eq!(vault::open(&state.vault_path(), "battery staple").unwrap().recovery_text().as_str(), recovery);
             assert!(!state.sent_path().exists());
             std::fs::remove_dir_all(&state.dir).unwrap();
         }
+    }
+
+    #[test]
+    fn creating_and_restoring_keep_the_record_when_a_vault_path_exists() {
+        for restoring in [false, true] {
+            for directory in [false, true] {
+                let state = test_state("create-existing-record");
+                let secret = Secret::new_bip39().unwrap();
+                let recovery = secret.recovery_text().to_string();
+                if directory {
+                    std::fs::create_dir(state.vault_path()).unwrap();
+                } else {
+                    vault::create(&state.vault_path(), "correct horse", &secret).unwrap();
+                }
+                let original = if directory { Vec::new() } else { std::fs::read(state.vault_path()).unwrap() };
+                store::save(&state.sent_path(), &vec![paid('1', "unknown", "schnorr", &['a'])]).unwrap();
+                let record = std::fs::read(state.sent_path()).unwrap();
+                *guard(&state.new_wallet) = Some(NewWallet { secret, confirmed: true });
+                let result = if restoring {
+                    restore_wallet_from_text(&state, recovery, "battery staple".into())
+                } else {
+                    create_confirmed_wallet(&state, "battery staple".into())
+                };
+                assert_eq!(result.unwrap_err().code, if directory { "io" } else { "exists" });
+                assert_eq!(std::fs::read(state.sent_path()).unwrap(), record);
+                if !directory { assert_eq!(std::fs::read(state.vault_path()).unwrap(), original); }
+                std::fs::remove_dir_all(&state.dir).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn forgetting_keeps_the_record_when_the_vault_path_cannot_be_removed() {
+        let state = test_state("remove-vault-directory");
+        std::fs::create_dir(state.vault_path()).unwrap();
+        std::fs::write(state.vault_path().join("held"), b"vault").unwrap();
+        store::save(&state.sent_path(), &vec![paid('1', "unknown", "schnorr", &['a'])]).unwrap();
+        let original = std::fs::read(state.sent_path()).unwrap();
+        let result = tauri::async_runtime::block_on(forget_locked_wallet(&state, Some("en"), |_| std::future::ready(true)));
+        assert_eq!(result.unwrap_err().code, "io");
+        assert_eq!(std::fs::read(state.vault_path().join("held")).unwrap(), b"vault");
+        assert_eq!(std::fs::read(state.sent_path()).unwrap(), original);
+        std::fs::remove_dir_all(&state.dir).unwrap();
     }
 
     #[test]
@@ -1875,7 +1973,6 @@ mod tests {
                 let secret = Secret::new_bip39().unwrap();
                 vault::create(&state.vault_path(), "correct horse", &secret).unwrap();
                 std::fs::write(state.sent_path(), b"[]").unwrap();
-                let original = std::fs::read(state.vault_path()).unwrap();
                 let mut permissions = std::fs::metadata(state.sent_path()).unwrap().permissions();
                 let held = if read_only {
                     permissions.set_readonly(true);
@@ -1890,13 +1987,72 @@ mod tests {
                     state.open_session(&secret, state.generation()).unwrap();
                     tauri::async_runtime::block_on(remove_wallet(&state, "correct horse".into(), Some("en"), |_| std::future::ready(true)))
                 };
+                assert_eq!(result.unwrap_err().code, "io");
+                assert!(!state.unlocked());
+                assert!(!state.vault_path().exists());
+                let recovery = secret.recovery_text().to_string();
+                *guard(&state.new_wallet) = Some(NewWallet { secret, confirmed: true });
+                assert_eq!(create_confirmed_wallet(&state, "battery staple".into()).unwrap_err().code, "io");
+                assert_eq!(restore_wallet_from_text(&state, recovery.clone(), "battery staple".into()).unwrap_err().code, "io");
                 drop(held);
                 permissions.set_readonly(false);
                 std::fs::set_permissions(state.sent_path(), permissions).unwrap();
-                assert_eq!(result.unwrap_err().code, "io");
+                assert_eq!(std::fs::read(state.sent_path()).unwrap(), b"[]");
+                if forgotten {
+                    restore_wallet_from_text(&state, recovery, "battery staple".into()).unwrap();
+                } else {
+                    create_confirmed_wallet(&state, "battery staple".into()).unwrap();
+                }
+                assert!(state.unlocked());
+                assert!(state.vault_path().is_file());
+                assert!(!state.sent_path().exists());
+                std::fs::remove_dir_all(&state.dir).unwrap();
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn removals_keep_the_wallet_and_record_when_the_vault_cannot_be_removed() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+        for forgotten in [false, true] {
+            for read_only in [false, true] {
+                let state = test_state("remove-vault-windows-io");
+                vault::create(&state.vault_path(), "correct horse", &Secret::new_bip39().unwrap()).unwrap();
+                store::save(&state.sent_path(), &vec![paid('1', "unknown", "schnorr", &['a'])]).unwrap();
+                let original = std::fs::read(state.vault_path()).unwrap();
+                let record = std::fs::read(state.sent_path()).unwrap();
+                let mut permissions = std::fs::metadata(state.vault_path()).unwrap().permissions();
+                let held = if read_only {
+                    permissions.set_readonly(true);
+                    std::fs::set_permissions(state.vault_path(), permissions.clone()).unwrap();
+                    None
+                } else {
+                    Some(std::fs::OpenOptions::new().read(true).share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE).open(state.vault_path()).unwrap())
+                };
+                if !forgotten { unlock_wallet(&state, "correct horse".into()).unwrap(); }
+                let remove = || {
+                    if forgotten {
+                        tauri::async_runtime::block_on(forget_locked_wallet(&state, Some("en"), |_| std::future::ready(true)))
+                    } else {
+                        tauri::async_runtime::block_on(remove_wallet(&state, "correct horse".into(), Some("en"), |_| std::future::ready(true)))
+                    }
+                };
+                assert_eq!(remove().unwrap_err().code, "io");
                 assert!(!state.unlocked());
                 assert_eq!(std::fs::read(state.vault_path()).unwrap(), original);
-                assert_eq!(std::fs::read(state.sent_path()).unwrap(), b"[]");
+                assert_eq!(std::fs::read(state.sent_path()).unwrap(), record);
+                drop(held);
+                permissions.set_readonly(false);
+                std::fs::set_permissions(state.vault_path(), permissions).unwrap();
+                unlock_wallet(&state, "correct horse".into()).unwrap();
+                assert!(state.unlocked());
+                if forgotten { state.lock(); }
+                remove().unwrap();
+                assert!(!state.vault_path().exists());
+                assert!(!state.sent_path().exists());
                 std::fs::remove_dir_all(&state.dir).unwrap();
             }
         }
@@ -2106,7 +2262,12 @@ mod tests {
         more.push(paid('6', "unknown", "mldsa44", &['e']));
         assert!(earlier_payments(&more, "mldsa44", &spendable, &PendingCoins::default()).spent);
         // A coin being spent by a transaction no record names: a payment made before a restore, or elsewhere.
-        assert!(!earlier_payments(&sent, "mldsa44", &spendable, &PendingCoins { coins: vec![coin('c', 7_000)], ..PendingCoins::default() }).unrecorded);
+        assert!(earlier_payments(&sent, "mldsa44", &spendable, &PendingCoins { coins: vec![coin('c', 7_000)], ..PendingCoins::default() }).unrecorded);
+        let named = PendingCoins {
+            coins: vec![coin('c', 7_000)], spent_by: HashMap::from([(coin('c', 0).outpoint(), HashSet::from(["2".repeat(64)]))]),
+            ..PendingCoins::default()
+        };
+        assert!(!earlier_payments(&sent, "mldsa44", &spendable, &named).unrecorded);
         assert!(earlier_payments(&sent, "mldsa44", &spendable, &PendingCoins { coins: vec![coin('x', 7_000)], ..PendingCoins::default() }).unrecorded);
         // One from another address, or recorded without its coins, cannot be replaced from here: unclear
         // or refused, however old, it is warned about until a payment of the wallet covers it.
@@ -2418,23 +2579,92 @@ mod tests {
     }
 
     #[test]
+    fn a_proven_cover_does_not_hide_an_unrecorded_spender_of_the_remaining_coin() {
+        use crate::api::tests::{response, serve, utxo};
+        use crate::chain::tests::state as chain_state;
+        use crate::sources::tests::coins;
+
+        for unnamed in [false, true] {
+            for reverse in [false, true] {
+                let mut state = test_state("covered-pending-spender");
+                state.open_session(&Secret::new_bip39().unwrap(), state.generation()).unwrap();
+                // P proves that a is spent, replacing R on {a, d}; B may still spend d.
+                let sent = vec![
+                    Sent { confirmations: REQUIRED_BLOCKS, proof_verified: true, ..paid('1', "confirmed", "schnorr", &['a']) },
+                    Sent { doubted: true, ..paid('2', "replaced", "schnorr", &['a', 'd']) },
+                ];
+                store::save(&state.sent_path(), &sent).unwrap();
+                let replies = |by: Option<char>| {
+                    let mut d = utxo('d', 0, 50_000);
+                    d["spent_in_mempool"] = serde_json::json!(true);
+                    if let Some(by) = by { d["spent_by"] = serde_json::json!(by.to_string().repeat(64)); }
+                    let mut replies = Vec::new();
+                    for _ in 0..2 {
+                        replies.extend([
+                            response(200, &chain_state(40_000, false).to_string()),
+                            response(200, &coins(vec![utxo('c', 0, 90_000), d.clone()])),
+                            response(200, &coins(vec![])), response(200, &coins(vec![])),
+                        ]);
+                    }
+                    replies
+                };
+                let a = replies(Some('2'));
+                let b = replies(if unnamed { None } else { Some('3') });
+                let (a, b) = if reverse { (b, a) } else { (a, b) };
+                let (a, first) = serve(a);
+                let (b, second) = serve(b);
+                state.sources = Arc::new(Sources::new(a, b));
+                let to = state.templates().unwrap().0.address;
+                let (view, mut pending, (_, coins, spending)) = tauri::async_runtime::block_on(async {
+                    let view = plan_payment(&state, Kind::Schnorr, to, "0.0001".into()).await.unwrap();
+                    let mut pending = guard(&state.pending).take().unwrap();
+                    let checked = recheck_payment(&state, &mut pending).await.unwrap();
+                    (view, pending, checked)
+                });
+                assert!(view.unrecorded && view.sources_disagree && pending.caution);
+                assert!(!view.went_out && !view.unclear_elsewhere && !view.one_source);
+                assert_eq!(view.replaces, 0);
+                assert_eq!(pending.plan.coins, vec![Coin { height: 10, ..coin('c', 90_000) }]);
+                let dialog = crate::confirm::payment("en", pending.plan.send, &pending.destination.address, pending.plan.fee, pending.plan.change, pending.caution, pending.sources);
+                assert!(dialog.body().contains("an earlier payment"));
+                let new = paid('4', "submitting", "schnorr", &['c']);
+                pending.caution = false;
+                assert_eq!(record_payment(&state, &pending, &coins, &spending, state.generation(), new.clone()).unwrap_err().code, "coins_changed");
+                assert_eq!(store::load_existing::<Vec<Sent>>(&state.sent_path()).unwrap(), sent);
+                pending.caution = true;
+                record_payment(&state, &pending, &coins, &spending, state.generation(), new).unwrap();
+                assert_eq!((first.join().unwrap().len(), second.join().unwrap().len()), (8, 8));
+                std::fs::remove_dir_all(&state.dir).unwrap();
+            }
+        }
+    }
+
+    #[test]
     fn a_pending_coin_is_recorded_by_its_spender() {
-        let settled = Sent { confirmations: REQUIRED_BLOCKS, proof_verified: true, ..paid('1', "confirmed", "schnorr", &['a']) };
+        let settled = Sent { confirmations: REQUIRED_BLOCKS, proof_verified: true, ..paid('1', "confirmed", "schnorr", &['b']) };
         let mut pending = PendingCoins {
             coins: vec![coin('a', 50_000)],
-            spent_by: HashMap::from([(coin('a', 0).outpoint(), "2".repeat(64))]),
+            spent_by: HashMap::from([(coin('a', 0).outpoint(), HashSet::from(["2".repeat(64)]))]),
+            ..PendingCoins::default()
         };
         assert!(earlier_payments(&[settled.clone()], "schnorr", &[], &pending).unrecorded);
         let mempool = paid('2', "mempool", "schnorr", &['a']);
         assert!(!earlier_payments(&[settled.clone(), mempool.clone()], "schnorr", &[], &pending).unrecorded);
         // A known in-flight input does not stand in for a different, explicitly named spender.
-        pending.spent_by.insert(coin('a', 0).outpoint(), "3".repeat(64));
+        pending.spent_by.get_mut(&coin('a', 0).outpoint()).unwrap().insert("3".repeat(64));
         assert!(earlier_payments(&[settled.clone(), mempool], "schnorr", &[], &pending).unrecorded);
-        pending.spent_by.clear();
         for status in ["unknown", "rejected", "failed", "replaced", "confirmed", "mempool", "submitting"] {
             let sent = [settled.clone(), paid('2', status, "schnorr", &['a'])];
-            assert_eq!(earlier_payments(&sent, "schnorr", &[], &pending).unrecorded, !matches!(status, "mempool" | "submitting"), "{status}");
+            pending.spent_by.insert(coin('a', 0).outpoint(), HashSet::from(["2".repeat(64)]));
+            assert!(!earlier_payments(&sent, "schnorr", &[], &pending).unrecorded, "{status}");
+            pending.unnamed_spenders.insert(coin('a', 0).outpoint());
+            assert!(earlier_payments(&sent, "schnorr", &[], &pending).unrecorded, "{status}");
+            pending.unnamed_spenders.clear();
+            pending.spent_by.clear();
+            assert!(earlier_payments(&sent, "schnorr", &[], &pending).unrecorded, "{status}");
         }
+        pending.spent_by.insert(coin('a', 0).outpoint(), HashSet::from(["2".repeat(64)]));
+        // Naming a recorded transaction is not enough: its record must spend this coin.
         assert!(earlier_payments(&[paid('2', "mempool", "schnorr", &['b'])], "schnorr", &[], &pending).unrecorded);
     }
 
@@ -2456,19 +2686,99 @@ mod tests {
         let (a, first) = serve(replies.clone());
         let (b, second) = serve(replies);
         let sources = Sources::new(a, b);
-        let coins = Coins { pending: vec![coin('a', 50_000)], spent_by: HashMap::from([(coin('a', 0).outpoint(), "1".repeat(64))]), ..Coins::default() };
+        let coins = Coins { pending: vec![coin('a', 50_000)], spent_by: HashMap::from([(coin('a', 0).outpoint(), HashSet::from(["1".repeat(64)]))]), ..Coins::default() };
         let mut pending = tauri::async_runtime::block_on(pending_everywhere(&sources, &coins, &own, &own[0].address, &mut Flags::default())).unwrap();
         assert_eq!(pending.coins.len(), 3);
         assert_eq!(pending.spent_by.len(), 3);
         let sent = [paid('1', "mempool", "schnorr", &['a']), paid('2', "mempool", "mldsa44", &['b']), paid('3', "mempool", "mixed", &['c'])];
         assert!(!earlier_payments(&sent, "schnorr", &[], &pending).unrecorded);
         for c in ['a', 'b', 'c'] {
-            let known = pending.spent_by.insert(coin(c, 0).outpoint(), "4".repeat(64)).unwrap();
+            let known = pending.spent_by.insert(coin(c, 0).outpoint(), HashSet::from(["4".repeat(64)])).unwrap();
             assert!(earlier_payments(&sent, "schnorr", &[], &pending).unrecorded);
             pending.spent_by.insert(coin(c, 0).outpoint(), known);
         }
         assert_eq!((first.join().unwrap().len(), second.join().unwrap().len()), (2, 2));
         std::fs::remove_dir_all(&state.dir).unwrap();
+    }
+
+    #[test]
+    fn pending_spenders_are_merged_when_addresses_repeat_a_coin() {
+        use crate::api::tests::{response, serve, utxo};
+        use crate::sources::tests::coins;
+
+        for unnamed in [false, true] {
+            let own = [Template::schnorr(&[2; 32]), Template::schnorr(&[3; 32]), Template::schnorr(&[4; 32])];
+            let mut u = utxo('a', 0, 50_000);
+            u["spent_in_mempool"] = serde_json::json!(true);
+            u["spent_by"] = serde_json::json!("1".repeat(64));
+            let replies = vec![response(200, &coins(vec![u])); 2];
+            let (a, first) = serve(replies.clone());
+            let (b, second) = serve(replies);
+            let sources = Sources::new(a, b);
+            let mut coins = Coins { pending: vec![coin('a', 50_000)], ..Coins::default() };
+            if unnamed {
+                coins.unnamed_spenders.insert(coin('a', 0).outpoint());
+            } else {
+                coins.spent_by.insert(coin('a', 0).outpoint(), HashSet::from(["9".repeat(64)]));
+            }
+            let pending = tauri::async_runtime::block_on(pending_everywhere(&sources, &coins, &own, &own[0].address, &mut Flags::default())).unwrap();
+            let expected = if unnamed { HashSet::from(["1".repeat(64)]) } else { HashSet::from(["1".repeat(64), "9".repeat(64)]) };
+            assert_eq!(pending.spent_by[&coin('a', 0).outpoint()], expected);
+            assert_eq!(pending.unnamed_spenders.contains(&coin('a', 0).outpoint()), unnamed);
+            assert!(earlier_payments(&[paid('1', "mempool", "schnorr", &['a'])], "schnorr", &[], &pending).unrecorded);
+            assert_eq!((first.join().unwrap().len(), second.join().unwrap().len()), (2, 2));
+        }
+    }
+
+    #[test]
+    fn proven_inputs_do_not_warn_or_block_a_drill_when_sources_lag() {
+        use crate::api::tests::{response, serve, utxo};
+        use crate::chain::tests::state as chain_state;
+        use crate::sources::tests::coins;
+
+        for unnamed in [false, true] {
+            let mut state = test_state("proven-pending-input");
+            state.open_session(&Secret::new_bip39().unwrap(), state.generation()).unwrap();
+            store::save(&state.sent_path(), &vec![
+                Sent { confirmations: REQUIRED_BLOCKS, proof_verified: true, ..paid('1', "confirmed", "mixed", &['a']) },
+                paid('2', "replaced", "mixed", &['a', 'd']),
+            ]).unwrap();
+            let mut a = utxo('a', 0, 50_000);
+            a["spent_in_mempool"] = serde_json::json!(true);
+            if !unnamed { a["spent_by"] = serde_json::json!("9".repeat(64)); }
+            let replies = |lagging| {
+                let mut replies = Vec::new();
+                for _ in 0..2 {
+                    let mut utxos = vec![utxo('c', 0, 150_000_000)];
+                    if lagging { utxos.push(a.clone()); }
+                    replies.extend([
+                        response(200, &chain_state(40_000, false).to_string()),
+                        response(200, &coins(utxos)),
+                        response(200, &coins(vec![])), response(200, &coins(vec![])),
+                    ]);
+                }
+                replies
+            };
+            let mut left = replies(true);
+            left.push(response(200, r#"{"allowed":true,"vsize":100,"fee":200}"#));
+            let (a, first) = serve(left);
+            let (b, second) = serve(replies(false));
+            state.sources = Arc::new(Sources::new(a, b));
+            let to = state.templates().unwrap().2.address;
+            tauri::async_runtime::block_on(async {
+                let view = plan_payment(&state, Kind::Mixed, to, "0.0001".into()).await.unwrap();
+                assert!(!view.unrecorded && !view.went_out && !view.unclear_elsewhere);
+                assert!(view.sources_disagree);
+                assert!(!guard(&state.pending).as_ref().unwrap().caution);
+                let result = run_drill(&state, Path::Schnorr, Some("en"), |_| std::future::ready(true)).await.unwrap();
+                assert!(matches!(result.verdict, CheckResult::Allowed { .. }));
+            });
+            let sent: Vec<Sent> = store::load_existing(&state.sent_path()).unwrap();
+            assert_eq!(sent.len(), 3);
+            assert_eq!(sent[0].outpoints, vec![coin('c', 0).outpoint()]);
+            assert_eq!((first.join().unwrap().len(), second.join().unwrap().len()), (9, 8));
+            std::fs::remove_dir_all(&state.dir).unwrap();
+        }
     }
 
     #[test]
@@ -2566,6 +2876,40 @@ mod tests {
         let saved: Vec<Sent> = store::load_existing(&state.sent_path()).unwrap();
         assert!(saved[..25].iter().all(|s| refused(s) && s.doubted));
         assert!(saved[26].proven());
+        std::fs::remove_dir_all(&state.dir).unwrap();
+    }
+
+    #[test]
+    fn two_due_records_rotate_after_one_lookup_uses_the_budget() {
+        use crate::api::tests::{response, serve};
+
+        let mut state = test_state("lookup-budget-rotation");
+        let sent = vec![paid('1', "unknown", "schnorr", &['a']), paid('2', "unknown", "schnorr", &['b'])];
+        store::save(&state.sent_path(), &sent).unwrap();
+        // A lookup that fails still counts as started and must not starve the next record.
+        let replies = vec![response(500, "{}"), response(200, r#"{"status":"unknown"}"#)];
+        let (a, first) = serve(replies.clone());
+        let (b, second) = serve(replies);
+        state.sources = Arc::new(Sources::new(a, b));
+        tauri::async_runtime::block_on(async {
+            refresh_sent(&state, |_| false, &mut Flags::default()).await;
+            assert_eq!(state.sent_lookup_offset.load(Ordering::Relaxed), 0);
+            for started in 1..=2 {
+                let at = Instant::now();
+                // The first lookup consumes the whole budget without a wall-clock delay in the test.
+                let mut ticks = [at, at, at + LOOKUP_BUDGET + Duration::from_secs(1)].into_iter();
+                refresh_sent_with_clock(&state, |_| true, &mut Flags::default(), || ticks.next().unwrap()).await;
+                assert_eq!(state.sent_lookup_offset.load(Ordering::Relaxed), started);
+            }
+        });
+        let requests = first.join().unwrap();
+        let peer_requests = second.join().unwrap();
+        assert_eq!((requests.len(), peer_requests.len()), (2, 2));
+        for requests in [&requests, &peer_requests] {
+            for (request, s) in requests.iter().zip(&sent) {
+                assert!(request.starts_with(&format!("GET /api/tx?txid={} ", s.txid)));
+            }
+        }
         std::fs::remove_dir_all(&state.dir).unwrap();
     }
 

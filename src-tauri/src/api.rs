@@ -4,7 +4,7 @@
 //! TLS is rustls with the ring provider and the Mozilla root store, the same on every platform.
 use serde::Serialize;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -50,8 +50,10 @@ pub struct Coins {
     pub spendable: Vec<Coin>,
     /// Confirmed, and spent by a transaction still waiting for a block.
     pub pending: Vec<Coin>,
-    /// The mempool transaction spending a pending coin, by outpoint, when the API named it.
-    pub spent_by: HashMap<String, String>,
+    /// Every mempool transaction named as spending a pending coin, by outpoint.
+    pub spent_by: HashMap<String, HashSet<String>>,
+    /// Pending outpoints for which a source did not name the spender.
+    pub unnamed_spenders: HashSet<String>,
     /// Payments to the address waiting for a block: shown, never spent.
     pub incoming: Vec<Incoming>,
     /// False when the API could not look through the whole mempool.
@@ -158,7 +160,9 @@ fn coins_from(status: u16, body: &Value) -> Result<Coins, ApiError> {
         }
         if u.get("spent_in_mempool").and_then(Value::as_bool).ok_or(ApiError::Malformed)? {
             if let Some(by) = u.get("spent_by").and_then(Value::as_str).filter(|t| is_txid(t)) {
-                coins.spent_by.insert(coin.outpoint(), by.to_string());
+                coins.spent_by.insert(coin.outpoint(), HashSet::from([by.to_string()]));
+            } else {
+                coins.unnamed_spenders.insert(coin.outpoint());
             }
             coins.pending.push(coin);
         } else {
@@ -474,6 +478,26 @@ pub(crate) mod tests {
 
     pub(crate) fn utxo(txid: char, vout: u32, sats: u64) -> Value {
         json!({ "txid": txid.to_string().repeat(64), "vout": vout, "sats": sats, "height": 10, "spent_in_mempool": false })
+    }
+
+    #[test]
+    fn pending_coins_keep_named_and_unnamed_spenders() {
+        for by in [None, Some(json!(null)), Some(json!("invalid")), Some(json!("2".repeat(64)))] {
+            let mut pending = utxo('a', 0, 1_000);
+            pending["spent_in_mempool"] = json!(true);
+            if let Some(by) = &by { pending["spent_by"] = by.clone(); }
+            let found = coins_from(200, &json!({"utxos": [pending]})).unwrap();
+            let outpoint = format!("{}:0", "a".repeat(64));
+            assert_eq!(found.pending.len(), 1);
+            assert!(found.spendable.is_empty());
+            if by == Some(json!("2".repeat(64))) {
+                assert_eq!(found.spent_by[&outpoint], HashSet::from(["2".repeat(64)]));
+                assert!(found.unnamed_spenders.is_empty());
+            } else {
+                assert!(found.spent_by.is_empty());
+                assert_eq!(found.unnamed_spenders, HashSet::from([outpoint]));
+            }
+        }
     }
 
     #[test]

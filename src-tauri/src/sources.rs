@@ -110,12 +110,13 @@ fn merge_coins(mut a: Coins, b: Coins) -> (Coins, bool) {
     let other = amounts(&b.spendable);
     let incoming = |c: &Coins| c.incoming.iter().map(|i| (format!("{}:{}", i.txid, i.vout), i.sats)).collect::<HashMap<_, _>>();
     let disagree = amounts(&a.spendable) != other || amounts(&a.pending) != amounts(&b.pending)
-        || incoming(&a) != incoming(&b) || a.spent_by != b.spent_by
+        || incoming(&a) != incoming(&b) || a.spent_by != b.spent_by || a.unnamed_spenders != b.unnamed_spenders
         || a.truncated != b.truncated || a.incoming_complete != b.incoming_complete;
     a.spendable.retain(|c| other.get(&c.outpoint()) == Some(&c.sats));
     a.pending = union(a.pending, b.pending, Coin::outpoint);
     a.incoming = union(a.incoming, b.incoming, |i| format!("{}:{}", i.txid, i.vout));
-    for (outpoint, txid) in b.spent_by { a.spent_by.entry(outpoint).or_insert(txid); }
+    for (outpoint, txids) in b.spent_by { a.spent_by.entry(outpoint).or_default().extend(txids); }
+    a.unnamed_spenders.extend(b.unnamed_spenders);
     a.incoming_complete &= b.incoming_complete;
     a.truncated |= b.truncated;
     (a, disagree)
@@ -423,6 +424,36 @@ pub(crate) mod tests {
             assert_eq!(found.incoming.len(), 3);
             assert_eq!(found.incoming.iter().map(|i| i.sats).sum::<u64>(), 600);
             assert!(found.truncated && !found.incoming_complete);
+        }
+    }
+
+    #[test]
+    fn pending_spenders_and_unnamed_spenders_are_kept_in_both_source_orders() {
+        for unnamed in [false, true] {
+            let mut a = utxo('a', 0, 1_000);
+            a["spent_in_mempool"] = json!(true);
+            a["spent_by"] = json!("1".repeat(64));
+            let mut b = a.clone();
+            if unnamed {
+                b.as_object_mut().unwrap().remove("spent_by");
+            } else {
+                b["spent_by"] = json!("2".repeat(64));
+            }
+            for reverse in [false, true] {
+                let (a, b) = if reverse { (&b, &a) } else { (&a, &b) };
+                let (left, first) = serve(vec![response(200, &coins(vec![a.clone()]))]);
+                let (right, second) = serve(vec![response(200, &coins(vec![b.clone()]))]);
+                let answer = block_on(Sources::new(left, right).coins("tb1ztest"));
+                first.join().unwrap();
+                second.join().unwrap();
+                assert_eq!(answer.flags, Flags { one_source: false, disagree: true });
+                let found = answer.value.unwrap();
+                let outpoint = format!("{}:0", "a".repeat(64));
+                let spenders = if unnamed { HashSet::from(["1".repeat(64)]) } else { HashSet::from(["1".repeat(64), "2".repeat(64)]) };
+                assert_eq!(found.pending.len(), 1);
+                assert_eq!(found.spent_by[&outpoint], spenders);
+                assert_eq!(found.unnamed_spenders, if unnamed { HashSet::from([outpoint]) } else { HashSet::new() });
+            }
         }
     }
 
