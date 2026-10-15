@@ -1,0 +1,3 @@
+# LF everywhere: the vendored C code is compared byte for byte with its release (check-vendor.sh).
+* text=auto eol=lf
+*.bat text eol=crlf

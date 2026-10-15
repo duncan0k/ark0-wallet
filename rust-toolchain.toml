@@ -1,0 +1,5 @@
+# Pinned so that every platform builds with the same compiler. Targets are added by the platform's own
+# build script, so a build never downloads targets it does not use.
+[toolchain]
+channel = "1.98.0"
+profile = "minimal"

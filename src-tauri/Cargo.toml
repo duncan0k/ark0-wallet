@@ -1,0 +1,47 @@
+[package]
+name = "ark0-wallet"
+version = "0.1.0"
+description = "A wallet for the Ark-0 test network"
+edition = "2021"
+rust-version = "1.90"
+publish = false
+
+[lib]
+# The Android build links the staticlib/cdylib; the desktop binary links the rlib.
+name = "ark0_wallet_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "=2.7.1", features = [] }
+cc = "=1.5.1"
+
+[dependencies]
+tauri = { version = "=2.12.1", features = [] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+# libsecp256k1 (Bitcoin Core's library) for BIP-340 Schnorr.
+secp256k1 = { version = "=0.33.1", features = ["global-context"] }
+getrandom = "=0.4.3"
+sha2 = "=0.11.0"
+hmac = "=0.13.0"
+hkdf = "=0.13.0"
+hex = "=0.4.3"
+zeroize = "=1.9.0"
+bech32 = "=0.11.1"
+bip39 = { version = "=2.2.2", features = ["zeroize"] }
+# The vault: Argon2id for the password, AES-256-GCM for the seed.
+argon2 = { version = "=0.6.0", default-features = false, features = ["alloc", "zeroize"] }
+aes-gcm = { version = "=0.11.1", default-features = false, features = ["aes", "alloc", "zeroize"] }
+# HTTPS to the network's API: rustls with ring and the Mozilla roots, the same on every platform.
+reqwest = { version = "=0.13.5", default-features = false, features = ["rustls-no-provider", "json", "http2", "system-proxy"] }
+rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "=1.0.9"
+qrcode = { version = "=0.14.1", default-features = false, features = ["svg"] }
+# Opens the faucet and the explorer in the system browser (app.rs allows nothing else).
+tauri-plugin-opener = "=2.5.5"
+tauri-plugin-dialog = "=2.8.0"
+
+[profile.release]
+codegen-units = 1
+lto = true
+strip = true

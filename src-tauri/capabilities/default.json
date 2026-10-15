@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "The main window gets what its interface uses of Tauri's core, listening to the app's events and setting its own title, and the app's own commands, nothing else: no file system, shell or HTTP plugin, the opener only through the app's open_page command, dialogs only from the app's own core.",
+  "windows": ["main"],
+  "permissions": ["core:event:default", "core:window:allow-set-title"]
+}

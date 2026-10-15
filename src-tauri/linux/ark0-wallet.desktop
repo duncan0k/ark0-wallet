@@ -1,0 +1,20 @@
+# On Linux the product name is the ASCII "ark0-wallet" (tauri.linux.conf.json): the bundler derives
+# the .deb Package field from it, and dpkg only accepts lowercase ASCII there. The names people see are here.
+[Desktop Entry]
+Categories={{categories}}
+{{#if comment}}
+Comment={{comment}}
+{{/if}}
+Exec={{exec}}
+StartupWMClass={{exec}}
+Icon={{icon}}
+Name=Ark-0 Wallet
+Name[zh_CN]=方舟 0 号钱包
+Name[zh_SG]=方舟 0 号钱包
+Name[zh_TW]=方舟 0 號錢包
+Name[zh_HK]=方舟 0 號錢包
+Terminal=false
+Type=Application
+{{#if mime_type}}
+MimeType={{mime_type}}
+{{/if}}

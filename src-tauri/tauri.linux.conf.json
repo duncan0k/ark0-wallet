@@ -1,0 +1,10 @@
+{
+  "productName": "ark0-wallet",
+  "bundle": {
+    "linux": {
+      "deb": {
+        "desktopTemplate": "linux/ark0-wallet.desktop"
+      }
+    }
+  }
+}

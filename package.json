@@ -1,0 +1,20 @@
+{
+  "name": "ark0-wallet",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build:ui": "node scripts/build-ui.mjs",
+    "typecheck": "tsc -p tsconfig.json",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "2.12.1",
+    "preact": "10.29.8"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.12.1",
+    "esbuild": "0.28.2",
+    "typescript": "5.9.3"
+  }
+}
