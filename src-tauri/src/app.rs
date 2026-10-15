@@ -164,8 +164,10 @@ pub struct AppState {
     vault_ops: Mutex<()>,
     /// Held while the record of sent transactions is read, changed and saved (`edit_sent`).
     sent_ops: Mutex<()>,
-    /// Where the next batch of due payment lookups starts.
-    sent_lookup_offset: AtomicU64,
+    /// Where the next batch of due lookups starts for payment reviews and their rechecks.
+    payment_lookup_offset: AtomicU64,
+    /// Where the next batch of due lookups starts for the activity list.
+    activity_lookup_offset: AtomicU64,
     /// Counts locks. Work that began before a lock (an unlock's key derivation, a send waiting on the
     /// network or the user) neither opens a session nor signs after it.
     generation: AtomicU64,
@@ -189,7 +191,8 @@ impl AppState {
             last_use: Mutex::new((Instant::now(), SystemTime::now())),
             vault_ops: Mutex::new(()),
             sent_ops: Mutex::new(()),
-            sent_lookup_offset: AtomicU64::new(0),
+            payment_lookup_offset: AtomicU64::new(0),
+            activity_lookup_offset: AtomicU64::new(0),
             generation: AtomicU64::new(0),
             locked: watch::channel(()).0,
             _wallet_lock: wallet_lock,
@@ -800,7 +803,7 @@ async fn plan_payment(state: &AppState, from: Kind, to: String, amount: String) 
     let coins = flags.take(sources.coins(&account.template.address).await)?;
     // The wallet's own payments that are, or may be, on their way, looked up again first.
     let at = now();
-    let sent = refresh_sent(state, |s| {
+    let sent = refresh_sent(state, &state.payment_lookup_offset, |s| {
         matches!(s.status.as_str(), "mempool" | "unknown") || (s.status == "confirmed" && !s.proven()) || (refused(s) && recent(s, at))
     }, &mut flags).await;
     // One payment at a time: while one is being handed to the API, its outcome is not known yet.
@@ -949,7 +952,7 @@ async fn recheck_payment(state: &AppState, pending: &mut PendingSend) -> Res<(Ac
         return Err(Failure::new("coins_changed"));
     }
     let at = now();
-    let sent = refresh_sent(state, |s| {
+    let sent = refresh_sent(state, &state.payment_lookup_offset, |s| {
         matches!(s.status.as_str(), "mempool" | "unknown") || (s.status == "confirmed" && !s.proven()) || (refused(s) && recent(s, at))
     }, &mut flags).await;
     let own: Vec<Template> = { let (a, b, c) = state.templates()?; vec![a, b, c] };
@@ -1240,13 +1243,14 @@ fn earlier_payments(sent: &[Sent], account: &str, spendable: &[Coin], pending: &
 }
 
 /// Looks up again the recorded transactions `due` picks, and uncovered refusals, in rotating batches
-/// of at most 20. Applies what changed to the record as it is by then, by txid: the lookups take a while,
-/// and a payment may be recorded meanwhile. One being handed to the API is left to the command doing that.
-async fn refresh_sent(state: &AppState, due: impl Fn(&Sent) -> bool, flags: &mut Flags) -> Vec<Sent> {
-    refresh_sent_with_clock(state, due, flags, Instant::now).await
+/// of at most 20. Each due rule has its own `lookup_offset`. Applies what changed to the record as it is
+/// by then, by txid: the lookups take a while, and a payment may be recorded meanwhile. One being handed
+/// to the API is left to the command doing that.
+async fn refresh_sent(state: &AppState, lookup_offset: &AtomicU64, due: impl Fn(&Sent) -> bool, flags: &mut Flags) -> Vec<Sent> {
+    refresh_sent_with_clock(state, lookup_offset, due, flags, Instant::now).await
 }
 
-async fn refresh_sent_with_clock(state: &AppState, due: impl Fn(&Sent) -> bool, flags: &mut Flags, mut clock: impl FnMut() -> Instant) -> Vec<Sent> {
+async fn refresh_sent_with_clock(state: &AppState, lookup_offset: &AtomicU64, due: impl Fn(&Sent) -> bool, flags: &mut Flags, mut clock: impl FnMut() -> Instant) -> Vec<Sent> {
     let picked = edit_sent(state, |sent| {
         // Still being handed to the API long after any answer would have come: the send was cut short.
         let at = now();
@@ -1260,7 +1264,7 @@ async fn refresh_sent_with_clock(state: &AppState, due: impl Fn(&Sent) -> bool, 
             s.status != "submitting" && (due(s) || (refused(s) && !s.outpoints.iter().any(|o| taken.contains(o.as_str()))))
         }).map(|s| (s.txid.clone(), (s.status.clone(), s.confirmations, s.proof_verified))).collect();
         if !picked.is_empty() {
-            let offset = (state.sent_lookup_offset.load(Ordering::Relaxed) % picked.len() as u64) as usize;
+            let offset = (lookup_offset.load(Ordering::Relaxed) % picked.len() as u64) as usize;
             picked.rotate_left(offset);
             picked.truncate(20);
         }
@@ -1273,7 +1277,7 @@ async fn refresh_sent_with_clock(state: &AppState, due: impl Fn(&Sent) -> bool, 
         if clock() > deadline {
             break;
         }
-        state.sent_lookup_offset.fetch_add(1, Ordering::Relaxed);
+        lookup_offset.fetch_add(1, Ordering::Relaxed);
         if let Ok(status) = lookup_sent(&state.sources, &txid, flags).await {
             found.push((txid, was, status));
         }
@@ -1323,7 +1327,7 @@ pub async fn activity(state: State<'_, AppState>) -> Res<Vec<Sent>> {
         return Err(Failure::new("locked"));
     }
     let at = now();
-    Ok(refresh_sent(&state, |s| !s.proven() && (!settled(s) || recent(s, at)), &mut Flags::default()).await)
+    Ok(refresh_sent(&state, &state.activity_lookup_offset, |s| !s.proven() && (!settled(s) || recent(s, at)), &mut Flags::default()).await)
 }
 
 #[derive(Serialize)]
@@ -2861,7 +2865,7 @@ mod tests {
         let (b, second) = serve(replies);
         state.sources = Arc::new(Sources::new(a, b));
         tauri::async_runtime::block_on(async {
-            for _ in 0..2 { refresh_sent(&state, |_| false, &mut Flags::default()).await; }
+            for _ in 0..2 { refresh_sent(&state, &state.payment_lookup_offset, |_| false, &mut Flags::default()).await; }
         });
         let requests = first.join().unwrap();
         let peer_requests = second.join().unwrap();
@@ -2892,14 +2896,19 @@ mod tests {
         let (b, second) = serve(replies);
         state.sources = Arc::new(Sources::new(a, b));
         tauri::async_runtime::block_on(async {
-            refresh_sent(&state, |_| false, &mut Flags::default()).await;
-            assert_eq!(state.sent_lookup_offset.load(Ordering::Relaxed), 0);
+            refresh_sent(&state, &state.payment_lookup_offset, |_| false, &mut Flags::default()).await;
+            assert_eq!(state.payment_lookup_offset.load(Ordering::Relaxed), 0);
+            let at = Instant::now();
+            let mut ticks = [at, at + LOOKUP_BUDGET + Duration::from_secs(1)].into_iter();
+            refresh_sent_with_clock(&state, &state.payment_lookup_offset, |_| true, &mut Flags::default(), || ticks.next().unwrap()).await;
+            assert_eq!(state.payment_lookup_offset.load(Ordering::Relaxed), 0);
             for started in 1..=2 {
                 let at = Instant::now();
                 // The first lookup consumes the whole budget without a wall-clock delay in the test.
                 let mut ticks = [at, at, at + LOOKUP_BUDGET + Duration::from_secs(1)].into_iter();
-                refresh_sent_with_clock(&state, |_| true, &mut Flags::default(), || ticks.next().unwrap()).await;
-                assert_eq!(state.sent_lookup_offset.load(Ordering::Relaxed), started);
+                refresh_sent_with_clock(&state, &state.payment_lookup_offset, |_| true, &mut Flags::default(), || ticks.next().unwrap()).await;
+                assert_eq!(state.payment_lookup_offset.load(Ordering::Relaxed), started);
+                assert_eq!(state.activity_lookup_offset.load(Ordering::Relaxed), 0);
             }
         });
         let requests = first.join().unwrap();
@@ -2910,6 +2919,71 @@ mod tests {
                 assert!(request.starts_with(&format!("GET /api/tx?txid={} ", s.txid)));
             }
         }
+        std::fs::remove_dir_all(&state.dir).unwrap();
+    }
+
+    #[test]
+    fn payment_and_activity_lookups_rotate_independently_when_each_uses_the_budget() {
+        use crate::api::tests::{response, serve};
+        use crate::sources::tests::synthetic_sources;
+
+        let mut state = test_state("lookup-rule-rotation");
+        let proof = proof::tests::chain(REQUIRED_BLOCKS);
+        // R, A, B, S, P: P covers R and S, but neither the refusal A nor the other address's payment B.
+        let mut records = vec![
+            paid('1', "replaced", "schnorr", &['a']),
+            paid('2', "rejected", "schnorr", &['b']),
+            Sent { txid: proof["txid"].as_str().unwrap().into(), ..paid('3', "unknown", "mldsa44", &['c']) },
+            paid('4', "replaced", "schnorr", &['d']),
+            Sent { confirmations: REQUIRED_BLOCKS, proof_verified: true, ..paid('5', "confirmed", "schnorr", &['a', 'd']) },
+        ];
+        let at = now();
+        for s in &mut records { s.created = at; }
+        store::save(&state.sent_path(), &records).unwrap();
+        assert!(earlier_payments(&records, "schnorr", &[coin('b', 50_000)], &PendingCoins::default()).elsewhere);
+        let mut replies = vec![response(200, r#"{"status":"unknown"}"#); 5];
+        // B becomes proven when activity reaches it on its third refresh.
+        replies.push(response(200, r#"{"status":"confirmed","confirmations":100}"#));
+        let mut left = replies.clone();
+        left.push(response(200, &proof.to_string()));
+        let (a, first) = serve(left);
+        let (b, second) = serve(replies);
+        state.sources = Arc::new(synthetic_sources(a, b));
+        tauri::async_runtime::block_on(async {
+            for started in 1..=3 {
+                let start = Instant::now();
+                // Each refresh can start only one lookup, without a wall-clock delay in the test.
+                let ticks = [start, start, start + LOOKUP_BUDGET + Duration::from_secs(1)];
+                let mut payment_ticks = ticks.into_iter();
+                let sent = refresh_sent_with_clock(&state, &state.payment_lookup_offset, |s| {
+                    matches!(s.status.as_str(), "mempool" | "unknown") || (s.status == "confirmed" && !s.proven()) || (refused(s) && recent(s, at))
+                }, &mut Flags::default(), || payment_ticks.next().unwrap()).await;
+                assert!(earlier_payments(&sent, "schnorr", &[coin('b', 50_000)], &PendingCoins::default()).elsewhere);
+                assert_eq!(state.payment_lookup_offset.load(Ordering::Relaxed), started);
+                assert_eq!(state.activity_lookup_offset.load(Ordering::Relaxed), started - 1);
+                let mut activity_ticks = ticks.into_iter();
+                let sent = refresh_sent_with_clock(&state, &state.activity_lookup_offset,
+                    |s| !s.proven() && (!settled(s) || recent(s, at)),
+                    &mut Flags::default(), || activity_ticks.next().unwrap()).await;
+                assert_eq!(state.payment_lookup_offset.load(Ordering::Relaxed), started);
+                assert_eq!(state.activity_lookup_offset.load(Ordering::Relaxed), started);
+                assert_eq!(sent[2].proven(), started == 3);
+                assert_eq!(earlier_payments(&sent, "schnorr", &[coin('b', 50_000)], &PendingCoins::default()).elsewhere, started != 3);
+            }
+        });
+        let requests = first.join().unwrap();
+        let peer_requests = second.join().unwrap();
+        assert_eq!((requests.len(), peer_requests.len()), (7, 6));
+        // Payment reaches B on its second refresh, activity on its third: A, R, B, A, A, B.
+        let expected = [&records[1], &records[0], &records[2], &records[1], &records[1], &records[2]];
+        for requests in [&requests, &peer_requests] {
+            for (request, s) in requests[..6].iter().zip(&expected) {
+                assert!(request.starts_with(&format!("GET /api/tx?txid={} ", s.txid)));
+            }
+        }
+        assert!(requests[6].starts_with(&format!("GET /api/proof?txid={} ", records[2].txid)));
+        let saved: Vec<Sent> = store::load_existing(&state.sent_path()).unwrap();
+        assert!(saved[2].proven());
         std::fs::remove_dir_all(&state.dir).unwrap();
     }
 
@@ -3281,7 +3355,7 @@ mod tests {
         state.sources = Arc::new(Sources::new(api, peer));
         let old = paid('1', "mempool", "mldsa44", &['a']);
         store::save(&state.sent_path(), &vec![old.clone()]).unwrap();
-        let sent = tauri::async_runtime::block_on(refresh_sent(&state, |_| true, &mut Flags::default()));
+        let sent = tauri::async_runtime::block_on(refresh_sent(&state, &state.payment_lookup_offset, |_| true, &mut Flags::default()));
         assert_eq!((first.join().unwrap().len(), second.join().unwrap().len()), (2, 2));
         assert_eq!(sent[0].status, "confirmed");
         assert_eq!(sent[0].confirmations, 5);
@@ -3320,7 +3394,7 @@ mod tests {
             let old = Sent { txid: txid.into(), doubted: true, ..paid('1', "mempool", "mldsa44", &['a']) };
             store::save(&state.sent_path(), &vec![old.clone()]).unwrap();
             let mut flags = Flags::default();
-            let sent = tauri::async_runtime::block_on(refresh_sent(&state, |_| true, &mut flags));
+            let sent = tauri::async_runtime::block_on(refresh_sent(&state, &state.payment_lookup_offset, |_| true, &mut flags));
             let first = first.join().unwrap();
             let second = second.join().unwrap();
             assert_eq!((first.len(), second.len()), (2, 2));
@@ -3375,7 +3449,7 @@ mod tests {
         store::save(&state.sent_path(), &vec![Sent { txid: txid.clone(), doubted: true, ..record('a', "unknown") }]).unwrap();
         let results = tauri::async_runtime::block_on(async {
             let mut results = Vec::new();
-            for _ in 0..6 { results.push(refresh_sent(&state, |_| true, &mut Flags::default()).await); }
+            for _ in 0..6 { results.push(refresh_sent(&state, &state.payment_lookup_offset, |_| true, &mut Flags::default()).await); }
             results
         });
         let requests = server.join().unwrap();
@@ -3461,7 +3535,7 @@ mod tests {
         assert_eq!(store::load_existing::<Vec<Sent>>(&state.sent_path()).unwrap().len(), count);
         assert_eq!(edit_sent(&state, |_| ()).unwrap_err().kind(), std::io::ErrorKind::InvalidData);
         // When the record cannot be written, the fallback read must still restore the protection in memory.
-        let view = tauri::async_runtime::block_on(refresh_sent(&state, |_| false, &mut Flags::default()));
+        let view = tauri::async_runtime::block_on(refresh_sent(&state, &state.payment_lookup_offset, |_| false, &mut Flags::default()));
         assert_eq!(view, migrated);
         assert!(surfaced(&view));
         assert_eq!(earlier_payments(&view, "mldsa44", &[coin('a', 5_000)], &PendingCoins::default()).required, vec![coin('a', 5_000)]);
@@ -3523,8 +3597,12 @@ mod tests {
                     state.sources = Arc::new(Sources::new(a, b));
                     let (view, pending, checked) = tauri::async_runtime::block_on(async {
                         let view = plan_payment(&state, Kind::Schnorr, to, "0.0001".into()).await.unwrap();
+                        assert_eq!(state.payment_lookup_offset.load(Ordering::Relaxed), 1);
+                        assert_eq!(state.activity_lookup_offset.load(Ordering::Relaxed), 0);
                         let mut pending = guard(&state.pending).take().unwrap();
                         let checked = recheck_payment(&state, &mut pending).await.unwrap();
+                        assert_eq!(state.payment_lookup_offset.load(Ordering::Relaxed), 2);
+                        assert_eq!(state.activity_lookup_offset.load(Ordering::Relaxed), 0);
                         (view, pending, checked)
                     });
                     let first = first.join().unwrap();
@@ -3569,8 +3647,8 @@ mod tests {
         store::save(&state.sent_path(), &vec![old.clone()]).unwrap();
         let mut flags = Flags::default();
         let results = tauri::async_runtime::block_on(async {
-            let first = refresh_sent(&state, |_| true, &mut flags).await;
-            let second = refresh_sent(&state, |_| true, &mut Flags::default()).await;
+            let first = refresh_sent(&state, &state.payment_lookup_offset, |_| true, &mut flags).await;
+            let second = refresh_sent(&state, &state.payment_lookup_offset, |_| true, &mut Flags::default()).await;
             (first, second)
         });
         first.join().unwrap();
