@@ -160,10 +160,12 @@ pub struct AppState {
     /// sleeps, the second may be set back by hand. The idle lock goes by whichever has gone further.
     last_use: Mutex<(Instant, SystemTime)>,
     settings: Mutex<Settings>,
-    /// Held while the vault is made, replaced or removed, so that two of those never interleave.
+    /// Held while the vault is made, replaced or removed, or read to open a session.
     vault_ops: Mutex<()>,
     /// Held while the record of sent transactions is read, changed and saved (`edit_sent`).
     sent_ops: Mutex<()>,
+    /// Where the next batch of due payment lookups starts.
+    sent_lookup_offset: AtomicU64,
     /// Counts locks. Work that began before a lock (an unlock's key derivation, a send waiting on the
     /// network or the user) neither opens a session nor signs after it.
     generation: AtomicU64,
@@ -187,6 +189,7 @@ impl AppState {
             last_use: Mutex::new((Instant::now(), SystemTime::now())),
             vault_ops: Mutex::new(()),
             sent_ops: Mutex::new(()),
+            sent_lookup_offset: AtomicU64::new(0),
             generation: AtomicU64::new(0),
             locked: watch::channel(()).0,
             _wallet_lock: wallet_lock,
@@ -221,7 +224,10 @@ impl AppState {
 
     fn lock(&self) {
         // Serialize locking with the final session check and mutation of a confirmed wallet change.
-        let mut session = guard(&self.session);
+        self.lock_session(guard(&self.session));
+    }
+
+    fn lock_session(&self, mut session: MutexGuard<'_, Option<Session>>) {
         self.generation.fetch_add(1, Ordering::SeqCst);
         self.locked.send_replace(());
         *session = None;
@@ -415,11 +421,16 @@ pub fn bip39_words() -> Vec<&'static str> {
 
 #[tauri::command(async)]
 pub fn unlock(state: State<'_, AppState>, password: String) -> Res<Status> {
+    unlock_wallet(&state, password)?;
+    Ok(wallet_status(state))
+}
+
+fn unlock_wallet(state: &AppState, password: String) -> Res<()> {
     let password = Zeroizing::new(password);
     let generation = state.generation();
+    let _one_at_a_time = guard(&state.vault_ops);
     let secret = vault::open(&state.vault_path(), &password)?;
-    state.open_session(&secret, generation)?;
-    Ok(wallet_status(state))
+    state.open_session(&secret, generation)
 }
 
 #[tauri::command]
@@ -547,12 +558,11 @@ async fn remove_wallet<F: Future<Output = bool>>(
         if session.is_none() || state.generation() != generation {
             return Err(Failure::new("locked"));
         }
-        vault::delete(&state.vault_path(), &password)?;
-        drop(session);
+        // The password may have changed while the dialog was open. Check it before deleting either file.
+        vault::open(&state.vault_path(), &password)?;
         // Locked before the record goes, so that no send begun earlier records into a fresh one.
-        state.lock();
-        let _sent = guard(&state.sent_ops);
-        let _ = std::fs::remove_file(state.sent_path());
+        state.lock_session(session);
+        remove_wallet_files(state)?;
     }
     Ok(())
 }
@@ -562,26 +572,63 @@ async fn remove_wallet<F: Future<Output = bool>>(
 /// The recovery words or backup code bring the wallet back.
 #[tauri::command]
 pub async fn forget_wallet(app: AppHandle, state: State<'_, AppState>, locale: Option<String>) -> Res<Status> {
+    forget_locked_wallet(&state, locale.as_deref(), |dialog| crate::confirm::ask(&app, dialog)).await?;
+    Ok(wallet_status(state))
+}
+
+async fn forget_locked_wallet<F: Future<Output = bool>>(
+    state: &AppState,
+    locale: Option<&str>,
+    ask: impl FnOnce(crate::confirm::Dialog) -> F,
+) -> Res<()> {
+    // Subscribe before reading the generation so that a lock cannot be missed between them.
+    let mut locked = state.locked.subscribe();
+    let generation = state.generation();
     if state.unlocked() {
         return Err(Failure::new("unlocked"));
     }
-    if !crate::confirm::ask(&app, crate::confirm::removal(state.dialog_locale(locale.as_deref()))).await {
+    let mut answer = std::pin::pin!(ask(crate::confirm::removal(state.dialog_locale(locale))));
+    let mut changed = std::pin::pin!(locked.changed());
+    let confirmed = poll_fn(|cx| {
+        // Locking wins when both the lock and the dialog answer are ready.
+        if changed.as_mut().poll(cx).is_ready() || state.generation() != generation {
+            return Poll::Ready(Err(Failure::new("cancelled")));
+        }
+        if state.unlocked() {
+            return Poll::Ready(Err(Failure::new("unlocked")));
+        }
+        answer.as_mut().poll(cx).map(Ok)
+    }).await?;
+    if !confirmed {
         return Err(Failure::new("cancelled"));
     }
     {
         let _one_at_a_time = guard(&state.vault_ops);
-        if state.unlocked() {
+        let session = guard(&state.session);
+        if state.generation() != generation {
+            return Err(Failure::new("cancelled"));
+        }
+        if session.is_some() {
             return Err(Failure::new("unlocked"));
         }
         // An unlock still deriving its key does not open the wallet after it is gone.
-        state.lock();
-        if vault::exists(&state.vault_path()) {
-            std::fs::remove_file(state.vault_path()).map_err(|_| Failure::new("io"))?;
-        }
-        let _sent = guard(&state.sent_ops);
-        let _ = std::fs::remove_file(state.sent_path());
+        state.lock_session(session);
+        remove_wallet_files(state)?;
     }
-    Ok(wallet_status(state))
+    Ok(())
+}
+
+/// Called under vault_ops after locking; a record that cannot be removed must leave the vault intact.
+fn remove_wallet_files(state: &AppState) -> Res<()> {
+    let _sent = guard(&state.sent_ops);
+    for path in [state.sent_path(), state.vault_path()] {
+        if let Err(error) = std::fs::remove_file(path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(Failure::new("io"));
+            }
+        }
+    }
+    Ok(())
 }
 
 // ---- the chain and the addresses ----
@@ -762,7 +809,7 @@ async fn plan_payment(state: &AppState, from: Kind, to: String, amount: String) 
         one_source: flags.one_source,
         sources_disagree: flags.disagree,
     };
-    let caution = went_out || earlier.elsewhere || earlier.unrecorded || flags.caution();
+    let caution = went_out || earlier.elsewhere || earlier.unrecorded;
     *guard(&state.pending) =
         Some(PendingSend { id: view.id.clone(), created: Instant::now(), kind: from, path: account.path, destination, plan, caution, sources: flags });
     Ok(view)
@@ -809,6 +856,9 @@ pub async fn confirm_send(app: AppHandle, state: State<'_, AppState>, id: String
     let signed = {
         let session = guard(&state.session);
         let session = session.as_ref().ok_or_else(|| Failure::new("locked"))?;
+        if state.generation() != generation {
+            return Err(Failure::new("locked"));
+        }
         wallet::sign_plan(&pending.plan, &account, &session.keys)?
     };
     let sign_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -859,7 +909,7 @@ fn signed_record(pending: &PendingSend, signed: &wallet::Signed, sign_ms: f64) -
     }
 }
 
-async fn recheck_payment(state: &AppState, pending: &mut PendingSend) -> Res<(Account, Coins, Vec<Coin>)> {
+async fn recheck_payment(state: &AppState, pending: &mut PendingSend) -> Res<(Account, Coins, PendingCoins)> {
     let mut flags = pending.sources;
     let chain = current_chain(&state.sources, &mut flags).await?;
     let template = guard(&state.session).as_ref().ok_or_else(|| Failure::new("locked"))?.template(pending.kind).clone();
@@ -873,17 +923,18 @@ async fn recheck_payment(state: &AppState, pending: &mut PendingSend) -> Res<(Ac
         return Err(Failure::new("coins_changed"));
     }
     let at = now();
-    refresh_sent(state, |s| {
+    let sent = refresh_sent(state, |s| {
         matches!(s.status.as_str(), "mempool" | "unknown") || (s.status == "confirmed" && !s.proven()) || (refused(s) && recent(s, at))
     }, &mut flags).await;
     let own: Vec<Template> = { let (a, b, c) = state.templates()?; vec![a, b, c] };
     let spending = pending_everywhere(&state.sources, &coins, &own, &account.template.address, &mut flags).await?;
+    let earlier = earlier_payments(&sent, &kind_name(pending.kind), &coins.spendable, &spending);
     pending.sources = flags;
-    pending.caution |= flags.caution();
+    pending.caution = earlier.spent || earlier.elsewhere || earlier.unrecorded || surfaced(&sent);
     Ok((account, coins, spending))
 }
 
-fn record_payment(state: &AppState, pending: &PendingSend, coins: &Coins, spending: &[Coin], generation: u64, record: Sent) -> Res<()> {
+fn record_payment(state: &AppState, pending: &PendingSend, coins: &Coins, spending: &PendingCoins, generation: u64, record: Sent) -> Res<()> {
     let account_name = kind_name(pending.kind);
     edit_sent(state, |sent| {
         if state.generation() != generation {
@@ -902,7 +953,7 @@ fn record_payment(state: &AppState, pending: &PendingSend, coins: &Coins, spendi
         // plan was made without. Then the payment is reviewed again.
         let earlier = earlier_payments(sent, &account_name, &coins.spendable, spending);
         let covered = earlier.replaces.iter().all(|txid| sent.iter().any(|s| &s.txid == txid && shared(s)));
-        if !covered || (!pending.caution && (earlier.spent || earlier.elsewhere || earlier.unrecorded || surfaced(sent) || pending.sources.caution())) {
+        if !covered || (!pending.caution && (earlier.spent || earlier.elsewhere || earlier.unrecorded || surfaced(sent))) {
             return Err(Failure::new("coins_changed"));
         }
         // The same transaction again (an identical retry): it stays doubted if it was.
@@ -950,7 +1001,7 @@ fn prepare_record(s: &mut Sent) -> bool {
         s.confirmations = REQUIRED_BLOCKS - 1;
         changed = true;
     }
-    if s.status == "confirmed" && !s.proven() && !s.doubted {
+    if !s.doubted && (matches!(s.status.as_str(), "unknown" | "rejected" | "failed" | "replaced") || (s.status == "confirmed" && !s.proven())) {
         s.doubted = true;
         changed = true;
     }
@@ -1033,25 +1084,36 @@ fn settled(s: &Sent) -> bool {
     matches!(s.status.as_str(), "rejected" | "failed" | "replaced")
 }
 
-/// Only a proven payment settles an unclear payment spending one of the same coins. Older records
+/// Only a proven payment settles an attempt spending one of the same coins. Older records
 /// marked replaced while a retry was merely in the mempool become unclear again, with their doubt.
 fn mark_replaced(sent: &mut [Sent]) {
     let taken: HashSet<String> =
         sent.iter().filter(|s| s.proven()).flat_map(|s| s.outpoints.iter().cloned()).collect();
-    for s in sent.iter_mut().filter(|s| matches!(s.status.as_str(), "unknown" | "replaced")) {
-        let was_replaced = s.status == "replaced";
-        s.status = if s.outpoints.iter().any(|o| taken.contains(o)) { "replaced" } else { "unknown" }.into();
-        s.doubted |= was_replaced && s.status == "unknown";
+    for s in sent.iter_mut().filter(|s| !s.proven() && !refused(s) && s.status != "submitting") {
+        if s.outpoints.iter().any(|o| taken.contains(o)) {
+            s.status = "replaced".into();
+        } else if s.status == "replaced" {
+            s.status = "unknown".into();
+            s.doubted = true;
+        }
     }
+}
+
+#[derive(Default)]
+struct PendingCoins {
+    coins: Vec<Coin>,
+    spent_by: HashMap<String, String>,
 }
 
 /// The coins being spent by mempool transactions from any of the wallet's addresses (`coins` are those
 /// of `paying`, already fetched): a payment made before the wallet was restored here, or on another
 /// device, may have gone from any of them. No answer means no plan.
-async fn pending_everywhere(sources: &Sources, coins: &Coins, own: &[Template], paying: &str, flags: &mut Flags) -> Res<Vec<Coin>> {
-    let mut pending = coins.pending.clone();
+async fn pending_everywhere(sources: &Sources, coins: &Coins, own: &[Template], paying: &str, flags: &mut Flags) -> Res<PendingCoins> {
+    let mut pending = PendingCoins { coins: coins.pending.clone(), spent_by: coins.spent_by.clone() };
     for t in own.iter().filter(|t| t.address != paying) {
-        pending.extend(flags.take(sources.coins(&t.address).await)?.pending);
+        let coins = flags.take(sources.coins(&t.address).await)?;
+        pending.coins.extend(coins.pending);
+        pending.spent_by.extend(coins.spent_by);
     }
     Ok(pending)
 }
@@ -1104,7 +1166,7 @@ struct Earlier {
     unrecorded: bool,
 }
 
-fn earlier_payments(sent: &[Sent], account: &str, spendable: &[Coin], pending: &[Coin]) -> Earlier {
+fn earlier_payments(sent: &[Sent], account: &str, spendable: &[Coin], pending: &PendingCoins) -> Earlier {
     let coins_of = |statuses: &[&str]| -> HashSet<String> {
         sent.iter().filter(|s| !unclear(s) && statuses.contains(&s.status.as_str())).flat_map(|s| s.outpoints.iter().cloned()).collect()
     };
@@ -1112,8 +1174,12 @@ fn earlier_payments(sent: &[Sent], account: &str, spendable: &[Coin], pending: &
     let in_flight = coins_of(&["submitting", "mempool"]);
     let taken: HashSet<String> = sent.iter().filter(|s| s.proven()).flat_map(|s| s.outpoints.iter().cloned()).collect();
     let usable: Vec<Coin> = spendable.iter().filter(|c| !in_flight.contains(&c.outpoint())).cloned().collect();
-    let recorded: HashSet<&str> = sent.iter().flat_map(|s| s.outpoints.iter().map(String::as_str)).collect();
-    let unrecorded = pending.iter().any(|c| !recorded.contains(c.outpoint().as_str()));
+    let recorded: HashSet<&str> = sent.iter().map(|s| s.txid.as_str()).collect();
+    let unrecorded = pending.coins.iter().any(|c| match pending.spent_by.get(&c.outpoint()) {
+        Some(txid) => !recorded.contains(txid.as_str()),
+        None => !in_flight.contains(&c.outpoint()),
+    });
+    let spending: HashSet<String> = pending.coins.iter().map(Coin::outpoint).chain(in_flight).collect();
     let mut e = Earlier { usable: Vec::new(), required: Vec::new(), replaces: Vec::new(), spent: false, elsewhere: false, unrecorded };
     for s in sent.iter().filter(|s| unclear(s) || refused(s)) {
         if s.outpoints.iter().any(|o| taken.contains(o)) {
@@ -1124,7 +1190,7 @@ fn earlier_payments(sent: &[Sent], account: &str, spendable: &[Coin], pending: &
             e.elsewhere = true;
             continue;
         }
-        e.spent |= s.outpoints.iter().any(|o| in_flight.contains(o));
+        e.spent |= s.outpoints.iter().any(|o| spending.contains(o));
         match usable.iter().filter(|c| s.outpoints.contains(&c.outpoint())).max_by_key(|c| c.sats) {
             Some(coin) => {
                 if !e.required.contains(coin) {
@@ -1139,9 +1205,9 @@ fn earlier_payments(sent: &[Sent], account: &str, spendable: &[Coin], pending: &
     e
 }
 
-/// Looks up again the recorded transactions `due` picks (at most 20), and applies what changed to the
-/// record as it is by then, by txid: the lookups take a while, and a payment may be recorded meanwhile.
-/// One being handed to the API is left to the command doing that.
+/// Looks up again the recorded transactions `due` picks, and uncovered refusals, in rotating batches
+/// of at most 20. Applies what changed to the record as it is by then, by txid: the lookups take a while,
+/// and a payment may be recorded meanwhile. One being handed to the API is left to the command doing that.
 async fn refresh_sent(state: &AppState, due: impl Fn(&Sent) -> bool, flags: &mut Flags) -> Vec<Sent> {
     let picked = edit_sent(state, |sent| {
         // Still being handed to the API long after any answer would have come: the send was cut short.
@@ -1151,8 +1217,16 @@ async fn refresh_sent(state: &AppState, due: impl Fn(&Sent) -> bool, flags: &mut
             s.doubted = true;
         }
         mark_replaced(sent);
-        sent.iter().filter(|s| s.status != "submitting" && due(s)).take(20)
-            .map(|s| (s.txid.clone(), (s.status.clone(), s.confirmations, s.proof_verified))).collect::<Vec<_>>()
+        let taken: HashSet<&str> = sent.iter().filter(|s| s.proven()).flat_map(|s| s.outpoints.iter().map(String::as_str)).collect();
+        let mut picked: Vec<_> = sent.iter().filter(|s| {
+            s.status != "submitting" && (due(s) || (refused(s) && !s.outpoints.iter().any(|o| taken.contains(o.as_str()))))
+        }).map(|s| (s.txid.clone(), (s.status.clone(), s.confirmations, s.proof_verified))).collect();
+        if picked.len() > 20 {
+            let offset = (state.sent_lookup_offset.fetch_add(20, Ordering::Relaxed) % picked.len() as u64) as usize;
+            picked.rotate_left(offset);
+            picked.truncate(20);
+        }
+        picked
     })
     .unwrap_or_default();
     let mut found = Vec::new();
@@ -1195,8 +1269,8 @@ async fn refresh_sent(state: &AppState, due: impl Fn(&Sent) -> bool, flags: &mut
     })
 }
 
-/// How long a settled outcome is still looked up: a refused transaction may have gone out after all, a
-/// replaced one may have been mined first.
+/// How long a settled outcome is still looked up even when a proven payment covers it. An uncovered
+/// refused transaction stays due however old: it may have gone out after all.
 const RECHECK_SETTLED_SECS: u64 = 7 * 24 * 3600;
 /// Far longer than a broadcast can take (the API client gives up after 20 seconds).
 const SUBMIT_TIMEOUT_SECS: u64 = 120;
@@ -1591,6 +1665,279 @@ mod tests {
     }
 
     #[test]
+    fn forgetting_requires_a_locked_wallet_and_native_confirmation() {
+        for record_exists in [false, true] {
+            let state = test_state("forget-confirm");
+            let secret = Secret::new_bip39().unwrap();
+            vault::create(&state.vault_path(), "correct horse", &secret).unwrap();
+            std::fs::write(state.sent_path(), b"[]").unwrap();
+            if !record_exists {
+                std::fs::remove_file(state.sent_path()).unwrap();
+            }
+            let original = std::fs::read(state.vault_path()).unwrap();
+            state.open_session(&secret, state.generation()).unwrap();
+            let unlocked = tauri::async_runtime::block_on(forget_locked_wallet(&state, Some("en"), |_| async {
+                panic!("an unlocked wallet must not open a removal dialog")
+            }));
+            assert_eq!(unlocked.unwrap_err().code, "unlocked");
+            state.lock();
+            let generation = state.generation();
+            let cancelled = tauri::async_runtime::block_on(forget_locked_wallet(&state, Some("en"), |_| std::future::ready(false)));
+            assert_eq!(cancelled.unwrap_err().code, "cancelled");
+            assert_eq!(state.generation(), generation);
+            assert_eq!(std::fs::read(state.vault_path()).unwrap(), original);
+            assert_eq!(state.sent_path().exists(), record_exists);
+            tauri::async_runtime::block_on(forget_locked_wallet(&state, Some("en"), |_| std::future::ready(true))).unwrap();
+            assert_ne!(state.generation(), generation);
+            assert!(!state.unlocked());
+            assert!(!state.vault_path().exists());
+            assert!(!state.sent_path().exists());
+            std::fs::remove_dir_all(&state.dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn locking_wakes_all_waiting_forget_requests_and_discards_late_answers() {
+        use std::sync::atomic::AtomicUsize;
+        use std::task::{Context, Wake, Waker};
+        use tokio::sync::oneshot;
+
+        struct Wakes(AtomicUsize);
+        impl Wake for Wakes {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        for scenario in ["lock", "idle", "answer"] {
+            let state = test_state("forget-lock-dialogs");
+            let secret = Secret::new_bip39().unwrap();
+            vault::create(&state.vault_path(), "correct horse", &secret).unwrap();
+            std::fs::write(state.sent_path(), b"[]").unwrap();
+            let original = std::fs::read(state.vault_path()).unwrap();
+            let (mut answers, waits): (Vec<_>, Vec<_>) = (0..2).map(|_| oneshot::channel::<bool>()).unzip();
+            let mut requests: Vec<_> = waits.into_iter().map(|wait| {
+                Box::pin(forget_locked_wallet(&state, Some("en"), |_| async move { wait.await.unwrap_or(false) }))
+            }).collect();
+            let wakes: Vec<_> = (0..2).map(|_| Arc::new(Wakes(AtomicUsize::new(0)))).collect();
+            let wakers: Vec<_> = wakes.iter().cloned().map(Waker::from).collect();
+            for (request, waker) in requests.iter_mut().zip(&wakers) {
+                assert!(request.as_mut().poll(&mut Context::from_waker(waker)).is_pending());
+            }
+            if scenario == "idle" {
+                state.open_session(&secret, state.generation()).unwrap();
+            }
+            if scenario == "answer" {
+                answers.remove(0).send(true).unwrap();
+            }
+            state.lock();
+            state.open_session(&secret, state.generation()).unwrap();
+            for ((request, waker), wakes) in requests.iter_mut().zip(&wakers).zip(&wakes) {
+                assert!(wakes.0.load(Ordering::SeqCst) > 0, "locking must wake every forget request");
+                match request.as_mut().poll(&mut Context::from_waker(waker)) {
+                    Poll::Ready(Err(error)) => assert_eq!(error.code, "cancelled"),
+                    _ => panic!("locking must end the forget request without an answer"),
+                }
+            }
+            for answer in answers {
+                assert!(answer.send(true).is_err());
+            }
+            assert_eq!(std::fs::read(state.vault_path()).unwrap(), original);
+            assert_eq!(std::fs::read(state.sent_path()).unwrap(), b"[]");
+            std::fs::remove_dir_all(&state.dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn forgetting_rechecks_changes_made_while_the_dialog_answers() {
+        for change in ["lock", "unlock", "relock"] {
+            let state = test_state("forget-answer");
+            let secret = Secret::new_bip39().unwrap();
+            vault::create(&state.vault_path(), "correct horse", &secret).unwrap();
+            std::fs::write(state.sent_path(), b"[]").unwrap();
+            let original = std::fs::read(state.vault_path()).unwrap();
+            let result = tauri::async_runtime::block_on(forget_locked_wallet(&state, Some("en"), |_| async {
+                if change != "lock" {
+                    state.open_session(&secret, state.generation()).unwrap();
+                }
+                if change != "unlock" {
+                    state.lock();
+                }
+                true
+            }));
+            assert_eq!(result.unwrap_err().code, if change == "unlock" { "unlocked" } else { "cancelled" });
+            assert_eq!(std::fs::read(state.vault_path()).unwrap(), original);
+            assert_eq!(std::fs::read(state.sent_path()).unwrap(), b"[]");
+            std::fs::remove_dir_all(&state.dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn forgetting_rechecks_under_vault_ops_after_the_answer() {
+        use std::sync::mpsc;
+
+        for lock_again in [false, true] {
+            let state = test_state("forget-vault-ops");
+            let secret = Secret::new_bip39().unwrap();
+            vault::create(&state.vault_path(), "correct horse", &secret).unwrap();
+            std::fs::write(state.sent_path(), b"[]").unwrap();
+            let original = std::fs::read(state.vault_path()).unwrap();
+            std::thread::scope(|scope| {
+                let vault_ops = guard(&state.vault_ops);
+                let (answered, wait) = mpsc::channel();
+                let state_ref = &state;
+                let request = scope.spawn(move || {
+                    tauri::async_runtime::block_on(forget_locked_wallet(state_ref, Some("en"), |_| async {
+                        answered.send(()).unwrap();
+                        true
+                    }))
+                });
+                wait.recv().unwrap();
+                if lock_again {
+                    state.lock();
+                } else {
+                    state.open_session(&secret, state.generation()).unwrap();
+                }
+                drop(vault_ops);
+                assert_eq!(request.join().unwrap().unwrap_err().code, if lock_again { "cancelled" } else { "unlocked" });
+            });
+            assert_eq!(std::fs::read(state.vault_path()).unwrap(), original);
+            assert_eq!(std::fs::read(state.sent_path()).unwrap(), b"[]");
+            std::fs::remove_dir_all(&state.dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn removals_keep_the_vault_when_the_payment_record_cannot_be_removed() {
+        for forgotten in [false, true] {
+            let state = test_state("remove-record-io");
+            let secret = Secret::new_bip39().unwrap();
+            vault::create(&state.vault_path(), "correct horse", &secret).unwrap();
+            std::fs::write(state.sent_path(), b"[]").unwrap();
+            std::fs::remove_file(state.sent_path()).unwrap();
+            // A directory reliably fails remove_file on every platform, even when tests run as root.
+            std::fs::create_dir(state.sent_path()).unwrap();
+            let original = std::fs::read(state.vault_path()).unwrap();
+            let remove = || {
+                if forgotten {
+                    tauri::async_runtime::block_on(forget_locked_wallet(&state, Some("en"), |_| std::future::ready(true)))
+                } else {
+                    tauri::async_runtime::block_on(remove_wallet(&state, "correct horse".into(), Some("en"), |_| std::future::ready(true)))
+                }
+            };
+            if !forgotten {
+                state.open_session(&secret, state.generation()).unwrap();
+            }
+            let generation = state.generation();
+            assert_eq!(remove().unwrap_err().code, "io");
+            assert_ne!(state.generation(), generation);
+            assert!(!state.unlocked());
+            assert_eq!(std::fs::read(state.vault_path()).unwrap(), original);
+            assert!(state.sent_path().is_dir());
+            std::fs::remove_dir(state.sent_path()).unwrap();
+            // NotFound is harmless, and the same wallet can be removed on a retry.
+            if !forgotten {
+                unlock_wallet(&state, "correct horse".into()).unwrap();
+            }
+            remove().unwrap();
+            assert!(!state.vault_path().exists());
+            assert!(!state.sent_path().exists());
+            std::fs::remove_dir_all(&state.dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn removal_rechecks_the_password_before_deleting_the_record() {
+        let state = test_state("remove-password-changed");
+        let secret = Secret::new_bip39().unwrap();
+        vault::create(&state.vault_path(), "correct horse", &secret).unwrap();
+        state.open_session(&secret, state.generation()).unwrap();
+        std::fs::write(state.sent_path(), b"[]").unwrap();
+        let result = tauri::async_runtime::block_on(remove_wallet(&state, "correct horse".into(), Some("en"), |_| {
+            vault::change_password(&state.vault_path(), "correct horse", "battery staple").unwrap();
+            std::future::ready(true)
+        }));
+        assert_eq!(result.unwrap_err().code, "wrong_password");
+        assert_eq!(std::fs::read(state.sent_path()).unwrap(), b"[]");
+        assert!(state.unlocked());
+        assert!(vault::open(&state.vault_path(), "battery staple").is_ok());
+        std::fs::remove_dir_all(&state.dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn removals_report_io_for_read_only_and_unshared_payment_records() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        for forgotten in [false, true] {
+            for read_only in [false, true] {
+                let state = test_state("remove-windows-io");
+                let secret = Secret::new_bip39().unwrap();
+                vault::create(&state.vault_path(), "correct horse", &secret).unwrap();
+                std::fs::write(state.sent_path(), b"[]").unwrap();
+                let original = std::fs::read(state.vault_path()).unwrap();
+                let mut permissions = std::fs::metadata(state.sent_path()).unwrap().permissions();
+                let held = if read_only {
+                    permissions.set_readonly(true);
+                    std::fs::set_permissions(state.sent_path(), permissions.clone()).unwrap();
+                    None
+                } else {
+                    Some(std::fs::OpenOptions::new().read(true).share_mode(0).open(state.sent_path()).unwrap())
+                };
+                let result = if forgotten {
+                    tauri::async_runtime::block_on(forget_locked_wallet(&state, Some("en"), |_| std::future::ready(true)))
+                } else {
+                    state.open_session(&secret, state.generation()).unwrap();
+                    tauri::async_runtime::block_on(remove_wallet(&state, "correct horse".into(), Some("en"), |_| std::future::ready(true)))
+                };
+                drop(held);
+                permissions.set_readonly(false);
+                std::fs::set_permissions(state.sent_path(), permissions).unwrap();
+                assert_eq!(result.unwrap_err().code, "io");
+                assert!(!state.unlocked());
+                assert_eq!(std::fs::read(state.vault_path()).unwrap(), original);
+                assert_eq!(std::fs::read(state.sent_path()).unwrap(), b"[]");
+                std::fs::remove_dir_all(&state.dir).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn an_unlock_started_after_the_removal_lock_cannot_reopen_a_deleted_wallet() {
+        use std::sync::mpsc;
+
+        let state = test_state("forget-unlock-race");
+        vault::create(&state.vault_path(), "correct horse", &Secret::new_bip39().unwrap()).unwrap();
+        std::fs::write(state.sent_path(), b"[]").unwrap();
+        let mut locked = state.locked.subscribe();
+        std::thread::scope(|scope| {
+            // Stop removal after its lock but before either file is deleted.
+            let sent_ops = guard(&state.sent_ops);
+            let removal = scope.spawn(|| {
+                tauri::async_runtime::block_on(forget_locked_wallet(&state, Some("en"), |_| std::future::ready(true)))
+            });
+            tauri::async_runtime::block_on(locked.changed()).unwrap();
+            assert!(!state.unlocked());
+            assert!(state.vault_path().is_file());
+            assert!(matches!(state.vault_ops.try_lock(), Err(std::sync::TryLockError::WouldBlock)));
+            let (started, wait) = mpsc::channel();
+            let state_ref = &state;
+            let opening = scope.spawn(move || {
+                started.send(()).unwrap();
+                unlock_wallet(state_ref, "correct horse".into())
+            });
+            wait.recv().unwrap();
+            drop(sent_ops);
+            removal.join().unwrap().unwrap();
+            assert_eq!(opening.join().unwrap().unwrap_err().code, "io");
+        });
+        assert!(!state.unlocked());
+        assert!(!state.vault_path().exists());
+        assert!(!state.sent_path().exists());
+        std::fs::remove_dir_all(&state.dir).unwrap();
+    }
+
+    #[test]
     fn drills_are_recorded_before_checking_and_keep_payment_protections() {
         use crate::api::tests::{response, serve, serve_with, utxo};
         use crate::chain::tests::state as chain_state;
@@ -1670,9 +2017,9 @@ mod tests {
                     assert_eq!(s.send + s.fee, 150_000_000);
                     assert_eq!(s.signature, if path == Path::Schnorr { "schnorr" } else { "mldsa44" });
                     assert!(s.doubted && !s.proven());
-                    let earlier = earlier_payments(&sent, "mixed", &[coin('a', 150_000_000), coin('b', 50_000)], &[]);
+                    let earlier = earlier_payments(&sent, "mixed", &[coin('a', 150_000_000), coin('b', 50_000)], &PendingCoins::default());
                     assert_eq!(earlier.required, vec![coin('a', 150_000_000)]);
-                    assert!(earlier_payments(&sent, "schnorr", &[], &[]).elsewhere);
+                    assert!(earlier_payments(&sent, "schnorr", &[], &PendingCoins::default()).elsewhere);
                 } else {
                     let expected = match outcome {
                         "conflict" | "mempool" => "coins_changed",
@@ -1749,7 +2096,7 @@ mod tests {
             paid('9', "rejected", "mldsa44", &['a', 'z']),
             Sent { confirmations: 6, proof_verified: true, ..paid('0', "confirmed", "mldsa44", &['z']) },
         ];
-        let e = earlier_payments(&sent, "mldsa44", &spendable, &[]);
+        let e = earlier_payments(&sent, "mldsa44", &spendable, &PendingCoins::default());
         assert_eq!(e.usable, vec![coin('a', 5_000), coin('b', 9_000)]);
         assert_eq!(e.required, vec![coin('b', 9_000), coin('a', 5_000)]);
         assert_eq!(e.replaces, vec!["1".repeat(64), "5".repeat(64), "7".repeat(64)]);
@@ -1757,10 +2104,10 @@ mod tests {
         // One whose coins are all spent, by none of the wallet's payments, has most likely gone out.
         let mut more = sent.to_vec();
         more.push(paid('6', "unknown", "mldsa44", &['e']));
-        assert!(earlier_payments(&more, "mldsa44", &spendable, &[]).spent);
+        assert!(earlier_payments(&more, "mldsa44", &spendable, &PendingCoins::default()).spent);
         // A coin being spent by a transaction no record names: a payment made before a restore, or elsewhere.
-        assert!(!earlier_payments(&sent, "mldsa44", &spendable, &[coin('c', 7_000)]).unrecorded);
-        assert!(earlier_payments(&sent, "mldsa44", &spendable, &[coin('x', 7_000)]).unrecorded);
+        assert!(!earlier_payments(&sent, "mldsa44", &spendable, &PendingCoins { coins: vec![coin('c', 7_000)], ..PendingCoins::default() }).unrecorded);
+        assert!(earlier_payments(&sent, "mldsa44", &spendable, &PendingCoins { coins: vec![coin('x', 7_000)], ..PendingCoins::default() }).unrecorded);
         // One from another address, or recorded without its coins, cannot be replaced from here: unclear
         // or refused, however old, it is warned about until a payment of the wallet covers it.
         for (other, warned) in [
@@ -1772,7 +2119,7 @@ mod tests {
         ] {
             let mut more = sent.to_vec();
             more.push(other);
-            let e = earlier_payments(&more, "mldsa44", &spendable, &[]);
+            let e = earlier_payments(&more, "mldsa44", &spendable, &PendingCoins::default());
             assert_eq!((e.elsewhere, e.spent), (warned, true));
             assert_eq!(e.required.len(), 2);
         }
@@ -1824,16 +2171,16 @@ mod tests {
             mark_replaced(&mut sent);
             assert_eq!(sent[0].status, "confirmed");
             assert_eq!(sent[1].status, "unknown");
-            let e = earlier_payments(&sent, "mldsa44", &spendable, &[]);
+            let e = earlier_payments(&sent, "mldsa44", &spendable, &PendingCoins::default());
             assert_eq!(e.usable, spendable.to_vec());
             assert_eq!(e.required, vec![coin('a', 5_000)]);
             assert_eq!(e.replaces, vec![old.txid.clone(), sent[1].txid.clone()]);
             assert!(!e.spent && !e.elsewhere);
-            assert!(earlier_payments(&[old.clone()], "mldsa44", &spendable[1..], &[]).spent);
-            assert!(earlier_payments(&[old.clone()], "schnorr", &spendable, &[]).elsewhere);
+            assert!(earlier_payments(&[old.clone()], "mldsa44", &spendable[1..], &PendingCoins::default()).spent);
+            assert!(earlier_payments(&[old.clone()], "schnorr", &spendable, &PendingCoins::default()).elsewhere);
             let mut without_coins = old.clone();
             without_coins.outpoints.clear();
-            assert!(earlier_payments(&[without_coins], "mldsa44", &spendable, &[]).elsewhere);
+            assert!(earlier_payments(&[without_coins], "mldsa44", &spendable, &PendingCoins::default()).elsewhere);
 
             // Only a verified settlement covers other unclear payments and ends those protections.
             let (status, verified) = confirmed_status(100, REQUIRED_BLOCKS);
@@ -1842,7 +2189,7 @@ mod tests {
             mark_replaced(&mut sent);
             assert_eq!(sent[1].status, "replaced");
             assert!(!surfaced(&sent));
-            let e = earlier_payments(&sent, "mldsa44", &spendable, &[]);
+            let e = earlier_payments(&sent, "mldsa44", &spendable, &PendingCoins::default());
             assert!(e.required.is_empty() && e.replaces.is_empty());
             assert!(!e.spent && !e.elsewhere);
         }
@@ -1870,20 +2217,20 @@ mod tests {
             ..paid('2', "submitting", "schnorr", &[])
         };
         // A larger coin could pay, but must not get round the cover the old payment requires.
-        let rejected = record_payment(&state, &pending, &coins, &[], state.generation(), record_for(&pending)).unwrap_err();
+        let rejected = record_payment(&state, &pending, &coins, &PendingCoins::default(), state.generation(), record_for(&pending)).unwrap_err();
         assert_eq!(rejected.code, "coins_changed");
-        let earlier = earlier_payments(&[old], "schnorr", &coins.spendable, &[]);
+        let earlier = earlier_payments(&[old], "schnorr", &coins.spendable, &PendingCoins::default());
         pending.plan = wallet::plan_spend(&account, &earlier.usable, &earlier.required, &pending.destination, Amount::Sats(10_000), 0).unwrap();
         assert_eq!(pending.plan.coins, vec![coin('a', 50_000)]);
         pending.caution = false;
-        let rejected = record_payment(&state, &pending, &coins, &[], state.generation(), record_for(&pending)).unwrap_err();
+        let rejected = record_payment(&state, &pending, &coins, &PendingCoins::default(), state.generation(), record_for(&pending)).unwrap_err();
         assert_eq!(rejected.code, "coins_changed");
         let saved: Vec<Sent> = store::load_existing(&state.sent_path()).unwrap();
         assert_eq!(saved.len(), 1);
         assert!(saved[0].doubted && !saved[0].proven());
         pending.caution = true;
         let new = record_for(&pending);
-        record_payment(&state, &pending, &coins, &[], state.generation(), new.clone()).unwrap();
+        record_payment(&state, &pending, &coins, &PendingCoins::default(), state.generation(), new.clone()).unwrap();
         assert_eq!(store::load_existing::<Vec<Sent>>(&state.sent_path()).unwrap()[0], new);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -1925,7 +2272,7 @@ mod tests {
         ];
         mark_replaced(&mut sent);
         let spendable = [coin('a', 50_000), coin('b', 60_000), coin('c', 90_000)];
-        let earlier = earlier_payments(&sent, "schnorr", &spendable, &[]);
+        let earlier = earlier_payments(&sent, "schnorr", &spendable, &PendingCoins::default());
         assert_eq!(sent[0].status, "unknown");
         assert!(sent[0].doubted && !settled(&sent[0]));
         assert_eq!(earlier.required, vec![coin('b', 60_000)]);
@@ -2018,13 +2365,347 @@ mod tests {
     }
 
     #[test]
+    fn an_unrecorded_retry_warns_and_keeps_the_remaining_coin_required() {
+        use crate::api::tests::{response, serve, utxo};
+        use crate::chain::tests::state as chain_state;
+        use crate::sources::tests::coins;
+
+        for status in ["unknown", "rejected"] {
+            let mut state = test_state("unrecorded-retry");
+            state.open_session(&Secret::new_bip39().unwrap(), state.generation()).unwrap();
+            store::save(&state.sent_path(), &vec![paid('1', status, "schnorr", &['a', 'b'])]).unwrap();
+            let mut a = utxo('a', 0, 50_000);
+            a["spent_in_mempool"] = serde_json::json!(true);
+            a["spent_by"] = serde_json::json!("2".repeat(64));
+            let mut replies = Vec::new();
+            for _ in 0..2 {
+                replies.extend([
+                    response(200, &chain_state(40_000, false).to_string()),
+                    response(200, &coins(vec![a.clone(), utxo('b', 0, 6_000), utxo('c', 0, 90_000)])),
+                    response(200, r#"{"status":"unknown"}"#),
+                    response(200, &coins(vec![])), response(200, &coins(vec![])),
+                ]);
+            }
+            let (a, first) = serve(replies.clone());
+            let (b, second) = serve(replies);
+            state.sources = Arc::new(Sources::new(a, b));
+            let to = state.templates().unwrap().0.address;
+            let (view, mut pending, (_, coins, spending)) = tauri::async_runtime::block_on(async {
+                let view = plan_payment(&state, Kind::Schnorr, to, "0.0001".into()).await.unwrap();
+                let mut pending = guard(&state.pending).take().unwrap();
+                let checked = recheck_payment(&state, &mut pending).await.unwrap();
+                (view, pending, checked)
+            });
+            assert!(view.went_out && view.unrecorded && pending.caution);
+            assert_eq!(view.replaces, 1);
+            assert!(!view.unclear_elsewhere && !view.one_source && !view.sources_disagree);
+            assert_eq!(pending.plan.coins.iter().map(Coin::outpoint).collect::<Vec<_>>(), vec![coin('b', 0).outpoint(), coin('c', 0).outpoint()]);
+            let sent: Vec<Sent> = store::load_existing(&state.sent_path()).unwrap();
+            let earlier = earlier_payments(&sent, "schnorr", &coins.spendable, &spending);
+            assert!(earlier.spent && earlier.unrecorded);
+            assert_eq!(earlier.required, vec![Coin { height: 10, ..coin('b', 6_000) }]);
+            let dialog = crate::confirm::payment("en", pending.plan.send, &pending.destination.address, pending.plan.fee, pending.plan.change, pending.caution, pending.sources);
+            assert!(dialog.body().contains("an earlier payment"));
+            let new = Sent { outpoints: pending.plan.coins.iter().map(Coin::outpoint).collect(), ..paid('3', "submitting", "schnorr", &[]) };
+            pending.caution = false;
+            assert_eq!(record_payment(&state, &pending, &coins, &spending, state.generation(), new.clone()).unwrap_err().code, "coins_changed");
+            assert_eq!(store::load_existing::<Vec<Sent>>(&state.sent_path()).unwrap(), sent);
+            pending.caution = true;
+            record_payment(&state, &pending, &coins, &spending, state.generation(), new).unwrap();
+            assert_eq!((first.join().unwrap().len(), second.join().unwrap().len()), (10, 10));
+            std::fs::remove_dir_all(&state.dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_pending_coin_is_recorded_by_its_spender() {
+        let settled = Sent { confirmations: REQUIRED_BLOCKS, proof_verified: true, ..paid('1', "confirmed", "schnorr", &['a']) };
+        let mut pending = PendingCoins {
+            coins: vec![coin('a', 50_000)],
+            spent_by: HashMap::from([(coin('a', 0).outpoint(), "2".repeat(64))]),
+        };
+        assert!(earlier_payments(&[settled.clone()], "schnorr", &[], &pending).unrecorded);
+        let mempool = paid('2', "mempool", "schnorr", &['a']);
+        assert!(!earlier_payments(&[settled.clone(), mempool.clone()], "schnorr", &[], &pending).unrecorded);
+        // A known in-flight input does not stand in for a different, explicitly named spender.
+        pending.spent_by.insert(coin('a', 0).outpoint(), "3".repeat(64));
+        assert!(earlier_payments(&[settled.clone(), mempool], "schnorr", &[], &pending).unrecorded);
+        pending.spent_by.clear();
+        for status in ["unknown", "rejected", "failed", "replaced", "confirmed", "mempool", "submitting"] {
+            let sent = [settled.clone(), paid('2', status, "schnorr", &['a'])];
+            assert_eq!(earlier_payments(&sent, "schnorr", &[], &pending).unrecorded, !matches!(status, "mempool" | "submitting"), "{status}");
+        }
+        assert!(earlier_payments(&[paid('2', "mempool", "schnorr", &['b'])], "schnorr", &[], &pending).unrecorded);
+    }
+
+    #[test]
+    fn pending_spenders_are_collected_from_every_address() {
+        use crate::api::tests::{response, serve, utxo};
+        use crate::sources::tests::coins;
+
+        let state = test_state("pending-spenders");
+        state.open_session(&Secret::new_bip39().unwrap(), state.generation()).unwrap();
+        let (a, b, c) = state.templates().unwrap();
+        let own = [a, b, c];
+        let replies: Vec<_> = [('b', '2'), ('c', '3')].iter().map(|&(coin, txid)| {
+            let mut u = utxo(coin, 0, 50_000);
+            u["spent_in_mempool"] = serde_json::json!(true);
+            u["spent_by"] = serde_json::json!(txid.to_string().repeat(64));
+            response(200, &coins(vec![u]))
+        }).collect();
+        let (a, first) = serve(replies.clone());
+        let (b, second) = serve(replies);
+        let sources = Sources::new(a, b);
+        let coins = Coins { pending: vec![coin('a', 50_000)], spent_by: HashMap::from([(coin('a', 0).outpoint(), "1".repeat(64))]), ..Coins::default() };
+        let mut pending = tauri::async_runtime::block_on(pending_everywhere(&sources, &coins, &own, &own[0].address, &mut Flags::default())).unwrap();
+        assert_eq!(pending.coins.len(), 3);
+        assert_eq!(pending.spent_by.len(), 3);
+        let sent = [paid('1', "mempool", "schnorr", &['a']), paid('2', "mempool", "mldsa44", &['b']), paid('3', "mempool", "mixed", &['c'])];
+        assert!(!earlier_payments(&sent, "schnorr", &[], &pending).unrecorded);
+        for c in ['a', 'b', 'c'] {
+            let known = pending.spent_by.insert(coin(c, 0).outpoint(), "4".repeat(64)).unwrap();
+            assert!(earlier_payments(&sent, "schnorr", &[], &pending).unrecorded);
+            pending.spent_by.insert(coin(c, 0).outpoint(), known);
+        }
+        assert_eq!((first.join().unwrap().len(), second.join().unwrap().len()), (2, 2));
+        std::fs::remove_dir_all(&state.dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_doubt_is_restored_before_the_first_mempool_lookup() {
+        use crate::api::tests::{response, serve, utxo};
+        use crate::chain::tests::state as chain_state;
+        use crate::sources::tests::coins;
+
+        let mut state = test_state("legacy-doubt");
+        state.open_session(&Secret::new_bip39().unwrap(), state.generation()).unwrap();
+        let mut old = serde_json::to_value(vec![paid('1', "unknown", "schnorr", &['a']), paid('2', "rejected", "schnorr", &['b'])]).unwrap();
+        for s in old.as_array_mut().unwrap() { s.as_object_mut().unwrap().remove("doubted"); }
+        store::write_atomic(&state.sent_path(), &serde_json::to_vec(&old).unwrap()).unwrap();
+        let replies = vec![
+            response(200, &chain_state(40_000, false).to_string()),
+            response(200, &coins(vec![utxo('c', 0, 90_000)])),
+            response(200, r#"{"status":"mempool"}"#), response(200, r#"{"status":"mempool"}"#),
+            response(200, &coins(vec![])), response(200, &coins(vec![])),
+        ];
+        let (a, first) = serve(replies.clone());
+        let (b, second) = serve(replies);
+        state.sources = Arc::new(Sources::new(a, b));
+        let to = state.templates().unwrap().0.address;
+        let view = tauri::async_runtime::block_on(plan_payment(&state, Kind::Schnorr, to, "0.0001".into())).unwrap();
+        assert!(view.went_out && !view.unclear_elsewhere && !view.unrecorded);
+        assert!(guard(&state.pending).as_ref().unwrap().caution);
+        let saved: Vec<Sent> = store::load_existing(&state.sent_path()).unwrap();
+        assert_eq!(saved.len(), 2);
+        assert!(saved.iter().all(|s| s.status == "mempool" && s.doubted));
+        for status in ["unknown", "rejected", "failed", "replaced"] {
+            let mut s = paid('3', status, "schnorr", &['d']);
+            assert!(prepare_record(&mut s));
+            assert!(s.doubted);
+            assert!(!prepare_record(&mut s));
+        }
+        assert_eq!((first.join().unwrap().len(), second.join().unwrap().len()), (6, 6));
+        std::fs::remove_dir_all(&state.dir).unwrap();
+    }
+
+    #[test]
+    fn a_proven_payment_releases_every_conflicting_attempt() {
+        for status in ["mempool", "confirmed"] {
+            let mut sent = [
+                Sent { confirmations: REQUIRED_BLOCKS, proof_verified: true, ..paid('1', "confirmed", "schnorr", &['a', 'b']) },
+                Sent { doubted: true, confirmations: if status == "confirmed" { 4 } else { 0 }, ..paid('2', status, "schnorr", &['a', 'd']) },
+                paid('3', "rejected", "schnorr", &['a']),
+                paid('4', "submitting", "schnorr", &['a']),
+            ];
+            mark_replaced(&mut sent);
+            assert!(sent[0].proven());
+            assert_eq!(sent[1].status, "replaced");
+            assert!(sent[1].doubted);
+            assert_eq!(sent[2].status, "rejected");
+            assert_eq!(sent[3].status, "submitting");
+            assert!(!surfaced(&sent));
+            let earlier = earlier_payments(&sent, "schnorr", &[coin('d', 70_000)], &PendingCoins::default());
+            assert_eq!(earlier.usable, vec![coin('d', 70_000)]);
+            assert!(earlier.required.is_empty() && earlier.replaces.is_empty());
+            assert!(!earlier.spent && !earlier.elsewhere && !earlier.unrecorded);
+        }
+    }
+
+    #[test]
+    fn lookup_batches_rotate_and_uncovered_refusals_stay_due() {
+        use crate::api::tests::{response, serve};
+
+        let mut state = test_state("lookup-batches");
+        let mut records: Vec<_> = (1..=25).map(|i| Sent {
+            txid: format!("{i:064x}"), outpoints: vec![format!("{i:064x}:0")],
+            ..record('1', if i % 2 == 0 { "rejected" } else { "failed" })
+        }).collect();
+        records.extend([
+            paid('e', "rejected", "schnorr", &['f']),
+            Sent { confirmations: REQUIRED_BLOCKS, proof_verified: true, ..paid('f', "confirmed", "schnorr", &['f']) },
+        ]);
+        assert!(records.iter().all(|s| !recent(s, now())));
+        store::save(&state.sent_path(), &records).unwrap();
+        let replies = vec![response(200, r#"{"status":"unknown"}"#); 40];
+        let (a, first) = serve(replies.clone());
+        let (b, second) = serve(replies);
+        state.sources = Arc::new(Sources::new(a, b));
+        tauri::async_runtime::block_on(async {
+            for _ in 0..2 { refresh_sent(&state, |_| false, &mut Flags::default()).await; }
+        });
+        let requests = first.join().unwrap();
+        let peer_requests = second.join().unwrap();
+        assert_eq!(peer_requests.iter().map(|r| r.lines().next().unwrap()).collect::<Vec<_>>(), requests.iter().map(|r| r.lines().next().unwrap()).collect::<Vec<_>>());
+        assert_eq!(requests.len(), 40);
+        for (request, s) in requests[..20].iter().zip(&records[..20]) {
+            assert!(request.starts_with(&format!("GET /api/tx?txid={} ", s.txid)));
+        }
+        assert!(requests[20].starts_with(&format!("GET /api/tx?txid={} ", records[20].txid)));
+        let queried: HashSet<_> = requests.iter().map(|r| r.lines().next().unwrap()).collect();
+        assert_eq!(queried.len(), 25);
+        let saved: Vec<Sent> = store::load_existing(&state.sent_path()).unwrap();
+        assert!(saved[..25].iter().all(|s| refused(s) && s.doubted));
+        assert!(saved[26].proven());
+        std::fs::remove_dir_all(&state.dir).unwrap();
+    }
+
+    #[test]
+    fn one_source_adds_its_dialog_note_without_a_payment_warning() {
+        use crate::api::tests::{response, serve, utxo};
+        use crate::chain::tests::state as chain_state;
+        use crate::sources::tests::coins;
+
+        let mut state = test_state("one-source-note");
+        state.open_session(&Secret::new_bip39().unwrap(), state.generation()).unwrap();
+        let mut replies = Vec::new();
+        for _ in 0..2 {
+            replies.extend([
+                response(200, &chain_state(40_000, false).to_string()),
+                response(200, &coins(vec![utxo('c', 0, 90_000)])),
+                response(200, &coins(vec![])), response(200, &coins(vec![])),
+            ]);
+        }
+        let mut left = replies.clone();
+        left[0] = response(500, "{}");
+        let (a, first) = serve(left);
+        let (b, second) = serve(replies);
+        state.sources = Arc::new(Sources::new(a, b));
+        let to = state.templates().unwrap().0.address;
+        let (view, pending, (_, coins, spending)) = tauri::async_runtime::block_on(async {
+            let view = plan_payment(&state, Kind::Schnorr, to, "0.0001".into()).await.unwrap();
+            let mut pending = guard(&state.pending).take().unwrap();
+            assert!(!pending.caution);
+            let checked = recheck_payment(&state, &mut pending).await.unwrap();
+            (view, pending, checked)
+        });
+        assert!(view.one_source && pending.sources.one_source);
+        assert!(!view.went_out && !view.unclear_elsewhere && !view.unrecorded && !pending.caution);
+        let dialog = crate::confirm::payment("en", pending.plan.send, &pending.destination.address, pending.plan.fee, pending.plan.change, pending.caution, pending.sources);
+        assert!(dialog.body().contains("only one node answered"));
+        assert!(!dialog.body().contains("an earlier payment"));
+        let new = Sent { outpoints: pending.plan.coins.iter().map(Coin::outpoint).collect(), ..paid('3', "submitting", "schnorr", &[]) };
+        record_payment(&state, &pending, &coins, &spending, state.generation(), new).unwrap();
+        assert_eq!((first.join().unwrap().len(), second.join().unwrap().len()), (8, 8));
+        std::fs::remove_dir_all(&state.dir).unwrap();
+    }
+
+    #[test]
+    fn the_payment_note_disappears_when_the_risk_ends_before_recheck() {
+        use crate::api::tests::{response, serve, utxo};
+        use crate::chain::tests::state as chain_state;
+        use crate::sources::tests::coins;
+
+        let mut state = test_state("risk-ended");
+        state.open_session(&Secret::new_bip39().unwrap(), state.generation()).unwrap();
+        store::save(&state.sent_path(), &vec![paid('1', "unknown", "schnorr", &['a'])]).unwrap();
+        let mut replies = Vec::new();
+        for round in 0..2 {
+            replies.extend([
+                response(200, &chain_state(40_000, false).to_string()),
+                response(200, &coins(vec![utxo('c', 0, 90_000)])),
+            ]);
+            if round == 0 { replies.push(response(200, r#"{"status":"unknown"}"#)); }
+            replies.extend([response(200, &coins(vec![])), response(200, &coins(vec![]))]);
+        }
+        let (a, first) = serve(replies.clone());
+        let (b, second) = serve(replies);
+        state.sources = Arc::new(Sources::new(a, b));
+        let to = state.templates().unwrap().0.address;
+        tauri::async_runtime::block_on(async {
+            let view = plan_payment(&state, Kind::Schnorr, to, "0.0001".into()).await.unwrap();
+            let mut pending = guard(&state.pending).take().unwrap();
+            assert!(view.went_out && pending.caution);
+            edit_sent(&state, |sent| {
+                sent[0].status = "confirmed".into();
+                sent[0].confirmations = REQUIRED_BLOCKS;
+                sent[0].proof_verified = true;
+            }).unwrap();
+            let (_, coins, spending) = recheck_payment(&state, &mut pending).await.unwrap();
+            assert!(!pending.caution);
+            let dialog = crate::confirm::payment("en", pending.plan.send, &pending.destination.address, pending.plan.fee, pending.plan.change, pending.caution, pending.sources);
+            assert!(!dialog.body().contains("an earlier payment"));
+            let new = Sent { outpoints: pending.plan.coins.iter().map(Coin::outpoint).collect(), ..paid('3', "submitting", "schnorr", &[]) };
+            record_payment(&state, &pending, &coins, &spending, state.generation(), new).unwrap();
+        });
+        assert_eq!((first.join().unwrap().len(), second.join().unwrap().len()), (9, 9));
+        std::fs::remove_dir_all(&state.dir).unwrap();
+    }
+
+    #[test]
+    fn a_risk_appearing_at_recheck_needs_the_dialog_warning() {
+        use crate::api::tests::{response, serve, utxo};
+        use crate::chain::tests::state as chain_state;
+        use crate::sources::tests::coins;
+
+        for during_dialog in [false, true] {
+            let mut state = test_state("risk-appeared");
+            state.open_session(&Secret::new_bip39().unwrap(), state.generation()).unwrap();
+            let mut replies = Vec::new();
+            for round in 0..2 {
+                replies.extend([
+                    response(200, &chain_state(40_000, false).to_string()),
+                    response(200, &coins(vec![utxo('c', 0, 90_000)])),
+                ]);
+                if round == 1 && !during_dialog { replies.push(response(200, r#"{"status":"mempool"}"#)); }
+                replies.extend([response(200, &coins(vec![])), response(200, &coins(vec![]))]);
+            }
+            let (a, first) = serve(replies.clone());
+            let (b, second) = serve(replies);
+            state.sources = Arc::new(Sources::new(a, b));
+            let to = state.templates().unwrap().0.address;
+            tauri::async_runtime::block_on(async {
+                let view = plan_payment(&state, Kind::Schnorr, to, "0.0001".into()).await.unwrap();
+                let mut pending = guard(&state.pending).take().unwrap();
+                assert!(!view.went_out && !pending.caution);
+                let old = paid('1', "unknown", "schnorr", &['a']);
+                if !during_dialog { store::save(&state.sent_path(), &vec![old.clone()]).unwrap(); }
+                let (_, coins, spending) = recheck_payment(&state, &mut pending).await.unwrap();
+                assert_eq!(pending.caution, !during_dialog);
+                let dialog = crate::confirm::payment("en", pending.plan.send, &pending.destination.address, pending.plan.fee, pending.plan.change, pending.caution, pending.sources);
+                assert_eq!(dialog.body().contains("an earlier payment"), !during_dialog);
+                if during_dialog { store::save(&state.sent_path(), &vec![old]).unwrap(); }
+                let new = Sent { outpoints: pending.plan.coins.iter().map(Coin::outpoint).collect(), ..paid('3', "submitting", "schnorr", &[]) };
+                pending.caution = false;
+                assert_eq!(record_payment(&state, &pending, &coins, &spending, state.generation(), new.clone()).unwrap_err().code, "coins_changed");
+                if !during_dialog {
+                    pending.caution = true;
+                    record_payment(&state, &pending, &coins, &spending, state.generation(), new).unwrap();
+                }
+            });
+            let count = if during_dialog { 8 } else { 9 };
+            assert_eq!((first.join().unwrap().len(), second.join().unwrap().len()), (count, count));
+            std::fs::remove_dir_all(&state.dir).unwrap();
+        }
+    }
+
+    #[test]
     fn a_chain_of_retries_warns_when_one_is_in_the_mempool() {
         let sent = [
             paid('1', "unknown", "schnorr", &['a', 'b']),
             Sent { doubted: true, ..paid('2', "unknown", "schnorr", &['a', 'd']) },
             paid('3', "mempool", "schnorr", &['b', 'd']),
         ];
-        let earlier = earlier_payments(&sent, "schnorr", &[coin('a', 50_000), coin('b', 60_000), coin('c', 90_000), coin('d', 70_000)], &[]);
+        let earlier = earlier_payments(&sent, "schnorr", &[coin('a', 50_000), coin('b', 60_000), coin('c', 90_000), coin('d', 70_000)], &PendingCoins::default());
         assert!(earlier.spent && !surfaced(&sent));
         assert_eq!(earlier.required, vec![coin('a', 50_000)]);
         assert_eq!(earlier.replaces, vec![sent[0].txid.clone(), sent[1].txid.clone()]);
@@ -2036,7 +2717,7 @@ mod tests {
             paid('1', "rejected", "schnorr", &['a', 'b']),
             paid('2', "mempool", "schnorr", &['a', 'd']),
         ];
-        let earlier = earlier_payments(&sent, "schnorr", &[coin('a', 50_000), coin('b', 60_000), coin('c', 90_000)], &[]);
+        let earlier = earlier_payments(&sent, "schnorr", &[coin('a', 50_000), coin('b', 60_000), coin('c', 90_000)], &PendingCoins::default());
         assert!(earlier.spent);
         assert_eq!(earlier.required, vec![coin('b', 60_000)]);
         assert_eq!(earlier.replaces, vec![sent[0].txid.clone()]);
@@ -2152,8 +2833,8 @@ mod tests {
             let sent: Vec<Sent> = store::load_existing(&state.sent_path()).unwrap();
             assert_eq!(sent[0].status, if proven { "replaced" } else { "unknown" });
             assert_eq!(settled(&sent[0]), proven);
-            assert_eq!(sent[0].doubted, !proven);
-            let earlier = earlier_payments(&sent, "schnorr", &[coin('b', 90_000)], &[]);
+            assert!(sent[0].doubted);
+            let earlier = earlier_payments(&sent, "schnorr", &[coin('b', 90_000)], &PendingCoins::default());
             assert_eq!(earlier.spent, !proven);
             drop(state);
             std::fs::remove_dir_all(dir).unwrap();
@@ -2263,7 +2944,7 @@ mod tests {
         assert_eq!(sent[0].outpoints, old.outpoints);
         assert!(sent[0].doubted && !sent[0].proof_verified);
         assert!(surfaced(&sent));
-        let e = earlier_payments(&sent, "mldsa44", &[coin('a', 5_000), coin('b', 90_000)], &[]);
+        let e = earlier_payments(&sent, "mldsa44", &[coin('a', 5_000), coin('b', 90_000)], &PendingCoins::default());
         assert_eq!(e.required, vec![coin('a', 5_000)]);
         assert_eq!(store::load::<Vec<Sent>>(&state.sent_path()), sent);
         std::fs::remove_dir_all(dir).unwrap();
@@ -2310,7 +2991,7 @@ mod tests {
             assert_eq!(sent[0].proof_verified, proven);
             assert_eq!(sent[0].proven(), proven);
             assert_eq!(surfaced(&sent), !proven);
-            let e = earlier_payments(&sent, "mldsa44", &[coin('a', 5_000), coin('b', 90_000)], &[]);
+            let e = earlier_payments(&sent, "mldsa44", &[coin('a', 5_000), coin('b', 90_000)], &PendingCoins::default());
             assert_eq!(e.required, if proven { vec![] } else { vec![coin('a', 5_000)] });
             assert_eq!(e.replaces, if proven { vec![] } else { vec![txid.to_string()] });
             assert_eq!(store::load::<Vec<Sent>>(&state.sent_path()), sent);
@@ -2439,7 +3120,7 @@ mod tests {
         let view = tauri::async_runtime::block_on(refresh_sent(&state, |_| false, &mut Flags::default()));
         assert_eq!(view, migrated);
         assert!(surfaced(&view));
-        assert_eq!(earlier_payments(&view, "mldsa44", &[coin('a', 5_000)], &[]).required, vec![coin('a', 5_000)]);
+        assert_eq!(earlier_payments(&view, "mldsa44", &[coin('a', 5_000)], &PendingCoins::default()).required, vec![coin('a', 5_000)]);
         assert_eq!(std::fs::read(state.sent_path()).unwrap(), original);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -2496,7 +3177,7 @@ mod tests {
                     let (a, first) = serve(left);
                     let (b, second) = serve(right);
                     state.sources = Arc::new(Sources::new(a, b));
-                    let (view, mut pending, checked) = tauri::async_runtime::block_on(async {
+                    let (view, pending, checked) = tauri::async_runtime::block_on(async {
                         let view = plan_payment(&state, Kind::Schnorr, to, "0.0001".into()).await.unwrap();
                         let mut pending = guard(&state.pending).take().unwrap();
                         let checked = recheck_payment(&state, &mut pending).await.unwrap();
@@ -2512,19 +3193,14 @@ mod tests {
                     assert_eq!(wire["one_source"], json!(view.one_source));
                     assert_eq!(wire["sources_disagree"], json!(view.sources_disagree));
                     assert_eq!(pending.sources, Flags { one_source, disagree: !one_source });
-                    assert!(pending.caution);
+                    assert!(!pending.caution);
                     let (_, coins, spending) = checked;
                     let new = Sent {
                         from: "schnorr".into(),
                         outpoints: pending.plan.coins.iter().map(Coin::outpoint).collect(),
                         ..record('2', "submitting")
                     };
-                    // A plan that showed no warning cannot use a source flag to get past the protection when it is recorded.
-                    pending.caution = false;
-                    let rejected = record_payment(&state, &pending, &coins, &spending, state.generation(), new.clone()).unwrap_err();
-                    assert_eq!(rejected.code, "coins_changed");
-                    assert_eq!(store::load::<Vec<Sent>>(&state.sent_path()), vec![old]);
-                    pending.caution = true;
+                    // Source notices alone do not require the earlier-payment warning.
                     record_payment(&state, &pending, &coins, &spending, state.generation(), new.clone()).unwrap();
                     let saved: Vec<Sent> = store::load(&state.sent_path());
                     assert_eq!(saved[0], new);

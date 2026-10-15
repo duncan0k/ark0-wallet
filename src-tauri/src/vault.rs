@@ -167,12 +167,6 @@ pub fn change_password(path: &Path, old: &str, new: &str) -> Result<(), VaultErr
     write_replacing(path, &seal(new, &secret)?)
 }
 
-/// Deletes the vault; the old password must open it first.
-pub fn delete(path: &Path, password: &str) -> Result<(), VaultError> {
-    open(path, password)?;
-    std::fs::remove_file(path).map_err(|_| VaultError::Io)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,9 +189,6 @@ mod tests {
         change_password(&path, "correct horse", "battery staple").unwrap();
         assert_eq!(open(&path, "correct horse").err(), Some(VaultError::WrongPassword));
         assert_eq!(open(&path, "battery staple").unwrap().recovery_text(), secret.recovery_text());
-        assert_eq!(delete(&path, "correct horse").err(), Some(VaultError::WrongPassword));
-        delete(&path, "battery staple").unwrap();
-        assert!(!exists(&path));
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

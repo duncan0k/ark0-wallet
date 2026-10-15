@@ -15,11 +15,15 @@ mod wallet;
 
 use tauri::Manager;
 
-/// Mobile development uses Tauri's local proxy; only desktop development uses the dev server's origin.
+/// Mobile development proxies localhost and literal IP hosts, matching Tauri's is_local_network_url.
 fn app_origin(dev_url: Option<&tauri::Url>, dev: bool, target_os: &str, use_https_scheme: bool) -> tauri::Url {
-    if dev && !matches!(target_os, "android" | "ios") {
+    if dev {
         if let Some(url) = dev_url {
-            return url.clone();
+            // A host with no domain is an IPv4 or IPv6 address.
+            let local_network = url.domain() == Some("localhost") || (url.host().is_some() && url.domain().is_none());
+            if !matches!(target_os, "android" | "ios") || !local_network {
+                return url.clone();
+            }
         }
     }
     let local = if matches!(target_os, "windows" | "android") {
@@ -159,21 +163,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn app_origin_matches_desktop_and_android_in_dev_and_release() {
-        let dev_url = tauri::Url::parse("http://localhost:1420").unwrap();
-        for target_os in ["windows", "linux", "macos", "android"] {
-            for dev in [false, true] {
-                for https in [false, true] {
-                    for configured_dev_url in [None, Some(&dev_url)] {
-                        let expected = if dev && target_os != "android" && configured_dev_url.is_some() {
-                            dev_url.as_str()
-                        } else if matches!(target_os, "windows" | "android") {
-                            if https { "https://tauri.localhost/" } else { "http://tauri.localhost/" }
-                        } else {
-                            "tauri://localhost"
-                        };
-                        assert_eq!(app_origin(configured_dev_url, dev, target_os, https), tauri::Url::parse(expected).unwrap(),
-                            "{target_os}, dev={dev}, https={https}, dev_url={configured_dev_url:?}");
+    fn app_origin_matches_desktop_and_mobile_in_dev_and_release() {
+        for (url, proxied) in [
+            ("http://localhost:1420", true),
+            ("http://127.0.0.1:1420", true),
+            ("http://192.168.1.2:1420", true),
+            ("http://[::1]:1420", true),
+            ("http://[2001:db8::1]:1420", true),
+            ("http://wallet-dev.example:1420", false),
+            ("http://localhost.:1420", false),
+            ("http://app.localhost:1420", false),
+            ("file:///dev/index.html", false),
+        ] {
+            let dev_url = tauri::Url::parse(url).unwrap();
+            for target_os in ["windows", "linux", "macos", "android", "ios"] {
+                for dev in [false, true] {
+                    for https in [false, true] {
+                        for configured_dev_url in [None, Some(&dev_url)] {
+                            let expected = if dev && configured_dev_url.is_some() && (!matches!(target_os, "android" | "ios") || !proxied) {
+                                dev_url.as_str()
+                            } else if matches!(target_os, "windows" | "android") {
+                                if https { "https://tauri.localhost/" } else { "http://tauri.localhost/" }
+                            } else {
+                                "tauri://localhost"
+                            };
+                            assert_eq!(app_origin(configured_dev_url, dev, target_os, https), tauri::Url::parse(expected).unwrap(),
+                                "{target_os}, dev={dev}, https={https}, dev_url={configured_dev_url:?}");
+                        }
                     }
                 }
             }
@@ -182,8 +198,8 @@ mod tests {
 
     #[test]
     fn navigation_stays_on_the_exact_app_origin() {
-        // Linux/macOS, Windows/Android (HTTP or HTTPS), and a configured development server.
-        for root in ["tauri://localhost", "http://tauri.localhost", "https://tauri.localhost", "http://localhost:1420"] {
+        // Linux/macOS/iOS, Windows/Android (HTTP or HTTPS), and configured development servers.
+        for root in ["tauri://localhost", "http://tauri.localhost", "https://tauri.localhost", "http://localhost:1420", "http://wallet-dev.example:1420"] {
             let origin = tauri::Url::parse(root).unwrap();
             for path in ["/", "/index.html", "/settings?tab=recovery#words"] {
                 assert!(navigation_allowed(&origin, &tauri::Url::parse(&format!("{root}{path}")).unwrap()));

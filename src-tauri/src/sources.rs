@@ -20,10 +20,6 @@ impl Flags {
         self.disagree |= answer.flags.disagree;
         answer.value
     }
-
-    pub fn caution(&self) -> bool {
-        self.one_source || self.disagree
-    }
 }
 
 // A failed query keeps its flags, so a refresh of an old payment does not lose the one-node warning.

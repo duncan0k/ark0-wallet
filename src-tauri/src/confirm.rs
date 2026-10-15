@@ -49,6 +49,13 @@ pub struct Dialog {
     cancel: &'static str,
 }
 
+#[cfg(test)]
+impl Dialog {
+    pub(crate) fn body(&self) -> &str {
+        &self.body
+    }
+}
+
 /// Recovery material is shown only after the user confirms outside the web view.
 pub fn recovery(locale: &str, legacy: bool) -> Dialog {
     match (locale, legacy) {
@@ -312,10 +319,10 @@ mod tests {
             for one_source in [false, true] {
                 for sources_disagree in [false, true] {
                     let flags = Flags { one_source, disagree: sources_disagree };
-                    let dialog = payment(locale, 1, "tb1ztest", 2, 0, flags.caution(), flags);
+                    let dialog = payment(locale, 1, "tb1ztest", 2, 0, false, flags);
                     assert_eq!(dialog.body.contains(one), one_source);
                     assert_eq!(dialog.body.contains(disagree), sources_disagree);
-                    assert_eq!(dialog.body.contains(earlier), flags.caution());
+                    assert!(!dialog.body.contains(earlier));
                     for notice in [one, disagree] {
                         if let Some(at) = dialog.body.find(notice) {
                             assert!(at < dialog.body.find(closing).unwrap());
