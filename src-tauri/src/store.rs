@@ -66,6 +66,9 @@ pub struct Sent {
 }
 
 impl Sent {
+    /// Settled for good: six signed blocks verified. Such a payment is not looked up again. On a signet only
+    /// the block signer can make a competing chain, so the wallet does not watch for a reorganisation deeper
+    /// than that.
     pub fn proven(&self) -> bool {
         self.status == "confirmed" && self.proof_verified && self.confirmations >= crate::proof::REQUIRED_BLOCKS
     }

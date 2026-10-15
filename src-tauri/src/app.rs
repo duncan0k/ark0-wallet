@@ -606,7 +606,8 @@ pub struct SendPlan {
     to_self: bool,
     /// Earlier payments without a clear answer that this one spends a coin of (see `plan_send`).
     replaces: usize,
-    /// An earlier payment the wallet doubted has gone out, or most likely has (its coins are spent).
+    /// An earlier payment the wallet doubted has gone out, or may have: none of its coins are usable, or
+    /// a payment on its way spends one of them.
     went_out: bool,
     /// A payment without a clear answer from another address, which this one cannot replace.
     unclear_elsewhere: bool,
@@ -1013,8 +1014,8 @@ struct Earlier {
     required: Vec<Coin>,
     /// The txids of those payments.
     replaces: Vec<String>,
-    /// Such a payment with no usable coins left and no proven cover: it may still go out, and a new
-    /// payment may be one more rather than a retry.
+    /// Such a payment with no usable coins left, or with a coin spent by a payment on its way, and no
+    /// proven cover: it may still go out, and a new payment may be one more rather than a retry.
     spent: bool,
     /// Such a payment from another address, or recorded without its coins: the new payment cannot replace
     /// it. It stays one until a payment from its own address covers it.
@@ -1044,6 +1045,7 @@ fn earlier_payments(sent: &[Sent], account: &str, spendable: &[Coin], pending: &
             e.elsewhere = true;
             continue;
         }
+        e.spent |= s.outpoints.iter().any(|o| in_flight.contains(o));
         match usable.iter().filter(|c| s.outpoints.contains(&c.outpoint())).max_by_key(|c| c.sats) {
             Some(coin) => {
                 if !e.required.contains(coin) {
@@ -1696,7 +1698,7 @@ mod tests {
     fn a_mempool_retry_keeps_the_originals_remaining_coin_required() {
         let mut sent = vec![
             Sent { doubted: true, ..paid('1', "unknown", "schnorr", &['a', 'b']) },
-            paid('2', "mempool", "schnorr", &['a']),
+            paid('2', "mempool", "schnorr", &['a', 'd']),
         ];
         mark_replaced(&mut sent);
         let spendable = [coin('a', 50_000), coin('b', 60_000), coin('c', 90_000)];
@@ -1705,10 +1707,116 @@ mod tests {
         assert!(sent[0].doubted && !settled(&sent[0]));
         assert_eq!(earlier.required, vec![coin('b', 60_000)]);
         assert_eq!(earlier.replaces, vec![sent[0].txid.clone()]);
+        assert!(earlier.spent);
         let account = Account::new(Template::schnorr(&[3; 32]), Path::Schnorr).unwrap();
         let destination = parse_destination(&Template::schnorr(&[5; 32]).address).unwrap();
         let plan = wallet::plan_spend(&account, &earlier.usable, &earlier.required, &destination, Amount::Sats(10_000), 0).unwrap();
         assert_eq!(plan.coins, vec![coin('b', 60_000)]);
+    }
+
+    #[test]
+    fn a_mempool_retry_with_a_remaining_coin_warns_until_either_payment_is_proven() {
+        use crate::api::tests::{response, serve, utxo};
+        use crate::chain::tests::state as chain_state;
+        use crate::sources::tests::coins;
+
+        for winner in 0..2 {
+            let mut nonce = [0; 8];
+            getrandom::fill(&mut nonce).unwrap();
+            let dir = std::env::temp_dir().join(format!("pqw-retry-remaining-{}", hex::encode(nonce)));
+            let mut state = AppState::new(dir.clone()).unwrap();
+            *guard(&state.session) = Some(Session::new(&Secret::new_bip39().unwrap()).unwrap());
+            let original = Sent { doubted: true, ..paid('1', "unknown", "schnorr", &['a', 'b']) };
+            let retry = paid('2', "mempool", "schnorr", &['a', 'd']);
+            store::save(&state.sent_path(), &vec![original, retry]).unwrap();
+            let mut replies = Vec::new();
+            // Review and confirmation recheck: b remains usable, but B and a payment spending b can both go through.
+            for _ in 0..2 {
+                replies.extend([
+                    response(200, &chain_state(40_000, false).to_string()),
+                    response(200, &coins(vec![utxo('b', 0, 60_000), utxo('c', 0, 90_000)])),
+                    response(200, r#"{"status":"unknown"}"#),
+                    response(200, r#"{"status":"mempool"}"#),
+                    response(200, &coins(vec![])), response(200, &coins(vec![])),
+                ]);
+            }
+            // Once A or B is proven, b is either spent or free; c can pay without covering either payment.
+            let spendable = if winner == 0 {
+                vec![utxo('c', 0, 90_000)]
+            } else {
+                vec![utxo('b', 0, 60_000), utxo('c', 0, 90_000)]
+            };
+            replies.extend([
+                response(200, &chain_state(40_000, false).to_string()),
+                response(200, &coins(spendable)),
+                response(200, &coins(vec![])), response(200, &coins(vec![])),
+            ]);
+            let (a, first) = serve(replies.clone());
+            let (b, second) = serve(replies);
+            state.sources = Arc::new(Sources::new(a, b));
+            let to = state.templates().unwrap().0.address;
+            let (view, mut pending, (_, coins, spending)) = tauri::async_runtime::block_on(async {
+                let view = plan_payment(&state, Kind::Schnorr, to.clone(), "0.0001".into()).await.unwrap();
+                let mut pending = guard(&state.pending).take().unwrap();
+                let checked = recheck_payment(&state, &mut pending).await.unwrap();
+                (view, pending, checked)
+            });
+            assert!(view.went_out && pending.caution);
+            assert_eq!(view.replaces, 1);
+            assert!(!view.unclear_elsewhere && !view.unrecorded && !view.one_source && !view.sources_disagree);
+            assert_eq!(pending.plan.coins, vec![Coin { height: 10, ..coin('b', 60_000) }]);
+            // Covering A does not replace B: the record guard requires the dialog's warning too.
+            pending.caution = false;
+            let new = Sent { outpoints: pending.plan.coins.iter().map(Coin::outpoint).collect(),
+                ..paid('3', "submitting", "schnorr", &[]) };
+            assert_eq!(record_payment(&state, &pending, &coins, &spending, state.generation(), new).unwrap_err().code, "coins_changed");
+            edit_sent(&state, |sent| {
+                assert_eq!(sent[0].status, "unknown");
+                assert!(sent[0].doubted && !settled(&sent[0]));
+                assert!(!surfaced(sent));
+                sent[1 - winner].status = "unknown".into();
+                sent[winner].status = "confirmed".into();
+                sent[winner].confirmations = REQUIRED_BLOCKS;
+                sent[winner].proof_verified = true;
+                mark_replaced(sent);
+                assert!(sent[winner].proven());
+                assert_eq!(sent[1 - winner].status, "replaced");
+            }).unwrap();
+            let free = tauri::async_runtime::block_on(plan_payment(&state, Kind::Schnorr, to, "0.0001".into())).unwrap();
+            assert_eq!(free.replaces, 0);
+            assert!(!free.went_out && !free.unclear_elsewhere && !free.unrecorded);
+            let pending = guard(&state.pending).take().unwrap();
+            assert!(!pending.caution);
+            assert_eq!(pending.plan.coins, vec![Coin { height: 10, ..coin('c', 90_000) }]);
+            assert_eq!((first.join().unwrap().len(), second.join().unwrap().len()), (16, 16));
+            drop(state);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_chain_of_retries_warns_when_one_is_in_the_mempool() {
+        let sent = [
+            paid('1', "unknown", "schnorr", &['a', 'b']),
+            Sent { doubted: true, ..paid('2', "unknown", "schnorr", &['a', 'd']) },
+            paid('3', "mempool", "schnorr", &['b', 'd']),
+        ];
+        let earlier = earlier_payments(&sent, "schnorr", &[coin('a', 50_000), coin('b', 60_000), coin('c', 90_000), coin('d', 70_000)], &[]);
+        assert!(earlier.spent && !surfaced(&sent));
+        assert_eq!(earlier.required, vec![coin('a', 50_000)]);
+        assert_eq!(earlier.replaces, vec![sent[0].txid.clone(), sent[1].txid.clone()]);
+    }
+
+    #[test]
+    fn a_refused_original_warns_when_a_retry_is_in_the_mempool() {
+        let sent = [
+            paid('1', "rejected", "schnorr", &['a', 'b']),
+            paid('2', "mempool", "schnorr", &['a', 'd']),
+        ];
+        let earlier = earlier_payments(&sent, "schnorr", &[coin('a', 50_000), coin('b', 60_000), coin('c', 90_000)], &[]);
+        assert!(earlier.spent);
+        assert_eq!(earlier.required, vec![coin('b', 60_000)]);
+        assert_eq!(earlier.replaces, vec![sent[0].txid.clone()]);
     }
 
     #[test]
