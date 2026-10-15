@@ -63,6 +63,9 @@ pub struct Sent {
     /// did is pointed out before the next payment.
     #[serde(default)]
     pub doubted: bool,
+    /// The order in which its last lookup started; 0 means never looked up.
+    #[serde(default)]
+    pub lookup_mark: u64,
 }
 
 impl Sent {
