@@ -70,25 +70,73 @@ impl From<&Settings> for SettingsFile {
 }
 
 impl From<SettingsFile> for Settings {
+    /// First what 0.1.1 reads, with its check: an invalid language or idle lock gives the defaults, as it
+    /// does there. Only then does a newer language take the place of `language`.
     fn from(f: SettingsFile) -> Self {
-        let language = match f.interface_language {
-            Some(l) if NEWER_LANGUAGES.contains(&l.as_str()) => l,
-            _ => f.language,
-        };
-        Settings {
-            language,
+        let base = Settings {
+            language: f.language,
             auto_lock_minutes: f.auto_lock_minutes,
+        };
+        let older = !NEWER_LANGUAGES.contains(&base.language.as_str());
+        let mut settings = if base.valid() && older {
+            base
+        } else {
+            Settings::default()
+        };
+        if let Some(language) = f.interface_language {
+            if NEWER_LANGUAGES.contains(&language.as_str()) {
+                settings.language = language;
+            }
         }
+        settings
     }
 }
 
+/// Takes `interface_language` when it is a string and skips anything else the way serde_json skips an
+/// unknown field, without building it: a value nested too deep to build would otherwise fail the whole file.
 fn lenient_language<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
-    Ok(serde_json::Value::deserialize(d)?
-        .as_str()
-        .map(str::to_owned))
+    use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
+    struct Lenient;
+    impl<'de> Visitor<'de> for Lenient {
+        type Value = Option<String>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("any JSON value")
+        }
+        fn visit_str<E>(self, v: &str) -> Result<Self::Value, E> {
+            Ok(Some(v.to_owned()))
+        }
+        fn visit_string<E>(self, v: String) -> Result<Self::Value, E> {
+            Ok(Some(v))
+        }
+        fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_unit<E>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        // The elements and entries go to serde_json's own skipping, which does not recurse.
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            while seq.next_element::<IgnoredAny>()?.is_some() {}
+            Ok(None)
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+            while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+            Ok(None)
+        }
+    }
+    d.deserialize_any(Lenient)
 }
 
-/// The settings saved in `path`, or the defaults; the caller still checks them with `valid`.
+/// The settings saved in `path`, or the defaults.
 pub fn load_settings(path: &Path) -> Settings {
     load::<SettingsFile>(path).into()
 }
@@ -441,6 +489,72 @@ mod tests {
                 auto_lock_minutes: 30
             }
         );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn invalid_base_settings_give_the_defaults_before_a_newer_language_applies() {
+        let path = settings_path("invalid-base");
+        for (file, language) in [
+            (
+                r#"{"language":"invalid","auto_lock_minutes":0,"interface_language":"ja"}"#,
+                "ja",
+            ),
+            (
+                r#"{"language":"en","auto_lock_minutes":241,"interface_language":"ko"}"#,
+                "ko",
+            ),
+            (r#"{"language":"ru","auto_lock_minutes":0}"#, "auto"),
+            (
+                r#"{"language":"invalid","auto_lock_minutes":0,"interface_language":"fr"}"#,
+                "auto",
+            ),
+        ] {
+            std::fs::write(&path, file).unwrap();
+            let expected = Settings {
+                language: language.into(),
+                ..Settings::default()
+            };
+            assert_eq!(load_settings(&path), expected, "{file}");
+            // 0.1.1 falls back to the defaults for the same file.
+            let old: OldSettings = serde_json::from_str(file).unwrap();
+            assert!(!old.valid());
+        }
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn any_other_interface_language_is_skipped_however_deep_it_nests() {
+        let path = settings_path("nested");
+        let depth = 10_000;
+        let arrays = format!("{}{}", "[".repeat(depth), "]".repeat(depth));
+        let objects = format!("{}1{}", r#"{"a":"#.repeat(depth), "}".repeat(depth));
+        let mixed = format!("{}1{}", r#"[{"a":"#.repeat(depth), "}]".repeat(depth));
+        let others = [
+            arrays,
+            objects,
+            mixed,
+            r#"["ja"]"#.into(),
+            r#"{"ja":"ja"}"#.into(),
+            "true".into(),
+            "-1.5".into(),
+        ];
+        for value in others {
+            let file = format!(
+                r#"{{"language":"zh-Hant","auto_lock_minutes":60,"interface_language":{value},"after":1}}"#
+            );
+            std::fs::write(&path, &file).unwrap();
+            let expected = Settings {
+                language: "zh-Hant".into(),
+                auto_lock_minutes: 60,
+            };
+            let old: OldSettings = serde_json::from_str(&file).unwrap();
+            assert_eq!(load_settings(&path), expected);
+            assert_eq!(
+                (old.language.as_str(), old.auto_lock_minutes),
+                ("zh-Hant", 60)
+            );
+        }
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }
