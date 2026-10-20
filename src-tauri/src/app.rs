@@ -178,7 +178,7 @@ pub struct AppState {
 impl AppState {
     pub fn new(dir: PathBuf) -> Result<Self, std::fs::TryLockError> {
         let wallet_lock = store::lock_wallet(&dir)?;
-        let settings: Settings = store::load(&dir.join("settings.json"));
+        let settings = store::load_settings(&dir.join("settings.json"));
         let state = AppState {
             sources: Arc::new(Sources::default()),
             settings: Mutex::new(if settings.valid() { settings } else { Settings::default() }),
@@ -1498,7 +1498,8 @@ pub fn settings_set(state: State<'_, AppState>, settings: Settings) -> Res<Setti
     if !settings.valid() {
         return Err(Failure::new("invalid_settings"));
     }
-    store::save(&state.dir.join("settings.json"), &settings).map_err(|_| Failure::new("io"))?;
+    store::save_settings(&state.dir.join("settings.json"), &settings)
+        .map_err(|_| Failure::new("io"))?;
     *guard(&state.settings) = settings.clone();
     Ok(settings)
 }

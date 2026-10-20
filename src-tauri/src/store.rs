@@ -6,6 +6,7 @@ use std::path::Path;
 
 pub const DEFAULT_AUTO_LOCK_MINUTES: u32 = 15;
 
+/// The settings as the interface reads and changes them; on disk they are kept as a `SettingsFile`.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct Settings {
@@ -27,6 +28,73 @@ impl Settings {
     pub fn valid(&self) -> bool {
         matches!(self.language.as_str(), "auto" | "zh-Hans" | "zh-Hant" | "en" | "ja" | "ko" | "ru" | "es") && self.auto_lock_minutes <= 240
     }
+}
+
+/// The languages 0.1.2 added. 0.1.1 drops the whole settings file when `language` holds one of them, so on
+/// disk they go in a field of their own that it ignores, and `language` says "auto".
+const NEWER_LANGUAGES: [&str; 4] = ["ja", "ko", "ru", "es"];
+
+/// The settings as they are kept on disk: `language` only ever holds a value 0.1.1 accepts.
+#[derive(Serialize, Deserialize)]
+#[serde(default)]
+struct SettingsFile {
+    language: String,
+    auto_lock_minutes: u32,
+    /// One of the newer languages; anything else found here is ignored rather than failing the whole file.
+    #[serde(
+        deserialize_with = "lenient_language",
+        skip_serializing_if = "Option::is_none"
+    )]
+    interface_language: Option<String>,
+}
+
+impl Default for SettingsFile {
+    fn default() -> Self {
+        SettingsFile::from(&Settings::default())
+    }
+}
+
+impl From<&Settings> for SettingsFile {
+    fn from(s: &Settings) -> Self {
+        let newer = NEWER_LANGUAGES.contains(&s.language.as_str());
+        SettingsFile {
+            language: if newer {
+                "auto".into()
+            } else {
+                s.language.clone()
+            },
+            auto_lock_minutes: s.auto_lock_minutes,
+            interface_language: newer.then(|| s.language.clone()),
+        }
+    }
+}
+
+impl From<SettingsFile> for Settings {
+    fn from(f: SettingsFile) -> Self {
+        let language = match f.interface_language {
+            Some(l) if NEWER_LANGUAGES.contains(&l.as_str()) => l,
+            _ => f.language,
+        };
+        Settings {
+            language,
+            auto_lock_minutes: f.auto_lock_minutes,
+        }
+    }
+}
+
+fn lenient_language<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    Ok(serde_json::Value::deserialize(d)?
+        .as_str()
+        .map(str::to_owned))
+}
+
+/// The settings saved in `path`, or the defaults; the caller still checks them with `valid`.
+pub fn load_settings(path: &Path) -> Settings {
+    load::<SettingsFile>(path).into()
+}
+
+pub fn save_settings(path: &Path, settings: &Settings) -> std::io::Result<()> {
+    save(path, &SettingsFile::from(settings))
 }
 
 /// A transaction this wallet signed and handed to the network.
@@ -242,6 +310,137 @@ mod tests {
         std::fs::write(&path, b"{ not json").unwrap();
         assert!(load_existing::<Vec<u32>>(&path).is_err());
         assert_eq!(load::<Vec<u32>>(&path), Vec::<u32>::new());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// 0.1.1's settings as it reads and writes them (at 1e43c46): every field defaulted, unknown ones ignored.
+    #[derive(Serialize, Deserialize)]
+    #[serde(default)]
+    struct OldSettings {
+        language: String,
+        auto_lock_minutes: u32,
+    }
+
+    impl Default for OldSettings {
+        fn default() -> Self {
+            OldSettings {
+                language: "auto".into(),
+                auto_lock_minutes: DEFAULT_AUTO_LOCK_MINUTES,
+            }
+        }
+    }
+
+    impl OldSettings {
+        fn valid(&self) -> bool {
+            matches!(
+                self.language.as_str(),
+                "auto" | "zh-Hans" | "zh-Hant" | "en"
+            ) && self.auto_lock_minutes <= 240
+        }
+    }
+
+    fn settings_path(label: &str) -> std::path::PathBuf {
+        let mut nonce = [0; 8];
+        getrandom::fill(&mut nonce).unwrap();
+        let dir = std::env::temp_dir().join(format!("pqw-settings-{label}-{}", hex::encode(nonce)));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("settings.json")
+    }
+
+    const LANGUAGES: [&str; 8] = ["auto", "zh-Hans", "zh-Hant", "en", "ja", "ko", "ru", "es"];
+
+    #[test]
+    fn every_language_reads_back_as_saved_and_an_older_version_keeps_language_and_lock() {
+        let path = settings_path("round-trip");
+        for language in LANGUAGES {
+            let settings = Settings {
+                language: language.into(),
+                auto_lock_minutes: 60,
+            };
+            save_settings(&path, &settings).unwrap();
+            assert_eq!(load_settings(&path), settings);
+            let old: OldSettings = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert!(old.valid());
+            let newer = NEWER_LANGUAGES.contains(&language);
+            assert_eq!(
+                (old.language.as_str(), old.auto_lock_minutes),
+                (if newer { "auto" } else { language }, 60)
+            );
+            let file: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(
+                file.get("interface_language").and_then(|v| v.as_str()),
+                newer.then_some(language)
+            );
+        }
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn an_unknown_interface_language_is_ignored_and_keeps_the_rest() {
+        let path = settings_path("unknown");
+        for (file, language) in [
+            (
+                r#"{"language":"zh-Hant","auto_lock_minutes":30,"interface_language":"fr"}"#,
+                "zh-Hant",
+            ),
+            (
+                r#"{"language":"en","auto_lock_minutes":30,"interface_language":7}"#,
+                "en",
+            ),
+            (
+                r#"{"language":"auto","auto_lock_minutes":30,"interface_language":null}"#,
+                "auto",
+            ),
+            (
+                r#"{"language":"zh-Hans","auto_lock_minutes":30,"interface_language":"en"}"#,
+                "zh-Hans",
+            ),
+        ] {
+            std::fs::write(&path, file).unwrap();
+            let settings = load_settings(&path);
+            assert_eq!(
+                settings,
+                Settings {
+                    language: language.into(),
+                    auto_lock_minutes: 30
+                }
+            );
+            assert!(settings.valid());
+        }
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_file_an_older_version_rewrote_reads_back_as_it_saved_it() {
+        let path = settings_path("downgrade");
+        std::fs::write(&path, r#"{"language":"en","auto_lock_minutes":5}"#).unwrap();
+        assert_eq!(
+            load_settings(&path),
+            Settings {
+                language: "en".into(),
+                auto_lock_minutes: 5
+            }
+        );
+        save_settings(
+            &path,
+            &Settings {
+                language: "ja".into(),
+                auto_lock_minutes: 60,
+            },
+        )
+        .unwrap();
+        // 0.1.1 reads the file, the user changes the idle lock there, and it writes the file back whole.
+        let mut old: OldSettings = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        old.auto_lock_minutes = 30;
+        save(&path, &old).unwrap();
+        assert_eq!(
+            load_settings(&path),
+            Settings {
+                language: "auto".into(),
+                auto_lock_minutes: 30
+            }
+        );
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }
