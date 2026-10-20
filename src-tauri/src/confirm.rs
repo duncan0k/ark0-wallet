@@ -663,7 +663,6 @@ mod tests {
     }
 
 
-
     #[test]
     fn removal_dialogs_in_each_language() {
         for (locale, title, body, ok, cancel) in [
