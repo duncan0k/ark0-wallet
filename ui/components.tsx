@@ -4,7 +4,7 @@ import type { ComponentChildren, JSX } from 'preact';
 import { createContext } from 'preact';
 import { useContext, useEffect, useRef, useState } from 'preact/hooks';
 import { errorText, fill, m } from './i18n';
-import { coins, group } from './format';
+import { coins, group, unit } from './format';
 import { brand, Logo } from './brand';
 
 // ---- icons: 24-unit strokes, drawn for this wallet ----
@@ -263,7 +263,7 @@ export function Amount({ sats, size = 'md' }: { sats: number; size?: 'md' | 'lg'
   return (
     <span class={`amount amount-${size}`}>
       <span class="amount-value">{coins(sats)}</span>
-      <span class="amount-unit">{m().common.unit}</span>
+      <span class="amount-unit">{unit(sats)}</span>
     </span>
   );
 }

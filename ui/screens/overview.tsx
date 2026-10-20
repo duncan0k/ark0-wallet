@@ -3,7 +3,7 @@ import type { AccountView, Chain, Kind, Overview as OverviewData } from '../api'
 import { codeOf, core } from '../api';
 import { Amount, Button, Card, Chip, CopyButton, Icon, Mono, Notice, useToast } from '../components';
 import { errorText, fill, m } from '../i18n';
-import { ago, coins, group, shorten } from '../format';
+import { ago, amount, coins, group, shorten } from '../format';
 
 export const ORDER: Kind[] = ['mldsa44', 'schnorr', 'mixed'];
 export const KIND_ICON: Record<Kind, string> = { mldsa44: 'drill', schnorr: 'lock', mixed: 'leaf' };
@@ -56,8 +56,8 @@ export function Overview({ data, legacy, loading, onRetry, onSend, onReceive }: 
           <span class="eyebrow">{o.available}</span>
           <Amount sats={available} size="xl" />
           <div class="balance-sub">
-            {incoming > 0 && <Chip tone="accent" dot>{fill(o.incoming, { amount: `${coins(incoming)} ${m().common.unit}` })}</Chip>}
-            {outgoing > 0 && <Chip tone="neutral" dot>{fill(o.outgoing, { amount: `${coins(outgoing)} ${m().common.unit}` })}</Chip>}
+            {incoming > 0 && <Chip tone="accent" dot>{fill(o.incoming, { amount: amount(incoming) })}</Chip>}
+            {outgoing > 0 && <Chip tone="neutral" dot>{fill(o.outgoing, { amount: amount(outgoing) })}</Chip>}
             {!complete && <Chip tone="warn">{o.incomplete}</Chip>}
           </div>
         </div>

@@ -3,7 +3,7 @@ import { useEffect, useState } from 'preact/hooks';
 import { core, type AppInfo, type Sent } from '../api';
 import { Button, Chip, CompareBars, CopyButton, Icon, Mono, Notice } from '../components';
 import { errorText, fill, m } from '../i18n';
-import { ago, coins, group, ms, shorten } from '../format';
+import { ago, amount, coins, group, ms, shorten } from '../format';
 
 export function Activity({ info, version }: { info: AppInfo | null; version: number }) {
   const [list, setList] = useState<Sent[] | null>(null);
@@ -57,7 +57,7 @@ function Details({ s, info }: { s: Sent; info: AppInfo | null }) {
         <div><dt>{a.txid}</dt><dd class="txid-line"><Mono class="break">{s.txid}</Mono><CopyButton text={s.txid} />
           <Button kind="ghost" size="sm" icon="external" onClick={() => core.openPage('tx', s.txid)} title={m().common.explorer} /></dd></div>
         <div><dt>{m().send.rowTo}</dt><dd><Mono class="break">{s.to}</Mono></dd></div>
-        <div><dt>{m().send.rowFee}</dt><dd>{coins(s.fee)} {m().common.unit}</dd></div>
+        <div><dt>{m().send.rowFee}</dt><dd>{amount(s.fee)}</dd></div>
         <div><dt>{m().send.rowSize}</dt><dd class="num">{group(s.vsize)} vB · {group(s.size)} B</dd></div>
         <div><dt>{m().send.rowSignature}</dt><dd>{s.signature === 'mldsa44' ? 'ML-DSA-44 · FIPS 204' : 'Schnorr · BIP-340'} · {fill(m().send.signedIn, { ms: ms(s.sign_ms) })}</dd></div>
       </dl>

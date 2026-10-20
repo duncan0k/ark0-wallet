@@ -1,5 +1,5 @@
 // Numbers and addresses as the interface shows them.
-import { fill, locale, m } from './i18n';
+import { fill, locale, m, type Locale } from './i18n';
 
 const COIN = 100_000_000;
 
@@ -8,6 +8,33 @@ export function coins(sats: number): string {
   const whole = Math.floor(sats / COIN);
   const fraction = String(sats % COIN).padStart(8, '0').replace(/0+$/, '');
   return fraction ? `${group(whole)}.${fraction}` : group(whole);
+}
+
+/** Coins from satoshis with the unit in the form for that amount: "1 test coin", "1.5 test coins". */
+export function amount(sats: number): string {
+  return `${coins(sats)} ${unit(sats)}`;
+}
+
+/** The unit in the form for an amount in satoshis. */
+export function unit(sats: number): string {
+  return unitOfCoins(sats / COIN);
+}
+
+const plurals = new Map<Locale, Intl.PluralRules>();
+
+/**
+ * The unit in the form for a number of coins, "other" for anything that is not a number. The rules look at
+ * up to eight decimals: by default they stop at three, and 0.0000209 would count as 0 and 1.0001 as 1.
+ */
+export function unitOfCoins(n: number): string {
+  const forms: Record<string, string> = m().common.unit;
+  if (!Number.isFinite(n)) return forms.other;
+  let rules = plurals.get(locale());
+  if (!rules) {
+    rules = new Intl.PluralRules(locale(), { maximumFractionDigits: 8 });
+    plurals.set(locale(), rules);
+  }
+  return forms[rules.select(n)] ?? forms.other;
 }
 
 /**

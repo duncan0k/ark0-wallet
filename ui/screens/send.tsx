@@ -4,7 +4,7 @@ import { useEffect, useRef, useState } from 'preact/hooks';
 import { codeOf, core, type AccountView, type AppInfo, type Kind, type Overview, type SendPlan, type SendResult } from '../api';
 import { Amount, Button, CompareBars, CopyButton, Field, Icon, Modal, Mono, Notice, useToast } from '../components';
 import { errorText, fill, locale, m } from '../i18n';
-import { coins, group, ms } from '../format';
+import { amount as withUnit, coins, group, ms, unit, unitOfCoins } from '../format';
 import { ORDER } from './overview';
 
 const SIGNATURE_NAME = { mldsa44: 'ML-DSA-44 · FIPS 204', schnorr: 'Schnorr · BIP-340' };
@@ -101,7 +101,7 @@ export function Send({ data, info, onSent, onActivity, preferred }: {
             <div class="input-wrap">
               <input id="amount" class="input num" inputMode="decimal" placeholder="0.00" disabled={all} value={all ? coins(source.spendable) : amount}
                 onInput={(e) => setAmount((e.target as HTMLInputElement).value)} />
-              <span class="input-unit">{m().common.unit}</span>
+              <span class="input-unit">{all ? unit(source.spendable) : unitOfCoins(amount.trim() ? Number(amount) : NaN)}</span>
               <button type="button" class={`input-affix${all ? ' on' : ''}`} onClick={() => setAll(!all)}>{m().send.max}</button>
             </div>
           </Field>
@@ -131,7 +131,7 @@ function Summary({ source, info }: { source: AccountView; info: AppInfo | null }
         <div><dt>{s.sumSignature}</dt><dd>{SIGNATURE_NAME[path]}</dd></div>
         <div><dt>{s.sumSigSize}</dt><dd class="num">{cost ? fill(s.bytes, { n: group(cost.signature_bytes) }) : '—'}</dd></div>
         <div><dt>{s.sumTxSize}</dt><dd class="num">{cost ? `${group(cost.tx_vsize)} vB` : '—'}</dd></div>
-        <div><dt>{s.sumFee}</dt><dd class="num">{cost && info ? fill(s.feeFrom, { amount: `${coins(cost.tx_vsize * info.fee_rate)} ${m().common.unit}` }) : '—'}</dd></div>
+        <div><dt>{s.sumFee}</dt><dd class="num">{cost && info ? fill(s.feeFrom, { amount: withUnit(cost.tx_vsize * info.fee_rate) }) : '—'}</dd></div>
       </dl>
       {pq && classic && (
         <div class="compare">
@@ -177,8 +177,8 @@ function ReviewDialog({ plan, all, onClose, onSent }: { plan: SendPlan; all: boo
       <dl class="rows">
         <div><dt>{s.rowFrom}</dt><dd>{m().kinds[plan.from].title}</dd></div>
         <div><dt>{s.rowTo}</dt><dd><Mono class="break">{plan.to}</Mono></dd></div>
-        <div><dt>{s.rowFee}</dt><dd>{coins(plan.fee)} {m().common.unit} <span class="muted">· {plan.fee_rate} sat/vB</span></dd></div>
-        {plan.change > 0 && <div><dt>{s.rowChange}</dt><dd>{coins(plan.change)} {m().common.unit}</dd></div>}
+        <div><dt>{s.rowFee}</dt><dd>{withUnit(plan.fee)} <span class="muted">· {plan.fee_rate} sat/vB</span></dd></div>
+        {plan.change > 0 && <div><dt>{s.rowChange}</dt><dd>{withUnit(plan.change)}</dd></div>}
         <div><dt>{s.rowSignature}</dt><dd>{SIGNATURE_NAME[plan.signature]}</dd></div>
         <div><dt>{s.rowSize}</dt><dd class="num">{group(plan.vsize)} vB <span class="muted">· {group(plan.size)} B</span></dd></div>
         <div><dt>{s.rowInputs}</dt><dd class="num">{plan.inputs}</dd></div>
