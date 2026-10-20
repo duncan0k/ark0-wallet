@@ -22,7 +22,7 @@ pub fn locale(setting: &str, resolved: Option<&str>) -> &'static str {
 
 /// The message for a second instance, in every language the wallet has: it runs before any window exists, so
 /// there is no language setting or system language to read.
-const RUNNING_MESSAGE: &str = "钱包已经在运行，请使用已经打开的窗口。\n錢包已經在執行，請使用已經開啟的視窗。\nThe wallet is already running. Use the window that is already open.";
+const RUNNING_MESSAGE: &str = "钱包已经在运行，请使用已经打开的窗口。\n錢包已經在執行，請使用已經開啟的視窗。\nThe wallet is already running. Use the window that is already open.\nウォレットはすでに起動しています。開いているウィンドウをお使いください。\n지갑이 이미 실행 중입니다. 이미 열려 있는 창을 사용하세요.\nКошелёк уже запущен. Пользуйтесь окном, которое уже открыто.\nLa billetera ya se está ejecutando. Usa la ventana que está abierta.";
 
 /// No AppState is installed in this instance, so no command can read or change wallet files. The process ends
 /// once the message is closed.
@@ -87,61 +87,53 @@ pub fn recovery(locale: &str, legacy: bool) -> Dialog {
             ok: "顯示",
             cancel: "取消",
         },
-        // PLACEHOLDER: translation pending
         ("ja", false) => Dialog {
-            title: "Show the recovery words",
-            body: "This wallet's recovery words will be shown in the window. Anyone who sees them can take every coin in the wallet. Make sure no one is watching and the screen is not being recorded or shared.".into(),
-            ok: "Show",
-            cancel: "Cancel",
+            title: "リカバリーワードを表示",
+            body: "このウォレットのリカバリーワードがウィンドウに表示されます。これを見た人は、ウォレットのコインをすべて持ち去ることができます。周りに誰もいないこと、画面が録画も共有もされていないことを確かめてください。".into(),
+            ok: "表示",
+            cancel: "キャンセル",
         },
-        // PLACEHOLDER: translation pending
         ("ja", true) => Dialog {
-            title: "Show the backup code",
-            body: "This wallet's backup code will be shown in the window. Anyone who sees it can take every coin in the wallet. Make sure no one is watching and the screen is not being recorded or shared.".into(),
-            ok: "Show",
-            cancel: "Cancel",
+            title: "バックアップコードを表示",
+            body: "このウォレットのバックアップコードがウィンドウに表示されます。これを見た人は、ウォレットのコインをすべて持ち去ることができます。周りに誰もいないこと、画面が録画も共有もされていないことを確かめてください。".into(),
+            ok: "表示",
+            cancel: "キャンセル",
         },
-        // PLACEHOLDER: translation pending
         ("ko", false) => Dialog {
-            title: "Show the recovery words",
-            body: "This wallet's recovery words will be shown in the window. Anyone who sees them can take every coin in the wallet. Make sure no one is watching and the screen is not being recorded or shared.".into(),
-            ok: "Show",
-            cancel: "Cancel",
+            title: "복구 단어 보기",
+            body: "이 지갑의 복구 단어가 창에 표시됩니다. 이 단어를 본 사람은 누구나 지갑의 코인을 모두 가져갈 수 있습니다. 주변에 보는 사람이 없는지, 화면이 녹화되거나 공유되고 있지 않은지 확인하세요.".into(),
+            ok: "보기",
+            cancel: "취소",
         },
-        // PLACEHOLDER: translation pending
         ("ko", true) => Dialog {
-            title: "Show the backup code",
-            body: "This wallet's backup code will be shown in the window. Anyone who sees it can take every coin in the wallet. Make sure no one is watching and the screen is not being recorded or shared.".into(),
-            ok: "Show",
-            cancel: "Cancel",
+            title: "백업 코드 보기",
+            body: "이 지갑의 백업 코드가 창에 표시됩니다. 이 코드를 본 사람은 누구나 지갑의 코인을 모두 가져갈 수 있습니다. 주변에 보는 사람이 없는지, 화면이 녹화되거나 공유되고 있지 않은지 확인하세요.".into(),
+            ok: "보기",
+            cancel: "취소",
         },
-        // PLACEHOLDER: translation pending
         ("ru", false) => Dialog {
-            title: "Show the recovery words",
-            body: "This wallet's recovery words will be shown in the window. Anyone who sees them can take every coin in the wallet. Make sure no one is watching and the screen is not being recorded or shared.".into(),
-            ok: "Show",
-            cancel: "Cancel",
+            title: "Показать слова для восстановления",
+            body: "Слова для восстановления этого кошелька будут показаны в окне. Тот, кто их увидит, сможет забрать все монеты из кошелька. Убедитесь, что рядом никого нет, а запись и демонстрация экрана выключены.".into(),
+            ok: "Показать",
+            cancel: "Отмена",
         },
-        // PLACEHOLDER: translation pending
         ("ru", true) => Dialog {
-            title: "Show the backup code",
-            body: "This wallet's backup code will be shown in the window. Anyone who sees it can take every coin in the wallet. Make sure no one is watching and the screen is not being recorded or shared.".into(),
-            ok: "Show",
-            cancel: "Cancel",
+            title: "Показать резервный код",
+            body: "Резервный код этого кошелька будет показан в окне. Тот, кто его увидит, сможет забрать все монеты из кошелька. Убедитесь, что рядом никого нет, а запись и демонстрация экрана выключены.".into(),
+            ok: "Показать",
+            cancel: "Отмена",
         },
-        // PLACEHOLDER: translation pending
         ("es", false) => Dialog {
-            title: "Show the recovery words",
-            body: "This wallet's recovery words will be shown in the window. Anyone who sees them can take every coin in the wallet. Make sure no one is watching and the screen is not being recorded or shared.".into(),
-            ok: "Show",
-            cancel: "Cancel",
+            title: "Mostrar las palabras de recuperación",
+            body: "Las palabras de recuperación de esta billetera se mostrarán en la ventana. Quien las vea puede llevarse todas las monedas de la billetera. Asegúrate de que nadie esté mirando y de que la pantalla no se esté grabando ni compartiendo.".into(),
+            ok: "Mostrar",
+            cancel: "Cancelar",
         },
-        // PLACEHOLDER: translation pending
         ("es", true) => Dialog {
-            title: "Show the backup code",
-            body: "This wallet's backup code will be shown in the window. Anyone who sees it can take every coin in the wallet. Make sure no one is watching and the screen is not being recorded or shared.".into(),
-            ok: "Show",
-            cancel: "Cancel",
+            title: "Mostrar el código de respaldo",
+            body: "El código de respaldo de esta billetera se mostrará en la ventana. Quien lo vea puede llevarse todas las monedas de la billetera. Asegúrate de que nadie esté mirando y de que la pantalla no se esté grabando ni compartiendo.".into(),
+            ok: "Mostrar",
+            cancel: "Cancelar",
         },
         (_, false) => Dialog {
             title: "Show the recovery words",
@@ -174,33 +166,29 @@ pub fn drill(locale: &str, amount: u64, fee: u64) -> Dialog {
             ok: "簽章並交給節點核對",
             cancel: "取消",
         },
-        // PLACEHOLDER: translation pending
         "ja" => Dialog {
-            title: "Drill: sign a transfer back to yourself",
-            body: format!("The largest coin in the mixed address ({amount} test coins) will be signed over to the same address and given to the node to check. The wallet will not broadcast it.\n\nWhat the node gets is a valid transaction, and the node or anyone else may still send it: the coin would then come back to the same address, less the fee of {fee} test coins."),
-            ok: "Sign and give to the node",
-            cancel: "Cancel",
+            title: "演習：自分に戻す取引に署名",
+            body: format!("混合アドレスでいちばん大きいコイン 1 枚（{amount} テストコイン）を使い、同じアドレスに戻す取引に署名して、ノードに検証してもらいます。ウォレットはこの取引をブロードキャストしません。\n\nノードに渡すのは有効な取引なので、ノードやほかの誰かがそれを送信する可能性はあります：その場合、このコインは手数料 {fee} テストコインを差し引いて、同じアドレスに戻ります。"),
+            ok: "署名してノードで検証",
+            cancel: "キャンセル",
         },
-        // PLACEHOLDER: translation pending
         "ko" => Dialog {
-            title: "Drill: sign a transfer back to yourself",
-            body: format!("The largest coin in the mixed address ({amount} test coins) will be signed over to the same address and given to the node to check. The wallet will not broadcast it.\n\nWhat the node gets is a valid transaction, and the node or anyone else may still send it: the coin would then come back to the same address, less the fee of {fee} test coins."),
-            ok: "Sign and give to the node",
-            cancel: "Cancel",
+            title: "훈련: 나에게 되돌려 보내는 트랜잭션에 서명",
+            body: format!("혼합 주소에서 가장 큰 코인 하나({amount} 테스트 코인)를 같은 주소로 되돌려 보내는 트랜잭션에 서명해 노드에 검사를 맡깁니다. 지갑은 이 트랜잭션을 브로드캐스트하지 않습니다.\n\n노드에 넘기는 것은 유효한 트랜잭션이므로, 노드나 다른 사람이 이를 네트워크에 보낼 수도 있습니다. 그러면 이 코인은 수수료 {fee} 테스트 코인을 뺀 채 같은 주소로 돌아옵니다."),
+            ok: "서명하고 노드에 검사 맡기기",
+            cancel: "취소",
         },
-        // PLACEHOLDER: translation pending
         "ru" => Dialog {
-            title: "Drill: sign a transfer back to yourself",
-            body: format!("The largest coin in the mixed address ({amount} test coins) will be signed over to the same address and given to the node to check. The wallet will not broadcast it.\n\nWhat the node gets is a valid transaction, and the node or anyone else may still send it: the coin would then come back to the same address, less the fee of {fee} test coins."),
-            ok: "Sign and give to the node",
-            cancel: "Cancel",
+            title: "Учения: подписать перевод обратно себе",
+            body: format!("Кошелёк подпишет перевод самой крупной монеты смешанного адреса (сумма в тестовых монетах: {amount}) обратно на этот же адрес и передаст его узлу на проверку. В сеть кошелёк его не отправит.\n\nУзел получит действительную транзакцию, и он сам или кто-то другой всё равно может отправить её в сеть: тогда монета вернётся на тот же адрес за вычетом комиссии (в тестовых монетах: {fee})."),
+            ok: "Подписать и передать узлу",
+            cancel: "Отмена",
         },
-        // PLACEHOLDER: translation pending
         "es" => Dialog {
-            title: "Drill: sign a transfer back to yourself",
-            body: format!("The largest coin in the mixed address ({amount} test coins) will be signed over to the same address and given to the node to check. The wallet will not broadcast it.\n\nWhat the node gets is a valid transaction, and the node or anyone else may still send it: the coin would then come back to the same address, less the fee of {fee} test coins."),
-            ok: "Sign and give to the node",
-            cancel: "Cancel",
+            title: "Simulacro: firmar una transferencia de vuelta a ti",
+            body: format!("Con la moneda más grande de la dirección mixta (cantidad en monedas de prueba: {amount}) se firmará una transferencia de vuelta a la misma dirección, que se entregará al nodo para que la compruebe. La billetera no la difundirá por la red.\n\nLo que recibe el nodo es una transacción válida, y el nodo u otra persona aún podrían enviarla: en ese caso, la moneda volvería a la misma dirección, descontada la comisión (en monedas de prueba: {fee})."),
+            ok: "Firmar y entregar al nodo",
+            cancel: "Cancelar",
         },
         _ => Dialog {
             title: "Drill: sign a transfer back to yourself",
@@ -239,57 +227,53 @@ pub fn payment(locale: &str, send: u64, to: &str, fee: u64, change: u64, caution
             ok: "簽章並發出",
             cancel: "取消",
         },
-        // PLACEHOLDER: translation pending
         "ja" => Dialog {
-            title: "Confirm the payment",
+            title: "送金の確認",
             body: format!(
-                "Send {send} test coins\nto\n{to}\n\nFee {fee} test coins{}.\n\n{}{}{}Once confirmed it is signed and sent, and cannot be undone.",
-                if change > 0 { format!("; {change_text} test coins come back to your address as change") } else { String::new() },
-                if caution { "Note: an earlier payment did not clearly go out and may have gone out after all; this one would be paid on top of it.\n\n" } else { "" },
-                if sources.one_source { "Note: only one node answered, so nothing was checked against the other.\n\n" } else { "" },
-                if sources.disagree { "Note: the two nodes disagree.\n\n" } else { "" }
+                "{send} テストコインを送金\n送金先アドレス：\n{to}\n\n手数料は {fee} テストコインです{}。\n\n{}{}{}確定すると、すぐに署名して送信され、取り消すことはできません。",
+                if change > 0 { format!("。おつりの {change_text} テストコインはあなたのアドレスに戻ります") } else { String::new() },
+                if caution { "注意：以前の送金が送信されたかどうか確認できませんでしたが、実際には送信されている可能性があります。この送金は、それとは別に支払われます。\n\n" } else { "" },
+                if sources.one_source { "注意：今回は 1 台のノードしか応答しなかったため、もう 1 台のノードと照合できませんでした。\n\n" } else { "" },
+                if sources.disagree { "注意：2 台のノードの回答が一致しません。\n\n" } else { "" }
             ),
-            ok: "Sign and send",
-            cancel: "Cancel",
+            ok: "署名して送金",
+            cancel: "キャンセル",
         },
-        // PLACEHOLDER: translation pending
         "ko" => Dialog {
-            title: "Confirm the payment",
+            title: "송금 확인",
             body: format!(
-                "Send {send} test coins\nto\n{to}\n\nFee {fee} test coins{}.\n\n{}{}{}Once confirmed it is signed and sent, and cannot be undone.",
-                if change > 0 { format!("; {change_text} test coins come back to your address as change") } else { String::new() },
-                if caution { "Note: an earlier payment did not clearly go out and may have gone out after all; this one would be paid on top of it.\n\n" } else { "" },
-                if sources.one_source { "Note: only one node answered, so nothing was checked against the other.\n\n" } else { "" },
-                if sources.disagree { "Note: the two nodes disagree.\n\n" } else { "" }
+                "{send} 테스트 코인을 보냅니다\n받는 주소:\n{to}\n\n수수료는 {fee} 테스트 코인입니다{}.\n\n{}{}{}확인하면 바로 서명해 보내며, 되돌릴 수 없습니다.",
+                if change > 0 { format!(". 잔돈 {change_text} 테스트 코인은 내 주소로 돌아옵니다") } else { String::new() },
+                if caution { "주의: 전송 여부가 확인되지 않은 이전 송금이 있으며, 그 송금은 실제로 이미 전송되었을 수 있습니다. 이번 송금은 그 송금에 더해 따로 지급됩니다.\n\n" } else { "" },
+                if sources.one_source { "주의: 이번에는 노드 하나만 응답해서, 다른 노드와 대조하지 못했습니다.\n\n" } else { "" },
+                if sources.disagree { "주의: 두 노드의 답이 서로 다릅니다.\n\n" } else { "" }
             ),
-            ok: "Sign and send",
-            cancel: "Cancel",
+            ok: "서명하고 보내기",
+            cancel: "취소",
         },
-        // PLACEHOLDER: translation pending
         "ru" => Dialog {
-            title: "Confirm the payment",
+            title: "Подтверждение перевода",
             body: format!(
-                "Send {send} test coins\nto\n{to}\n\nFee {fee} test coins{}.\n\n{}{}{}Once confirmed it is signed and sent, and cannot be undone.",
-                if change > 0 { format!("; {change_text} test coins come back to your address as change") } else { String::new() },
-                if caution { "Note: an earlier payment did not clearly go out and may have gone out after all; this one would be paid on top of it.\n\n" } else { "" },
-                if sources.one_source { "Note: only one node answered, so nothing was checked against the other.\n\n" } else { "" },
-                if sources.disagree { "Note: the two nodes disagree.\n\n" } else { "" }
+                "Сумма перевода в тестовых монетах: {send}\nАдрес получателя:\n{to}\n\nКомиссия в тестовых монетах: {fee}{}.\n\n{}{}{}После подтверждения перевод будет сразу подписан и отправлен; отменить его будет нельзя.",
+                if change > 0 { format!("; сдача, которая вернётся на ваш адрес: {change_text}") } else { String::new() },
+                if caution { "Внимание: отправку более раннего перевода не удалось подтвердить, и, возможно, он всё-таки ушёл; этот перевод не заменит его, а уйдёт в дополнение к нему.\n\n" } else { "" },
+                if sources.one_source { "Внимание: в этот раз ответил только один узел, поэтому ничего не удалось сверить со вторым.\n\n" } else { "" },
+                if sources.disagree { "Внимание: ответы двух узлов расходятся.\n\n" } else { "" }
             ),
-            ok: "Sign and send",
-            cancel: "Cancel",
+            ok: "Подписать и отправить",
+            cancel: "Отмена",
         },
-        // PLACEHOLDER: translation pending
         "es" => Dialog {
-            title: "Confirm the payment",
+            title: "Confirmar la transferencia",
             body: format!(
-                "Send {send} test coins\nto\n{to}\n\nFee {fee} test coins{}.\n\n{}{}{}Once confirmed it is signed and sent, and cannot be undone.",
-                if change > 0 { format!("; {change_text} test coins come back to your address as change") } else { String::new() },
-                if caution { "Note: an earlier payment did not clearly go out and may have gone out after all; this one would be paid on top of it.\n\n" } else { "" },
-                if sources.one_source { "Note: only one node answered, so nothing was checked against the other.\n\n" } else { "" },
-                if sources.disagree { "Note: the two nodes disagree.\n\n" } else { "" }
+                "Cantidad a enviar en monedas de prueba: {send}\nDirección de destino:\n{to}\n\nComisión en monedas de prueba: {fee}{}.\n\n{}{}{}Al confirmar, se firmará y se enviará de inmediato, y no se podrá deshacer.",
+                if change > 0 { format!("; cambio que vuelve a tu dirección: {change_text}") } else { String::new() },
+                if caution { "Atención: una transferencia anterior no se pudo confirmar como enviada, pero puede que sí haya salido; esta se pagaría además de aquella.\n\n" } else { "" },
+                if sources.one_source { "Atención: esta vez solo respondió un nodo, así que nada se pudo contrastar con el otro.\n\n" } else { "" },
+                if sources.disagree { "Atención: las respuestas de los dos nodos no coinciden.\n\n" } else { "" }
             ),
-            ok: "Sign and send",
-            cancel: "Cancel",
+            ok: "Firmar y enviar",
+            cancel: "Cancelar",
         },
         _ => Dialog {
             title: "Confirm the payment",
@@ -317,37 +301,33 @@ pub fn removal(locale: &str) -> Dialog {
         },
         "zh-Hant" => Dialog {
             title: "從這台裝置移除錢包",
-            body: "這台裝置上的錢包檔案將被刪除。之後只能用助記詞或備份碼還原；沒有它們，錢包裡的幣就再也取不回來。轉帳記錄也會一併刪除，還沒有明確結果的轉帳將不再有防止重複付款的保護。".into(),
+            body: "這台裝置上的錢包檔案將被刪除。之後只能用助記詞或備份碼還原；沒有它們，錢包裡的幣就再也取不回來。轉帳紀錄也會一併刪除，還沒有明確結果的轉帳將不再有防止重複付款的保護。".into(),
             ok: "移除",
             cancel: "取消",
         },
-        // PLACEHOLDER: translation pending
         "ja" => Dialog {
-            title: "Remove the wallet from this device",
-            body: "The wallet file on this device will be deleted. Only the recovery words or the backup code bring it back; without them, its coins are lost for good. Its record of payments goes too: a payment whose outcome is still unclear is no longer guarded against being paid twice.".into(),
-            ok: "Remove",
-            cancel: "Cancel",
+            title: "このデバイスからウォレットを削除",
+            body: "このデバイス上のウォレットのファイルが削除されます。その後はリカバリーワードかバックアップコードでしか復元できず、どちらもなければ、ウォレットのコインは二度と取り戻せません。送金の履歴も一緒に削除され、結果がまだはっきりしない送金については、二重払いを防ぐ保護がなくなります。".into(),
+            ok: "削除",
+            cancel: "キャンセル",
         },
-        // PLACEHOLDER: translation pending
         "ko" => Dialog {
-            title: "Remove the wallet from this device",
-            body: "The wallet file on this device will be deleted. Only the recovery words or the backup code bring it back; without them, its coins are lost for good. Its record of payments goes too: a payment whose outcome is still unclear is no longer guarded against being paid twice.".into(),
-            ok: "Remove",
-            cancel: "Cancel",
+            title: "이 기기에서 지갑 삭제",
+            body: "이 기기의 지갑 파일이 삭제됩니다. 이후에는 복구 단어나 백업 코드가 있어야만 되살릴 수 있고, 없으면 지갑의 코인은 다시는 되찾을 수 없습니다. 송금 기록도 함께 삭제되므로, 결과가 아직 확실하지 않은 송금은 더 이상 중복 지급을 막는 보호를 받지 못합니다.".into(),
+            ok: "삭제",
+            cancel: "취소",
         },
-        // PLACEHOLDER: translation pending
         "ru" => Dialog {
-            title: "Remove the wallet from this device",
-            body: "The wallet file on this device will be deleted. Only the recovery words or the backup code bring it back; without them, its coins are lost for good. Its record of payments goes too: a payment whose outcome is still unclear is no longer guarded against being paid twice.".into(),
-            ok: "Remove",
-            cancel: "Cancel",
+            title: "Удалить кошелёк с этого устройства",
+            body: "Файл кошелька на этом устройстве будет удалён. Вернуть кошелёк можно будет только по словам для восстановления или резервному коду; без них его монеты будут потеряны навсегда. История переводов тоже будет удалена: для переводов, результат которых ещё не ясен, защиты от повторной оплаты больше не будет.".into(),
+            ok: "Удалить",
+            cancel: "Отмена",
         },
-        // PLACEHOLDER: translation pending
         "es" => Dialog {
-            title: "Remove the wallet from this device",
-            body: "The wallet file on this device will be deleted. Only the recovery words or the backup code bring it back; without them, its coins are lost for good. Its record of payments goes too: a payment whose outcome is still unclear is no longer guarded against being paid twice.".into(),
-            ok: "Remove",
-            cancel: "Cancel",
+            title: "Eliminar la billetera de este dispositivo",
+            body: "Se borrará el archivo de la billetera de este dispositivo. Después, solo podrás restaurarla con las palabras de recuperación o el código de respaldo; sin ellos, las monedas de la billetera se pierden para siempre. También se borra su registro de transferencias: una transferencia cuyo resultado aún no está claro deja de estar protegida contra un pago duplicado.".into(),
+            ok: "Eliminar",
+            cancel: "Cancelar",
         },
         _ => Dialog {
             title: "Remove the wallet from this device",
@@ -373,33 +353,29 @@ pub fn password_change(locale: &str) -> Dialog {
             ok: "修改",
             cancel: "取消",
         },
-        // PLACEHOLDER: translation pending
         "ja" => Dialog {
-            title: "Change the password",
-            body: "From now on only the new password will open this wallet on this device; the old one will no longer work.".into(),
-            ok: "Change",
-            cancel: "Cancel",
+            title: "パスワードを変更",
+            body: "今後、このデバイスでこのウォレットを開けるのは新しいパスワードだけになり、古いパスワードは使えなくなります。".into(),
+            ok: "変更",
+            cancel: "キャンセル",
         },
-        // PLACEHOLDER: translation pending
         "ko" => Dialog {
-            title: "Change the password",
-            body: "From now on only the new password will open this wallet on this device; the old one will no longer work.".into(),
-            ok: "Change",
-            cancel: "Cancel",
+            title: "비밀번호 변경",
+            body: "지금부터는 이 기기에서 새 비밀번호로만 이 지갑을 열 수 있으며, 예전 비밀번호는 더 이상 쓸 수 없습니다.".into(),
+            ok: "변경",
+            cancel: "취소",
         },
-        // PLACEHOLDER: translation pending
         "ru" => Dialog {
-            title: "Change the password",
-            body: "From now on only the new password will open this wallet on this device; the old one will no longer work.".into(),
-            ok: "Change",
-            cancel: "Cancel",
+            title: "Сменить пароль",
+            body: "С этого момента открыть этот кошелёк на этом устройстве можно будет только новым паролем; старый перестанет действовать.".into(),
+            ok: "Сменить",
+            cancel: "Отмена",
         },
-        // PLACEHOLDER: translation pending
         "es" => Dialog {
-            title: "Change the password",
-            body: "From now on only the new password will open this wallet on this device; the old one will no longer work.".into(),
-            ok: "Change",
-            cancel: "Cancel",
+            title: "Cambiar la contraseña",
+            body: "A partir de ahora, solo la nueva contraseña abrirá esta billetera en este dispositivo; la anterior dejará de funcionar.".into(),
+            ok: "Cambiar",
+            cancel: "Cancelar",
         },
         _ => Dialog {
             title: "Change the password",
@@ -436,6 +412,10 @@ mod tests {
             ("en", "Change the password", "From now on only the new password will open this wallet on this device; the old one will no longer work.", "Change", "Cancel"),
             ("zh-Hans", "修改密码", "从现在起，只有新密码能在这台设备上打开这个钱包，旧密码将不再有效。", "修改", "取消"),
             ("zh-Hant", "修改密碼", "從現在起，只有新密碼能在這台裝置上開啟這個錢包，舊密碼將不再有效。", "修改", "取消"),
+            ("ja", "パスワードを変更", "今後、このデバイスでこのウォレットを開けるのは新しいパスワードだけになり、古いパスワードは使えなくなります。", "変更", "キャンセル"),
+            ("ko", "비밀번호 변경", "지금부터는 이 기기에서 새 비밀번호로만 이 지갑을 열 수 있으며, 예전 비밀번호는 더 이상 쓸 수 없습니다.", "변경", "취소"),
+            ("ru", "Сменить пароль", "С этого момента открыть этот кошелёк на этом устройстве можно будет только новым паролем; старый перестанет действовать.", "Сменить", "Отмена"),
+            ("es", "Cambiar la contraseña", "A partir de ahora, solo la nueva contraseña abrirá esta billetera en este dispositivo; la anterior dejará de funcionar.", "Cambiar", "Cancelar"),
         ] {
             let dialog = password_change(locale);
             assert_eq!((dialog.title, dialog.body.as_str(), dialog.ok, dialog.cancel), (title, body, ok, cancel));
@@ -454,6 +434,18 @@ mod tests {
             ("zh-Hant", "顯示助記詞", "顯示備份碼",
                 "這個錢包的助記詞將顯示在視窗裡。看到它的人能拿走錢包裡的全部幣。請確認周圍沒有人，螢幕也沒有在錄製或共享。",
                 "這個錢包的備份碼將顯示在視窗裡。看到它的人能拿走錢包裡的全部幣。請確認周圍沒有人，螢幕也沒有在錄製或共享。", "顯示", "取消"),
+            ("ja", "リカバリーワードを表示", "バックアップコードを表示",
+                "このウォレットのリカバリーワードがウィンドウに表示されます。これを見た人は、ウォレットのコインをすべて持ち去ることができます。周りに誰もいないこと、画面が録画も共有もされていないことを確かめてください。",
+                "このウォレットのバックアップコードがウィンドウに表示されます。これを見た人は、ウォレットのコインをすべて持ち去ることができます。周りに誰もいないこと、画面が録画も共有もされていないことを確かめてください。", "表示", "キャンセル"),
+            ("ko", "복구 단어 보기", "백업 코드 보기",
+                "이 지갑의 복구 단어가 창에 표시됩니다. 이 단어를 본 사람은 누구나 지갑의 코인을 모두 가져갈 수 있습니다. 주변에 보는 사람이 없는지, 화면이 녹화되거나 공유되고 있지 않은지 확인하세요.",
+                "이 지갑의 백업 코드가 창에 표시됩니다. 이 코드를 본 사람은 누구나 지갑의 코인을 모두 가져갈 수 있습니다. 주변에 보는 사람이 없는지, 화면이 녹화되거나 공유되고 있지 않은지 확인하세요.", "보기", "취소"),
+            ("ru", "Показать слова для восстановления", "Показать резервный код",
+                "Слова для восстановления этого кошелька будут показаны в окне. Тот, кто их увидит, сможет забрать все монеты из кошелька. Убедитесь, что рядом никого нет, а запись и демонстрация экрана выключены.",
+                "Резервный код этого кошелька будет показан в окне. Тот, кто его увидит, сможет забрать все монеты из кошелька. Убедитесь, что рядом никого нет, а запись и демонстрация экрана выключены.", "Показать", "Отмена"),
+            ("es", "Mostrar las palabras de recuperación", "Mostrar el código de respaldo",
+                "Las palabras de recuperación de esta billetera se mostrarán en la ventana. Quien las vea puede llevarse todas las monedas de la billetera. Asegúrate de que nadie esté mirando y de que la pantalla no se esté grabando ni compartiendo.",
+                "El código de respaldo de esta billetera se mostrará en la ventana. Quien lo vea puede llevarse todas las monedas de la billetera. Asegúrate de que nadie esté mirando y de que la pantalla no se esté grabando ni compartiendo.", "Mostrar", "Cancelar"),
         ] {
             for (legacy, title, body) in [(false, words_title, words_body), (true, code_title, code_body)] {
                 let dialog = recovery(locale, legacy);
@@ -474,6 +466,18 @@ mod tests {
             ("zh-Hant", "演練：簽一筆轉回自己的交易",
                 "將用混合地址裡最大的一枚幣（1.5 測試幣）簽一筆轉回同一地址的交易，交給節點核對，錢包不會廣播它。",
                 "交給節點的是一筆有效交易，節點或別人仍可能把它發出去：那樣這枚幣會回到同一地址，扣掉手續費 0.0000209 測試幣。", "簽章並交給節點核對", "取消"),
+            ("ja", "演習：自分に戻す取引に署名",
+                "混合アドレスでいちばん大きいコイン 1 枚（1.5 テストコイン）を使い、同じアドレスに戻す取引に署名して、ノードに検証してもらいます。ウォレットはこの取引をブロードキャストしません。",
+                "ノードに渡すのは有効な取引なので、ノードやほかの誰かがそれを送信する可能性はあります：その場合、このコインは手数料 0.0000209 テストコインを差し引いて、同じアドレスに戻ります。", "署名してノードで検証", "キャンセル"),
+            ("ko", "훈련: 나에게 되돌려 보내는 트랜잭션에 서명",
+                "혼합 주소에서 가장 큰 코인 하나(1.5 테스트 코인)를 같은 주소로 되돌려 보내는 트랜잭션에 서명해 노드에 검사를 맡깁니다. 지갑은 이 트랜잭션을 브로드캐스트하지 않습니다.",
+                "노드에 넘기는 것은 유효한 트랜잭션이므로, 노드나 다른 사람이 이를 네트워크에 보낼 수도 있습니다. 그러면 이 코인은 수수료 0.0000209 테스트 코인을 뺀 채 같은 주소로 돌아옵니다.", "서명하고 노드에 검사 맡기기", "취소"),
+            ("ru", "Учения: подписать перевод обратно себе",
+                "Кошелёк подпишет перевод самой крупной монеты смешанного адреса (сумма в тестовых монетах: 1.5) обратно на этот же адрес и передаст его узлу на проверку. В сеть кошелёк его не отправит.",
+                "Узел получит действительную транзакцию, и он сам или кто-то другой всё равно может отправить её в сеть: тогда монета вернётся на тот же адрес за вычетом комиссии (в тестовых монетах: 0.0000209).", "Подписать и передать узлу", "Отмена"),
+            ("es", "Simulacro: firmar una transferencia de vuelta a ti",
+                "Con la moneda más grande de la dirección mixta (cantidad en monedas de prueba: 1.5) se firmará una transferencia de vuelta a la misma dirección, que se entregará al nodo para que la compruebe. La billetera no la difundirá por la red.",
+                "Lo que recibe el nodo es una transacción válida, y el nodo u otra persona aún podrían enviarla: en ese caso, la moneda volvería a la misma dirección, descontada la comisión (en monedas de prueba: 0.0000209).", "Firmar y entregar al nodo", "Cancelar"),
         ] {
             let dialog = drill(locale, 150_000_000, 2_090);
             assert_eq!((dialog.title, dialog.ok, dialog.cancel), (title, ok, cancel));
@@ -488,6 +492,10 @@ mod tests {
             "钱包已经在运行，请使用已经打开的窗口。",
             "錢包已經在執行，請使用已經開啟的視窗。",
             "The wallet is already running. Use the window that is already open.",
+            "ウォレットはすでに起動しています。開いているウィンドウをお使いください。",
+            "지갑이 이미 실행 중입니다. 이미 열려 있는 창을 사용하세요.",
+            "Кошелёк уже запущен. Пользуйтесь окном, которое уже открыто.",
+            "La billetera ya se está ejecutando. Usa la ventana que está abierta.",
         ]);
     }
 
@@ -515,6 +523,10 @@ mod tests {
             ("zh-Hans", "注意：这次只有一个节点回应，没能用另一个节点核对。", "注意：两个节点的回答不一致。", "确认后立即", "之前有转账"),
             ("zh-Hant", "注意：這次只有一個節點回應，沒能用另一個節點核對。", "注意：兩個節點的回答不一致。", "確認後立即", "之前有轉帳"),
             ("en", "Note: only one node answered, so nothing was checked against the other.", "Note: the two nodes disagree.", "Once confirmed", "an earlier payment"),
+            ("ja", "注意：今回は 1 台のノードしか応答しなかったため、もう 1 台のノードと照合できませんでした。", "注意：2 台のノードの回答が一致しません。", "確定すると、すぐ", "以前の送金が送信"),
+            ("ko", "주의: 이번에는 노드 하나만 응답해서, 다른 노드와 대조하지 못했습니다.", "주의: 두 노드의 답이 서로 다릅니다.", "확인하면 바로 ", "전송 여부가 확"),
+            ("ru", "Внимание: в этот раз ответил только один узел, поэтому ничего не удалось сверить со вторым.", "Внимание: ответы двух узлов расходятся.", "После по", "отправку"),
+            ("es", "Atención: esta vez solo respondió un nodo, así que nada se pudo contrastar con el otro.", "Atención: las respuestas de los dos nodos no coinciden.", "Al confi", "una tran"),
         ] {
             for one_source in [false, true] {
                 for sources_disagree in [false, true] {
