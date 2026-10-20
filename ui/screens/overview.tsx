@@ -1,8 +1,8 @@
 // The overview: what the wallet can spend, its three addresses, and the network.
 import type { AccountView, Chain, Kind, Overview as OverviewData } from '../api';
-import { core } from '../api';
-import { Amount, Button, Card, Chip, CopyButton, Icon, Mono, Notice, copyText, useToast } from '../components';
-import { fill, m } from '../i18n';
+import { codeOf, core } from '../api';
+import { Amount, Button, Card, Chip, CopyButton, Icon, Mono, Notice, useToast } from '../components';
+import { errorText, fill, m } from '../i18n';
 import { ago, coins, group, shorten } from '../format';
 
 export const ORDER: Kind[] = ['mldsa44', 'schnorr', 'mixed'];
@@ -64,7 +64,7 @@ export function Overview({ data, legacy, loading, onRetry, onSend, onReceive }: 
         <div class="balance-actions">
           <Button kind="primary" size="lg" icon="send" onClick={onSend}>{m().nav.send}</Button>
           <Button kind="secondary" size="lg" icon="receive" onClick={onReceive}>{m().nav.receive}</Button>
-          <Button kind="ghost" size="lg" icon="drop" onClick={() => openFaucet(data, toast)}>{m().common.faucet}</Button>
+          <Button kind="ghost" size="lg" icon="drop" onClick={() => openFaucet(data.accounts.find((a) => a.kind === 'mldsa44' && a.shown)?.address, toast)}>{m().common.faucet}</Button>
         </div>
       </section>
 
@@ -83,11 +83,17 @@ export function Overview({ data, legacy, loading, onRetry, onSend, onReceive }: 
   );
 }
 
-/** The faucet asks for an address: the post-quantum one is copied first, so that it only needs pasting. */
-async function openFaucet(data: OverviewData, toast: (text: string, tone?: 'good' | 'bad' | 'neutral') => void) {
-  const pq = data.accounts.find((a) => a.kind === 'mldsa44' && a.shown);
-  if (pq && (await copyText(pq.address))) toast(m().common.faucetCopied, 'good');
-  await core.openPage('faucet');
+/**
+ * Opens the faucet in the browser with one of this wallet's addresses filled in, or with none when there is
+ * no address to give; the toast says the address is there once the page has opened.
+ */
+export async function openFaucet(address: string | undefined, toast: (text: string, tone?: 'good' | 'bad' | 'neutral') => void) {
+  try {
+    await core.openPage('faucet', address);
+    if (address) toast(m().common.faucetOpened, 'good');
+  } catch (err) {
+    toast(errorText(codeOf(err)), 'bad');
+  }
 }
 
 /**

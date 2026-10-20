@@ -36,7 +36,7 @@ export const zhHans: Messages = {
     minutesAgo: '{n} 分钟前',
     justNow: '刚刚',
     faucet: '领测试币',
-    faucetCopied: '已复制你的后量子签名地址，在水龙头页面粘贴即可',
+    faucetOpened: '已在浏览器打开水龙头，地址已经填好',
   },
   welcome: {
     title: '开始使用',
@@ -242,6 +242,7 @@ export const zhHans: Messages = {
     rejected: '节点拒收',
     nodeSays: '节点原文',
     noCoins: '混合地址里还没有币。先往混合地址转一点测试币，再来试。',
+    faucet: '给混合地址领测试币',
     unspent: '未花费',
     spent: '已花费',
     notReady: '混合地址还不能用：要等 M3 生效后满 6 个区块，并且读到绊线状态。',

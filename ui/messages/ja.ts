@@ -36,7 +36,7 @@ export const ja: Messages = {
     minutesAgo: '{n} min ago',
     justNow: 'just now',
     faucet: 'Get test coins',
-    faucetCopied: 'Your post-quantum address is copied: paste it on the faucet page',
+    faucetOpened: 'The faucet is open in your browser, with your address filled in',
   },
   welcome: {
     title: 'Get started',
@@ -242,6 +242,7 @@ export const ja: Messages = {
     rejected: 'Refused by the node',
     nodeSays: 'The node’s own words',
     noCoins: 'The mixed address has no coins yet. Send it a few test coins first.',
+    faucet: 'Get test coins for the mixed address',
     unspent: 'unspent',
     spent: 'spent',
     notReady: 'The mixed address is not ready: it waits six blocks past M3 and for the tripwire state.',

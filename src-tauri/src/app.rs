@@ -1512,23 +1512,30 @@ pub fn qr_svg(text: String) -> Res<String> {
     Ok(code.render::<svg::Color>().min_dimensions(240, 240).dark_color(svg::Color("#0b0f14")).light_color(svg::Color("#ffffff")).build())
 }
 
-/// Opens one of the network's pages in the system browser: the faucet, or the explorer at a transaction
-/// this wallet recorded or at one of its own addresses. Nothing else can be opened from the interface, and
-/// no value it makes up reaches the browser.
+/// Opens one of the network's pages in the system browser: the faucet, with one of this wallet's own
+/// addresses filled in or none, or the explorer at a transaction this wallet recorded or at one of its own
+/// addresses. Nothing else can be opened from the interface, and no value it makes up reaches the browser.
 #[tauri::command]
 pub fn open_page(app: AppHandle, state: State<'_, AppState>, page: String, value: Option<String>) -> Res<()> {
     use tauri_plugin_opener::OpenerExt;
     let value = value.unwrap_or_default();
     let recorded = || store::load::<Vec<Sent>>(&state.sent_path()).iter().any(|s| s.txid == value);
     let own = || state.templates().is_ok_and(|(a, b, c)| [a, b, c].iter().any(|t| t.address == value));
-    let url = match page.as_str() {
-        "faucet" => FAUCET.to_string(),
-        "explorer" => format!("{EXPLORER}/"),
-        "tx" if crate::api::is_txid(&value) && recorded() => format!("{EXPLORER}/tx/{value}"),
-        "address" if own() => format!("{EXPLORER}/address/{value}"),
-        _ => return Err(Failure::new("invalid_page")),
-    };
+    let url = page_url(&page, &value, recorded, own).ok_or_else(|| Failure::new("invalid_page"))?;
     app.opener().open_url(url, None::<&str>).map_err(|_| Failure::new("io"))
+}
+
+/// The address of a page `open_page` may open, or None; `recorded` and `own` say whether the value is a
+/// transaction this wallet recorded and one of its own addresses, and are asked only when it matters.
+fn page_url(page: &str, value: &str, recorded: impl Fn() -> bool, own: impl Fn() -> bool) -> Option<String> {
+    match page {
+        "faucet" if value.is_empty() => Some(FAUCET.to_string()),
+        "faucet" if own() => Some(format!("{FAUCET}?address={value}")),
+        "explorer" => Some(format!("{EXPLORER}/")),
+        "tx" if crate::api::is_txid(value) && recorded() => Some(format!("{EXPLORER}/tx/{value}")),
+        "address" if own() => Some(format!("{EXPLORER}/address/{value}")),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -4014,5 +4021,21 @@ mod tests {
         assert_eq!(short_flags, Flags { one_source: false, disagree: true });
         assert!(first[1].starts_with("GET /api/proof?"));
         assert!(second[1].starts_with("GET /api/proof?"));
+    }
+
+    #[test]
+    fn pages_open_only_for_this_wallets_own_values() {
+        let own_address = "tb1zown";
+        let recorded_txid = "ab".repeat(32);
+        let url = |page: &str, value: &str| page_url(page, value, || value == recorded_txid, || value == own_address);
+        assert_eq!(url("faucet", "").as_deref(), Some("https://faucet.ark0.si/"));
+        assert_eq!(url("faucet", own_address).as_deref(), Some("https://faucet.ark0.si/?address=tb1zown"));
+        assert_eq!(url("faucet", "tb1zsomeoneelse"), None);
+        assert_eq!(url("explorer", "").as_deref(), Some("https://explorer.ark0.si/"));
+        assert_eq!(url("tx", &recorded_txid), Some(format!("https://explorer.ark0.si/tx/{recorded_txid}")));
+        assert_eq!(url("tx", &"cd".repeat(32)), None);
+        assert_eq!(url("address", own_address).as_deref(), Some("https://explorer.ark0.si/address/tb1zown"));
+        assert_eq!(url("address", "tb1zsomeoneelse"), None);
+        assert_eq!(url("settings", ""), None);
     }
 }

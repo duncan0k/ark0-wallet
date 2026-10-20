@@ -439,6 +439,8 @@ p { margin: 0; }
 .leaf-off { opacity: 0.5; text-decoration: line-through; }
 .drill-tries { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin-top: 16px; }
 .drill-try { display: flex; flex-direction: column; gap: 12px; align-items: stretch; }
+.drill-faucet { display: flex; flex-direction: column; gap: 12px; margin-top: 16px; }
+.drill-faucet .btn { align-self: flex-start; }
 .verdict { display: flex; flex-direction: column; gap: 8px; padding: 14px; border-radius: 12px; border: 1px solid var(--line); background: var(--surface-2); animation: fade 0.25s ease-out; }
 .verdict-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .verdict-allowed { border-color: rgba(76, 207, 143, 0.35); }

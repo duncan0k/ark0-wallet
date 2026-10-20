@@ -1,15 +1,16 @@
 // The drill: the network's tripwire, and both leaves of the mixed address tried against the node.
 import { useState } from 'preact/hooks';
 import { codeOf, core, type DrillResult, type Overview, type Path } from '../api';
-import { Button, Card, Chip, Icon, Notice } from '../components';
+import { Button, Card, Chip, Icon, Notice, useToast } from '../components';
 import { errorText, fill, locale, m } from '../i18n';
 import { group, ms } from '../format';
-import { LegacyNotice } from './overview';
+import { LegacyNotice, openFaucet } from './overview';
 
 export function Drill({ data, legacy }: { data: Overview | null; legacy: boolean }) {
   const d = m().drill;
   const chain = data?.chain ?? null;
   const mixed = data?.accounts.find((a) => a.kind === 'mixed');
+  const toast = useToast();
   const [results, setResults] = useState<Partial<Record<Path, DrillResult | string>>>({});
   const [busy, setBusy] = useState<Path | null>(null);
 
@@ -68,7 +69,10 @@ export function Drill({ data, legacy }: { data: Overview | null; legacy: boolean
         {!mixed?.shown ? (
           <Notice tone="info">{d.notReady}</Notice>
         ) : mixed.spendable === 0 ? (
-          <Notice tone="info">{d.noCoins}</Notice>
+          <div class="drill-faucet">
+            <Notice tone="info">{d.noCoins}</Notice>
+            <Button kind="secondary" icon="drop" onClick={() => openFaucet(mixed.address, toast)}>{d.faucet}</Button>
+          </div>
         ) : (
           <div class="drill-tries">
             {(['schnorr', 'mldsa44'] as Path[]).map((p) => (

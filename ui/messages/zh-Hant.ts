@@ -36,7 +36,7 @@ export const zhHant: Messages = {
     minutesAgo: '{n} 分鐘前',
     justNow: '剛剛',
     faucet: '領測試幣',
-    faucetCopied: '已複製你的後量子簽章地址，在水龍頭頁面貼上即可',
+    faucetOpened: '已在瀏覽器開啟水龍頭，地址已經填好',
   },
   welcome: {
     title: '開始使用',
@@ -242,6 +242,7 @@ export const zhHant: Messages = {
     rejected: '節點拒收',
     nodeSays: '節點原文',
     noCoins: '混合地址裡還沒有幣。先往混合地址轉一點測試幣，再來試。',
+    faucet: '給混合地址領測試幣',
     unspent: '未花費',
     spent: '已花費',
     notReady: '混合地址還不能用：要等 M3 生效後滿 6 個區塊，並且讀到絆線狀態。',
