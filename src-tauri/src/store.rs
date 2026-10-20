@@ -34,24 +34,13 @@ impl Settings {
 /// disk they go in a field of their own that it ignores, and `language` says "auto".
 const NEWER_LANGUAGES: [&str; 4] = ["ja", "ko", "ru", "es"];
 
-/// The settings as they are kept on disk: `language` only ever holds a value 0.1.1 accepts.
-#[derive(Serialize, Deserialize)]
-#[serde(default)]
+/// The settings as they are written to disk: `language` only ever holds a value 0.1.1 accepts.
+#[derive(Serialize)]
 struct SettingsFile {
     language: String,
     auto_lock_minutes: u32,
-    /// One of the newer languages; anything else found here is ignored rather than failing the whole file.
-    #[serde(
-        deserialize_with = "lenient_language",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(skip_serializing_if = "Option::is_none")]
     interface_language: Option<String>,
-}
-
-impl Default for SettingsFile {
-    fn default() -> Self {
-        SettingsFile::from(&Settings::default())
-    }
 }
 
 impl From<&Settings> for SettingsFile {
@@ -69,31 +58,16 @@ impl From<&Settings> for SettingsFile {
     }
 }
 
-impl From<SettingsFile> for Settings {
-    /// First what 0.1.1 reads, with its check: an invalid language or idle lock gives the defaults, as it
-    /// does there. Only then does a newer language take the place of `language`.
-    fn from(f: SettingsFile) -> Self {
-        let base = Settings {
-            language: f.language,
-            auto_lock_minutes: f.auto_lock_minutes,
-        };
-        let older = !NEWER_LANGUAGES.contains(&base.language.as_str());
-        let mut settings = if base.valid() && older {
-            base
-        } else {
-            Settings::default()
-        };
-        if let Some(language) = f.interface_language {
-            if NEWER_LANGUAGES.contains(&language.as_str()) {
-                settings.language = language;
-            }
-        }
-        settings
-    }
+/// What 0.1.2 adds to the settings file, read on its own pass over the same bytes: only `interface_language`,
+/// every other field ignored.
+#[derive(Deserialize)]
+struct Extension {
+    #[serde(default, deserialize_with = "lenient_language")]
+    interface_language: Option<String>,
 }
 
 /// Takes `interface_language` when it is a string and skips anything else the way serde_json skips an
-/// unknown field, without building it: a value nested too deep to build would otherwise fail the whole file.
+/// unknown field, without building it: a value nested too deep to build would otherwise fail the pass.
 fn lenient_language<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
     use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
     struct Lenient;
@@ -136,9 +110,32 @@ fn lenient_language<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Str
     d.deserialize_any(Lenient)
 }
 
-/// The settings saved in `path`, or the defaults.
+/// The settings saved in `path`, or the defaults. The file is first read exactly as 0.1.1 reads it, with its
+/// two-field `Settings` and its check, so that every file gives the same base settings in both versions: an
+/// invalid one gives the defaults. Only then does a newer language from a second pass take the place of
+/// `language`; when that pass fails for any reason, or the file is not an object, the base is kept as it is.
 pub fn load_settings(path: &Path) -> Settings {
-    load::<SettingsFile>(path).into()
+    let Ok(bytes) = read_capped(path) else {
+        return Settings::default();
+    };
+    let base: Settings = serde_json::from_slice(&bytes).unwrap_or_default();
+    let older = !NEWER_LANGUAGES.contains(&base.language.as_str());
+    let mut settings = if base.valid() && older {
+        base
+    } else {
+        Settings::default()
+    };
+    if bytes.trim_ascii_start().starts_with(b"{") {
+        if let Ok(Extension {
+            interface_language: Some(language),
+        }) = serde_json::from_slice(&bytes)
+        {
+            if NEWER_LANGUAGES.contains(&language.as_str()) {
+                settings.language = language;
+            }
+        }
+    }
+    settings
 }
 
 pub fn save_settings(path: &Path, settings: &Settings) -> std::io::Result<()> {
@@ -555,6 +552,54 @@ mod tests {
                 ("zh-Hant", 60)
             );
         }
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn files_without_a_usable_extension_read_exactly_as_in_the_older_version() {
+        let path = settings_path("as-before");
+        for file in [
+            r#"["en",0,"ja"]"#,
+            r#"["en",0]"#,
+            r#"["ja"]"#,
+            r#"{"language":"en","auto_lock_minutes":5,"interface_language":1e400}"#,
+            r#"{"language":"en","auto_lock_minutes":5,"interface_language":"ja","interface_language":"ko"}"#,
+            r#"{"language":"en","auto_lock_minutes":5,"interface_language":"ja""#,
+            r#""ja""#,
+            "",
+        ] {
+            std::fs::write(&path, file).unwrap();
+            let old = serde_json::from_str::<OldSettings>(file)
+                .ok()
+                .filter(OldSettings::valid)
+                .unwrap_or_default();
+            let expected = Settings {
+                language: old.language,
+                auto_lock_minutes: old.auto_lock_minutes,
+            };
+            assert_eq!(load_settings(&path), expected, "{file}");
+        }
+        std::fs::write(
+            &path,
+            r#"{"language":"en","auto_lock_minutes":5,"interface_language":1e400}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            load_settings(&path),
+            Settings {
+                language: "en".into(),
+                auto_lock_minutes: 5
+            }
+        );
+        // A duplicated base field fails 0.1.1's read, which gives the defaults; a newer language still applies.
+        std::fs::write(&path, r#"{"language":"en","language":"zh-Hans","auto_lock_minutes":5,"interface_language":"ja"}"#).unwrap();
+        assert_eq!(
+            load_settings(&path),
+            Settings {
+                language: "ja".into(),
+                ..Settings::default()
+            }
+        );
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }
