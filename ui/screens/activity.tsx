@@ -24,8 +24,10 @@ export function Activity({ info, version }: { info: AppInfo | null; version: num
                 <strong>{m().activity.to} <Mono>{shorten(s.to, 10, 6)}</Mono></strong>
                 <small class="muted">{ago(s.created)} · {s.signature === 'mldsa44' ? 'ML-DSA-44' : 'Schnorr'}</small>
               </span>
-              <span class="tx-amount num">−{coins(s.send)}</span>
-              <StatusChip s={s} />
+              <span class="tx-side">
+                <span class="tx-amount num">−{coins(s.send)}</span>
+                <StatusChip s={s} />
+              </span>
               <span class="tx-chevron"><Icon name="chevron" size={16} /></span>
             </button>
             {open === s.txid && <Details s={s} info={info} />}
