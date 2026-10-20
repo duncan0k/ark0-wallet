@@ -3,10 +3,16 @@ import { locale, type Locale } from './i18n';
 
 type Brand = { name: string; brand: string; product: string };
 
+const ENGLISH: Brand = { name: 'Ark-0 Wallet', brand: 'Ark-0', product: 'Wallet' };
+
 export const brands: Record<Locale, Brand> = {
-  en: { name: 'Ark-0 Wallet', brand: 'Ark-0', product: 'Wallet' },
   'zh-Hans': { name: '方舟 0 号钱包', brand: '方舟 0 号', product: '钱包' },
   'zh-Hant': { name: '方舟 0 號錢包', brand: '方舟 0 號', product: '錢包' },
+  en: ENGLISH,
+  ja: ENGLISH,
+  ko: ENGLISH,
+  ru: ENGLISH,
+  es: ENGLISH,
 };
 
 export function brand(): Brand {

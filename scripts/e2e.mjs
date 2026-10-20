@@ -3,7 +3,7 @@
 // signing core's self-test. A screenshot of each step goes to the output directory. The app must start
 // with an empty data directory.
 //
-//   node scripts/e2e.mjs <app binary | CDP endpoint> <output dir> [language: zh-Hans | zh-Hant | en]
+//   node scripts/e2e.mjs <app binary | CDP endpoint> <output dir> [language: zh-Hans | zh-Hant | en | ja | ko | ru | es]
 //
 // Given the app binary, the script starts it through tauri-driver (WebDriver on 127.0.0.1:4444; Linux).
 // Given a CDP endpoint such as http://127.0.0.1:9222, it attaches to a running app whose WebView2 was

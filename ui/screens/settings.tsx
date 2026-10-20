@@ -4,10 +4,21 @@ import type { ComponentChildren } from 'preact';
 import { useState } from 'preact/hooks';
 import { codeOf, core, type AppInfo, type SelftestReport, type Settings as SettingsData, type Status } from '../api';
 import { Button, Card, Field, Modal, Mono, Notice, PasswordInput, StrengthMeter, useToast } from '../components';
-import { errorText, fill, locale, m } from '../i18n';
+import { errorText, fill, locale, m, type Locale } from '../i18n';
 import { ms } from '../format';
 
 const LOCK_CHOICES = [5, 15, 30, 60, 0];
+
+/** Each language under its own name, whatever the interface's language. */
+const LANGUAGES: [Locale, string][] = [
+  ['zh-Hans', '简体中文'],
+  ['zh-Hant', '繁體中文'],
+  ['en', 'English'],
+  ['ja', '日本語'],
+  ['ko', '한국어'],
+  ['ru', 'Русский'],
+  ['es', 'Español'],
+];
 
 export function Settings({ settings, info, onSettings, onRemoved }: {
   settings: SettingsData;
@@ -30,10 +41,8 @@ export function Settings({ settings, info, onSettings, onRemoved }: {
     <div class="page narrow">
       <Card title={st.language}>
         <div class="segmented">
-          {(['auto', 'zh-Hans', 'zh-Hant', 'en'] as const).map((l) => (
-            <button class={settings.language === l ? 'on' : ''} onClick={() => save({ ...settings, language: l })}>
-              {l === 'auto' ? st.languageAuto : l === 'zh-Hans' ? '简体中文' : l === 'zh-Hant' ? '繁體中文' : 'English'}
-            </button>
+          {([['auto', st.languageAuto], ...LANGUAGES] as const).map(([l, name]) => (
+            <button class={settings.language === l ? 'on' : ''} onClick={() => save({ ...settings, language: l })}>{name}</button>
           ))}
         </div>
       </Card>

@@ -1,5 +1,5 @@
 // Numbers and addresses as the interface shows them.
-import { fill, m } from './i18n';
+import { fill, locale, m } from './i18n';
 
 const COIN = 100_000_000;
 
@@ -7,12 +7,22 @@ const COIN = 100_000_000;
 export function coins(sats: number): string {
   const whole = Math.floor(sats / COIN);
   const fraction = String(sats % COIN).padStart(8, '0').replace(/0+$/, '');
-  const grouped = whole.toLocaleString('en-US');
-  return fraction ? `${grouped}.${fraction}` : grouped;
+  return fraction ? `${group(whole)}.${fraction}` : group(whole);
 }
 
+/**
+ * A whole number with its thousands set apart, as the Ark-0 web wallet writes them: with a comma, or in
+ * Russian and Spanish, where a comma marks decimals, with a no-break space from five digits on: 2,420 and
+ * 12,345, or 2420 and 12 345.
+ */
 export function group(n: number): string {
-  return n.toLocaleString('en-US');
+  const text = Number.isInteger(n) ? BigInt(n).toString() : n.toString();
+  const parts = /^(-?)(\d+)(.*)$/.exec(text);
+  if (!parts) return text;
+  const [, sign = '', whole = '', rest = ''] = parts;
+  const spaced = locale() === 'ru' || locale() === 'es';
+  if (spaced && whole.length < 5) return text;
+  return sign + whole.replace(/\B(?=(\d{3})+$)/g, spaced ? '\u00a0' : ',') + rest;
 }
 
 /** The start and the end of a long string, for one line: tb1zabcd…wxyz. */

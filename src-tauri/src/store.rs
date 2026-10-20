@@ -9,7 +9,7 @@ pub const DEFAULT_AUTO_LOCK_MINUTES: u32 = 15;
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct Settings {
-    /// "auto" follows the system; otherwise "zh-Hans", "zh-Hant" or "en".
+    /// "auto" follows the system; otherwise "zh-Hans", "zh-Hant", "en", "ja", "ko", "ru" or "es".
     pub language: String,
     /// The wallet locks itself after this many minutes without use; 0 turns that off.
     pub auto_lock_minutes: u32,
@@ -22,8 +22,10 @@ impl Default for Settings {
 }
 
 impl Settings {
+    /// A language the interface has ("auto", "zh-Hans", "zh-Hant", "en", "ja", "ko", "ru" or "es"), and an
+    /// idle lock of at most four hours.
     pub fn valid(&self) -> bool {
-        matches!(self.language.as_str(), "auto" | "zh-Hans" | "zh-Hant" | "en") && self.auto_lock_minutes <= 240
+        matches!(self.language.as_str(), "auto" | "zh-Hans" | "zh-Hant" | "en" | "ja" | "ko" | "ru" | "es") && self.auto_lock_minutes <= 240
     }
 }
 

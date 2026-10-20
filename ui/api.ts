@@ -94,7 +94,7 @@ export interface DrillResult { verdict: CheckResult; signature: Path; vsize: num
 export interface InputCost { kind: Kind; signature: Path; signature_bytes: number; tx_vsize: number; tx_size: number }
 export interface AppInfo { version: string; api: string; explorer: string; faucet: string; target: string; fee_rate: number; costs: InputCost[] }
 
-export interface Settings { language: 'auto' | 'zh-Hans' | 'zh-Hant' | 'en'; auto_lock_minutes: number }
+export interface Settings { language: 'auto' | 'zh-Hans' | 'zh-Hant' | 'en' | 'ja' | 'ko' | 'ru' | 'es'; auto_lock_minutes: number }
 
 export interface SelftestReport {
   ok: boolean;

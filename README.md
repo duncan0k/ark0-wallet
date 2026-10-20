@@ -22,7 +22,7 @@ Ark-0 is a test network for trying things out. It may be reset at any time.
 - **A drill page** shows the state of the network's tripwire and lets you check a transfer from the mixed
   address against the node without broadcasting it.
 
-The interface is in Simplified Chinese, Traditional Chinese and English.
+The interface is in Simplified Chinese, Traditional Chinese, English, Japanese, Korean, Russian and Spanish.
 
 ## Where its view of the chain comes from
 

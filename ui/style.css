@@ -40,8 +40,17 @@
   --lattice: radial-gradient(rgba(127, 232, 210, 0.2) 1px, transparent 1.4px);
   --font: system-ui, -apple-system, "Segoe UI", "PingFang SC", "PingFang TC", "Hiragino Sans GB", "Microsoft YaHei UI",
     "Microsoft JhengHei UI", "Noto Sans CJK SC", "Noto Sans CJK TC", "Source Han Sans SC", "Ubuntu", "Cantarell", sans-serif;
+  --font-ja: system-ui, -apple-system, "Segoe UI", "Hiragino Sans", "Hiragino Kaku Gothic ProN", "Yu Gothic UI", "Meiryo UI",
+    "Noto Sans CJK JP", "PingFang SC", "PingFang TC", "Hiragino Sans GB", "Microsoft YaHei UI", "Microsoft JhengHei UI",
+    "Noto Sans CJK SC", "Noto Sans CJK TC", "Source Han Sans SC", "Ubuntu", "Cantarell", sans-serif;
+  --font-ko: system-ui, -apple-system, "Segoe UI", "Apple SD Gothic Neo", "Malgun Gothic", "Noto Sans CJK KR", "PingFang SC",
+    "PingFang TC", "Hiragino Sans GB", "Microsoft YaHei UI", "Microsoft JhengHei UI", "Noto Sans CJK SC", "Noto Sans CJK TC",
+    "Source Han Sans SC", "Ubuntu", "Cantarell", sans-serif;
   --mono: ui-monospace, "SF Mono", "Cascadia Mono", "JetBrains Mono", "Roboto Mono", Consolas, "DejaVu Sans Mono", monospace;
 }
+/* Japanese and Korean put their own fonts first, so that kana, kanji and hangul do not take Chinese glyphs. */
+:root:lang(ja) { --font: var(--font-ja); }
+:root:lang(ko) { --font: var(--font-ko); }
 
 * { box-sizing: border-box; }
 html, body { height: 100%; }

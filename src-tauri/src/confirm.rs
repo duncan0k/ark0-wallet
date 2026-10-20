@@ -12,6 +12,10 @@ pub fn locale(setting: &str, resolved: Option<&str>) -> &'static str {
     match pick {
         "zh-Hans" => "zh-Hans",
         "zh-Hant" => "zh-Hant",
+        "ja" => "ja",
+        "ko" => "ko",
+        "ru" => "ru",
+        "es" => "es",
         _ => "en",
     }
 }
@@ -83,6 +87,62 @@ pub fn recovery(locale: &str, legacy: bool) -> Dialog {
             ok: "顯示",
             cancel: "取消",
         },
+        // PLACEHOLDER: translation pending
+        ("ja", false) => Dialog {
+            title: "Show the recovery words",
+            body: "This wallet's recovery words will be shown in the window. Anyone who sees them can take every coin in the wallet. Make sure no one is watching and the screen is not being recorded or shared.".into(),
+            ok: "Show",
+            cancel: "Cancel",
+        },
+        // PLACEHOLDER: translation pending
+        ("ja", true) => Dialog {
+            title: "Show the backup code",
+            body: "This wallet's backup code will be shown in the window. Anyone who sees it can take every coin in the wallet. Make sure no one is watching and the screen is not being recorded or shared.".into(),
+            ok: "Show",
+            cancel: "Cancel",
+        },
+        // PLACEHOLDER: translation pending
+        ("ko", false) => Dialog {
+            title: "Show the recovery words",
+            body: "This wallet's recovery words will be shown in the window. Anyone who sees them can take every coin in the wallet. Make sure no one is watching and the screen is not being recorded or shared.".into(),
+            ok: "Show",
+            cancel: "Cancel",
+        },
+        // PLACEHOLDER: translation pending
+        ("ko", true) => Dialog {
+            title: "Show the backup code",
+            body: "This wallet's backup code will be shown in the window. Anyone who sees it can take every coin in the wallet. Make sure no one is watching and the screen is not being recorded or shared.".into(),
+            ok: "Show",
+            cancel: "Cancel",
+        },
+        // PLACEHOLDER: translation pending
+        ("ru", false) => Dialog {
+            title: "Show the recovery words",
+            body: "This wallet's recovery words will be shown in the window. Anyone who sees them can take every coin in the wallet. Make sure no one is watching and the screen is not being recorded or shared.".into(),
+            ok: "Show",
+            cancel: "Cancel",
+        },
+        // PLACEHOLDER: translation pending
+        ("ru", true) => Dialog {
+            title: "Show the backup code",
+            body: "This wallet's backup code will be shown in the window. Anyone who sees it can take every coin in the wallet. Make sure no one is watching and the screen is not being recorded or shared.".into(),
+            ok: "Show",
+            cancel: "Cancel",
+        },
+        // PLACEHOLDER: translation pending
+        ("es", false) => Dialog {
+            title: "Show the recovery words",
+            body: "This wallet's recovery words will be shown in the window. Anyone who sees them can take every coin in the wallet. Make sure no one is watching and the screen is not being recorded or shared.".into(),
+            ok: "Show",
+            cancel: "Cancel",
+        },
+        // PLACEHOLDER: translation pending
+        ("es", true) => Dialog {
+            title: "Show the backup code",
+            body: "This wallet's backup code will be shown in the window. Anyone who sees it can take every coin in the wallet. Make sure no one is watching and the screen is not being recorded or shared.".into(),
+            ok: "Show",
+            cancel: "Cancel",
+        },
         (_, false) => Dialog {
             title: "Show the recovery words",
             body: "This wallet's recovery words will be shown in the window. Anyone who sees them can take every coin in the wallet. Make sure no one is watching and the screen is not being recorded or shared.".into(),
@@ -113,6 +173,34 @@ pub fn drill(locale: &str, amount: u64, fee: u64) -> Dialog {
             body: format!("將用混合地址裡最大的一枚幣（{amount} 測試幣）簽一筆轉回同一地址的交易，交給節點核對，錢包不會廣播它。\n\n交給節點的是一筆有效交易，節點或別人仍可能把它發出去：那樣這枚幣會回到同一地址，扣掉手續費 {fee} 測試幣。"),
             ok: "簽章並交給節點核對",
             cancel: "取消",
+        },
+        // PLACEHOLDER: translation pending
+        "ja" => Dialog {
+            title: "Drill: sign a transfer back to yourself",
+            body: format!("The largest coin in the mixed address ({amount} test coins) will be signed over to the same address and given to the node to check. The wallet will not broadcast it.\n\nWhat the node gets is a valid transaction, and the node or anyone else may still send it: the coin would then come back to the same address, less the fee of {fee} test coins."),
+            ok: "Sign and give to the node",
+            cancel: "Cancel",
+        },
+        // PLACEHOLDER: translation pending
+        "ko" => Dialog {
+            title: "Drill: sign a transfer back to yourself",
+            body: format!("The largest coin in the mixed address ({amount} test coins) will be signed over to the same address and given to the node to check. The wallet will not broadcast it.\n\nWhat the node gets is a valid transaction, and the node or anyone else may still send it: the coin would then come back to the same address, less the fee of {fee} test coins."),
+            ok: "Sign and give to the node",
+            cancel: "Cancel",
+        },
+        // PLACEHOLDER: translation pending
+        "ru" => Dialog {
+            title: "Drill: sign a transfer back to yourself",
+            body: format!("The largest coin in the mixed address ({amount} test coins) will be signed over to the same address and given to the node to check. The wallet will not broadcast it.\n\nWhat the node gets is a valid transaction, and the node or anyone else may still send it: the coin would then come back to the same address, less the fee of {fee} test coins."),
+            ok: "Sign and give to the node",
+            cancel: "Cancel",
+        },
+        // PLACEHOLDER: translation pending
+        "es" => Dialog {
+            title: "Drill: sign a transfer back to yourself",
+            body: format!("The largest coin in the mixed address ({amount} test coins) will be signed over to the same address and given to the node to check. The wallet will not broadcast it.\n\nWhat the node gets is a valid transaction, and the node or anyone else may still send it: the coin would then come back to the same address, less the fee of {fee} test coins."),
+            ok: "Sign and give to the node",
+            cancel: "Cancel",
         },
         _ => Dialog {
             title: "Drill: sign a transfer back to yourself",
@@ -151,6 +239,58 @@ pub fn payment(locale: &str, send: u64, to: &str, fee: u64, change: u64, caution
             ok: "簽章並發出",
             cancel: "取消",
         },
+        // PLACEHOLDER: translation pending
+        "ja" => Dialog {
+            title: "Confirm the payment",
+            body: format!(
+                "Send {send} test coins\nto\n{to}\n\nFee {fee} test coins{}.\n\n{}{}{}Once confirmed it is signed and sent, and cannot be undone.",
+                if change > 0 { format!("; {change_text} test coins come back to your address as change") } else { String::new() },
+                if caution { "Note: an earlier payment did not clearly go out and may have gone out after all; this one would be paid on top of it.\n\n" } else { "" },
+                if sources.one_source { "Note: only one node answered, so nothing was checked against the other.\n\n" } else { "" },
+                if sources.disagree { "Note: the two nodes disagree.\n\n" } else { "" }
+            ),
+            ok: "Sign and send",
+            cancel: "Cancel",
+        },
+        // PLACEHOLDER: translation pending
+        "ko" => Dialog {
+            title: "Confirm the payment",
+            body: format!(
+                "Send {send} test coins\nto\n{to}\n\nFee {fee} test coins{}.\n\n{}{}{}Once confirmed it is signed and sent, and cannot be undone.",
+                if change > 0 { format!("; {change_text} test coins come back to your address as change") } else { String::new() },
+                if caution { "Note: an earlier payment did not clearly go out and may have gone out after all; this one would be paid on top of it.\n\n" } else { "" },
+                if sources.one_source { "Note: only one node answered, so nothing was checked against the other.\n\n" } else { "" },
+                if sources.disagree { "Note: the two nodes disagree.\n\n" } else { "" }
+            ),
+            ok: "Sign and send",
+            cancel: "Cancel",
+        },
+        // PLACEHOLDER: translation pending
+        "ru" => Dialog {
+            title: "Confirm the payment",
+            body: format!(
+                "Send {send} test coins\nto\n{to}\n\nFee {fee} test coins{}.\n\n{}{}{}Once confirmed it is signed and sent, and cannot be undone.",
+                if change > 0 { format!("; {change_text} test coins come back to your address as change") } else { String::new() },
+                if caution { "Note: an earlier payment did not clearly go out and may have gone out after all; this one would be paid on top of it.\n\n" } else { "" },
+                if sources.one_source { "Note: only one node answered, so nothing was checked against the other.\n\n" } else { "" },
+                if sources.disagree { "Note: the two nodes disagree.\n\n" } else { "" }
+            ),
+            ok: "Sign and send",
+            cancel: "Cancel",
+        },
+        // PLACEHOLDER: translation pending
+        "es" => Dialog {
+            title: "Confirm the payment",
+            body: format!(
+                "Send {send} test coins\nto\n{to}\n\nFee {fee} test coins{}.\n\n{}{}{}Once confirmed it is signed and sent, and cannot be undone.",
+                if change > 0 { format!("; {change_text} test coins come back to your address as change") } else { String::new() },
+                if caution { "Note: an earlier payment did not clearly go out and may have gone out after all; this one would be paid on top of it.\n\n" } else { "" },
+                if sources.one_source { "Note: only one node answered, so nothing was checked against the other.\n\n" } else { "" },
+                if sources.disagree { "Note: the two nodes disagree.\n\n" } else { "" }
+            ),
+            ok: "Sign and send",
+            cancel: "Cancel",
+        },
         _ => Dialog {
             title: "Confirm the payment",
             body: format!(
@@ -181,6 +321,34 @@ pub fn removal(locale: &str) -> Dialog {
             ok: "移除",
             cancel: "取消",
         },
+        // PLACEHOLDER: translation pending
+        "ja" => Dialog {
+            title: "Remove the wallet from this device",
+            body: "The wallet file on this device will be deleted. Only the recovery words or the backup code bring it back; without them, its coins are lost for good. Its record of payments goes too: a payment whose outcome is still unclear is no longer guarded against being paid twice.".into(),
+            ok: "Remove",
+            cancel: "Cancel",
+        },
+        // PLACEHOLDER: translation pending
+        "ko" => Dialog {
+            title: "Remove the wallet from this device",
+            body: "The wallet file on this device will be deleted. Only the recovery words or the backup code bring it back; without them, its coins are lost for good. Its record of payments goes too: a payment whose outcome is still unclear is no longer guarded against being paid twice.".into(),
+            ok: "Remove",
+            cancel: "Cancel",
+        },
+        // PLACEHOLDER: translation pending
+        "ru" => Dialog {
+            title: "Remove the wallet from this device",
+            body: "The wallet file on this device will be deleted. Only the recovery words or the backup code bring it back; without them, its coins are lost for good. Its record of payments goes too: a payment whose outcome is still unclear is no longer guarded against being paid twice.".into(),
+            ok: "Remove",
+            cancel: "Cancel",
+        },
+        // PLACEHOLDER: translation pending
+        "es" => Dialog {
+            title: "Remove the wallet from this device",
+            body: "The wallet file on this device will be deleted. Only the recovery words or the backup code bring it back; without them, its coins are lost for good. Its record of payments goes too: a payment whose outcome is still unclear is no longer guarded against being paid twice.".into(),
+            ok: "Remove",
+            cancel: "Cancel",
+        },
         _ => Dialog {
             title: "Remove the wallet from this device",
             body: "The wallet file on this device will be deleted. Only the recovery words or the backup code bring it back; without them, its coins are lost for good. Its record of payments goes too: a payment whose outcome is still unclear is no longer guarded against being paid twice.".into(),
@@ -204,6 +372,34 @@ pub fn password_change(locale: &str) -> Dialog {
             body: "從現在起，只有新密碼能在這台裝置上開啟這個錢包，舊密碼將不再有效。".into(),
             ok: "修改",
             cancel: "取消",
+        },
+        // PLACEHOLDER: translation pending
+        "ja" => Dialog {
+            title: "Change the password",
+            body: "From now on only the new password will open this wallet on this device; the old one will no longer work.".into(),
+            ok: "Change",
+            cancel: "Cancel",
+        },
+        // PLACEHOLDER: translation pending
+        "ko" => Dialog {
+            title: "Change the password",
+            body: "From now on only the new password will open this wallet on this device; the old one will no longer work.".into(),
+            ok: "Change",
+            cancel: "Cancel",
+        },
+        // PLACEHOLDER: translation pending
+        "ru" => Dialog {
+            title: "Change the password",
+            body: "From now on only the new password will open this wallet on this device; the old one will no longer work.".into(),
+            ok: "Change",
+            cancel: "Cancel",
+        },
+        // PLACEHOLDER: translation pending
+        "es" => Dialog {
+            title: "Change the password",
+            body: "From now on only the new password will open this wallet on this device; the old one will no longer work.".into(),
+            ok: "Change",
+            cancel: "Cancel",
         },
         _ => Dialog {
             title: "Change the password",
@@ -303,6 +499,10 @@ mod tests {
         assert_eq!(locale("auto", Some("zh-Hant")), "zh-Hant");
         assert_eq!(locale("en", Some("zh-Hans")), "en");
         assert_eq!(locale("auto", Some("<script>")), "en");
+        for code in ["ja", "ko", "ru", "es"] {
+            assert_eq!(locale(code, Some("zh-Hans")), code);
+            assert_eq!(locale("auto", Some(code)), code);
+        }
         let d = payment("zh-Hans", 10_000_000, "tb1zexample", 2_090, 0, false, Flags::default());
         assert!(d.body.contains("0.1 测试币") && d.body.contains("tb1zexample") && !d.body.contains("找零") && !d.body.contains("注意"));
         assert!(payment("en", 1, "x", 1, 5, false, Flags::default()).body.contains("change"));
