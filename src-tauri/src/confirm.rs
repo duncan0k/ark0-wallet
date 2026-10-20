@@ -546,64 +546,87 @@ mod tests {
     }
 
     #[test]
-    fn payment_dialogs_show_the_figures_and_change_only_with_change_in_each_language() {
-        for (locale, change_clause, earlier) in [
+    fn payment_dialogs_in_each_language_with_and_without_change_and_with_each_note() {
+        for (locale, plain, with_change, closing, caution, one, disagree) in [
             (
                 "zh-Hans",
-                "，找零 0.3 测试币回到你的地址",
-                "注意：之前有转账",
+                "转出 1.5 测试币\n收款地址：\ntb1ztest\n\n手续费 0.0000209 测试币。\n\n确认后立即签名并发出，无法撤回。",
+                "转出 1.5 测试币\n收款地址：\ntb1ztest\n\n手续费 0.0000209 测试币，找零 0.3 测试币回到你的地址。\n\n确认后立即签名并发出，无法撤回。",
+                "确认后立即",
+                "注意：之前有转账没能确认发出，它可能已经发出；这一笔会在它之外另行支付。",
+                "注意：这次只有一个节点回应，没能用另一个节点核对。",
+                "注意：两个节点的回答不一致。",
             ),
             (
                 "zh-Hant",
-                "，找零 0.3 測試幣回到你的地址",
-                "注意：之前有轉帳",
+                "轉出 1.5 測試幣\n收款地址：\ntb1ztest\n\n手續費 0.0000209 測試幣。\n\n確認後立即簽章並發出，無法撤回。",
+                "轉出 1.5 測試幣\n收款地址：\ntb1ztest\n\n手續費 0.0000209 測試幣，找零 0.3 測試幣回到你的地址。\n\n確認後立即簽章並發出，無法撤回。",
+                "確認後立即",
+                "注意：之前有轉帳沒能確認發出，它可能已經發出；這一筆會在它之外另行支付。",
+                "注意：這次只有一個節點回應，沒能用另一個節點核對。",
+                "注意：兩個節點的回答不一致。",
             ),
             (
                 "en",
-                "; 0.3 test coins come back to your address as change",
-                "Note: an earlier payment",
+                "Send 1.5 test coins\nto\ntb1ztest\n\nFee 0.0000209 test coins.\n\nOnce confirmed it is signed and sent, and cannot be undone.",
+                "Send 1.5 test coins\nto\ntb1ztest\n\nFee 0.0000209 test coins; 0.3 test coins come back to your address as change.\n\nOnce confirmed it is signed and sent, and cannot be undone.",
+                "Once confirmed",
+                "Note: an earlier payment did not clearly go out and may have gone out after all; this one would be paid on top of it.",
+                "Note: only one node answered, so nothing was checked against the other.",
+                "Note: the two nodes disagree.",
             ),
             (
                 "ja",
-                "。おつりの 0.3 テストコインはあなたのアドレスに戻ります",
-                "注意：以前の送金",
+                "1.5 テストコインを送金\n送金先アドレス：\ntb1ztest\n\n手数料は 0.0000209 テストコインです。\n\n確定すると、すぐに署名して送信され、取り消すことはできません。",
+                "1.5 テストコインを送金\n送金先アドレス：\ntb1ztest\n\n手数料は 0.0000209 テストコインです。おつりの 0.3 テストコインはあなたのアドレスに戻ります。\n\n確定すると、すぐに署名して送信され、取り消すことはできません。",
+                "確定すると",
+                "注意：以前の送金が送信されたかどうか確認できませんでしたが、実際には送信されている可能性があります。この送金は、それとは別に支払われます。",
+                "注意：今回は 1 台のノードしか応答しなかったため、もう 1 台のノードと照合できませんでした。",
+                "注意：2 台のノードの回答が一致しません。",
             ),
             (
                 "ko",
-                ". 잔돈 0.3 테스트 코인은 내 주소로 돌아옵니다",
-                "주의: 전송 여부가",
+                "1.5 테스트 코인을 보냅니다\n받는 주소:\ntb1ztest\n\n수수료는 0.0000209 테스트 코인입니다.\n\n확인하면 바로 서명해 보내며, 되돌릴 수 없습니다.",
+                "1.5 테스트 코인을 보냅니다\n받는 주소:\ntb1ztest\n\n수수료는 0.0000209 테스트 코인입니다. 잔돈 0.3 테스트 코인은 내 주소로 돌아옵니다.\n\n확인하면 바로 서명해 보내며, 되돌릴 수 없습니다.",
+                "확인하면 바로",
+                "주의: 전송 여부가 확인되지 않은 이전 송금이 있으며, 그 송금은 실제로 이미 전송되었을 수 있습니다. 이번 송금은 그 송금에 더해 따로 지급됩니다.",
+                "주의: 이번에는 노드 하나만 응답해서, 다른 노드와 대조하지 못했습니다.",
+                "주의: 두 노드의 답이 서로 다릅니다.",
             ),
             (
                 "ru",
-                "; сдача, которая вернётся на ваш адрес: 0.3",
-                "Внимание: отправку более раннего",
+                "Сумма перевода в тестовых монетах: 1.5\nАдрес получателя:\ntb1ztest\n\nКомиссия в тестовых монетах: 0.0000209.\n\nПосле подтверждения перевод будет сразу подписан и отправлен; отменить его будет нельзя.",
+                "Сумма перевода в тестовых монетах: 1.5\nАдрес получателя:\ntb1ztest\n\nКомиссия в тестовых монетах: 0.0000209; сдача, которая вернётся на ваш адрес: 0.3.\n\nПосле подтверждения перевод будет сразу подписан и отправлен; отменить его будет нельзя.",
+                "После подтверждения",
+                "Внимание: отправку более раннего перевода не удалось подтвердить, и, возможно, он всё-таки ушёл; этот перевод не заменит его, а уйдёт в дополнение к нему.",
+                "Внимание: в этот раз ответил только один узел, поэтому ничего не удалось сверить со вторым.",
+                "Внимание: ответы двух узлов расходятся.",
             ),
             (
                 "es",
-                "; cambio que vuelve a tu dirección: 0.3",
-                "Atención: una transferencia anterior",
+                "Cantidad a enviar en monedas de prueba: 1.5\nDirección de destino:\ntb1ztest\n\nComisión en monedas de prueba: 0.0000209.\n\nAl confirmar, se firmará y se enviará de inmediato, y no se podrá deshacer.",
+                "Cantidad a enviar en monedas de prueba: 1.5\nDirección de destino:\ntb1ztest\n\nComisión en monedas de prueba: 0.0000209; cambio que vuelve a tu dirección: 0.3.\n\nAl confirmar, se firmará y se enviará de inmediato, y no se podrá deshacer.",
+                "Al confirmar",
+                "Atención: una transferencia anterior no se pudo confirmar como enviada, pero puede que sí haya salido; esta se pagaría además de aquella.",
+                "Atención: esta vez solo respondió un nodo, así que nada se pudo contrastar con el otro.",
+                "Atención: las respuestas de los dos nodos no coinciden.",
             ),
         ] {
-            for change in [0, 30_000_000] {
-                for caution in [false, true] {
-                    let dialog = payment(
-                        locale,
-                        150_000_000,
-                        "tb1ztest",
-                        2_090,
-                        change,
-                        caution,
-                        Flags::default(),
-                    );
-                    let body = dialog.body.as_str();
-                    for figure in ["1.5", "tb1ztest", "0.0000209"] {
-                        assert!(body.contains(figure), "{locale}: {figure}");
-                    }
-                    assert_eq!(body.contains(change_clause), change > 0, "{locale}");
-                    assert_eq!(body.contains("0.3"), change > 0, "{locale}");
-                    assert_eq!(body.contains(earlier), caution, "{locale}");
-                }
-            }
+            // A note goes in front of the closing sentence, as its own paragraph.
+            let noted = |notes: &[&str]| {
+                let notes: String = notes.iter().map(|n| format!("{n}\n\n")).collect();
+                plain.replacen(closing, &format!("{notes}{closing}"), 1)
+            };
+            let body = |change, caution, one_source, disagree| {
+                let flags = Flags { one_source, disagree };
+                payment(locale, 150_000_000, "tb1ztest", 2_090, change, caution, flags).body
+            };
+            assert_eq!(body(0, false, false, false), plain);
+            assert_eq!(body(30_000_000, false, false, false), with_change);
+            assert_eq!(body(0, true, false, false), noted(&[caution]));
+            assert_eq!(body(0, false, true, false), noted(&[one]));
+            assert_eq!(body(0, false, false, true), noted(&[disagree]));
+            assert_eq!(body(0, true, true, true), noted(&[caution, one, disagree]));
         }
     }
 
@@ -635,4 +658,5 @@ mod tests {
             }
         }
     }
+
 }
