@@ -204,7 +204,12 @@ p { margin: 0; }
 .amount-lg .amount-value { font-weight: 600; }
 .amount-xl { font-size: 42px; line-height: 1.1; }
 .amount-xl .amount-value { font-weight: 560; letter-spacing: -0.02em; }
-.amount-xl .amount-unit, .amount-lg .amount-unit { font-size: 14px; margin-left: 10px; }
+.amount-xl .amount-unit, .amount-lg .amount-unit { font-size: 14px; margin-left: 0; }
+/* A large amount never hides a digit: the unit goes under the number when they do not fit together, and the
+   number itself wraps rather than runs out of its card. */
+.amount-lg, .amount-xl { flex-wrap: wrap; column-gap: 10px; }
+.amount-lg .amount-value, .amount-xl .amount-value { min-width: 0; white-space: normal; overflow-wrap: anywhere; }
+.review-amount .amount { justify-content: center; }
 
 /* ---- onboarding: the brand on the left, the step on the right ---- */
 .onboard { min-height: 100%; display: grid; grid-template-columns: minmax(340px, 42%) 1fr; }
@@ -516,15 +521,12 @@ p { margin: 0; }
   .amount-xl { font-size: 34px; }
   .account { grid-template-columns: 40px minmax(0, 1fr); padding: 14px 16px; align-items: start; }
   .account-side { grid-column: 2; flex-direction: row; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px 12px; }
-  /* Long statuses, amounts and the drill's faucet label wrap inside their card instead of running off the
-     screen. */
+  /* Long statuses and the drill's faucet label wrap inside their card instead of running off the screen. */
   .chip { white-space: normal; height: auto; min-height: 24px; padding: 3px 10px; line-height: 1.35; max-width: 100%; }
   .chip-dot::before { flex: none; }
   .drill-faucet .btn { height: auto; min-height: 36px; padding-top: 6px; padding-bottom: 6px; }
   .drill-faucet .btn > span { white-space: normal; text-align: left; }
   .drill-faucet .btn > .icon { flex: none; }
-  .amount-xl { flex-wrap: wrap; column-gap: 10px; }
-  .amount-xl .amount-unit { margin-left: 0; }
   /* A payment's status goes under its main text, so that the text keeps the width of the row. */
   .tx-row { display: grid; grid-template-columns: 36px minmax(0, 1fr) auto auto; grid-template-areas: "icon main amount chevron" ". status status status"; gap: 8px 12px; padding: 14px 16px; }
   .tx-icon { grid-area: icon; }
