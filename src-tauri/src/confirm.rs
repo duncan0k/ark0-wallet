@@ -544,4 +544,95 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn payment_dialogs_show_the_figures_and_change_only_with_change_in_each_language() {
+        for (locale, change_clause, earlier) in [
+            (
+                "zh-Hans",
+                "，找零 0.3 测试币回到你的地址",
+                "注意：之前有转账",
+            ),
+            (
+                "zh-Hant",
+                "，找零 0.3 測試幣回到你的地址",
+                "注意：之前有轉帳",
+            ),
+            (
+                "en",
+                "; 0.3 test coins come back to your address as change",
+                "Note: an earlier payment",
+            ),
+            (
+                "ja",
+                "。おつりの 0.3 テストコインはあなたのアドレスに戻ります",
+                "注意：以前の送金",
+            ),
+            (
+                "ko",
+                ". 잔돈 0.3 테스트 코인은 내 주소로 돌아옵니다",
+                "주의: 전송 여부가",
+            ),
+            (
+                "ru",
+                "; сдача, которая вернётся на ваш адрес: 0.3",
+                "Внимание: отправку более раннего",
+            ),
+            (
+                "es",
+                "; cambio que vuelve a tu dirección: 0.3",
+                "Atención: una transferencia anterior",
+            ),
+        ] {
+            for change in [0, 30_000_000] {
+                for caution in [false, true] {
+                    let dialog = payment(
+                        locale,
+                        150_000_000,
+                        "tb1ztest",
+                        2_090,
+                        change,
+                        caution,
+                        Flags::default(),
+                    );
+                    let body = dialog.body.as_str();
+                    for figure in ["1.5", "tb1ztest", "0.0000209"] {
+                        assert!(body.contains(figure), "{locale}: {figure}");
+                    }
+                    assert_eq!(body.contains(change_clause), change > 0, "{locale}");
+                    assert_eq!(body.contains("0.3"), change > 0, "{locale}");
+                    assert_eq!(body.contains(earlier), caution, "{locale}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_newer_languages_have_dialogs_of_their_own() {
+        let flags = Flags::default();
+        let english = [
+            recovery("en", false).title,
+            recovery("en", true).title,
+            drill("en", 1, 1).title,
+            payment("en", 1, "x", 1, 0, false, flags).title,
+            removal("en").title,
+            password_change("en").title,
+        ];
+        for locale in ["ja", "ko", "ru", "es"] {
+            let dialogs = [
+                recovery(locale, false),
+                recovery(locale, true),
+                drill(locale, 1, 1),
+                payment(locale, 1, "x", 1, 0, false, flags),
+                removal(locale),
+                password_change(locale),
+            ];
+            for (dialog, english) in dialogs.iter().zip(english) {
+                assert_ne!(dialog.title, english, "{locale}");
+                assert!(
+                    !dialog.body.is_empty() && !dialog.ok.is_empty() && !dialog.cancel.is_empty()
+                );
+            }
+        }
+    }
 }

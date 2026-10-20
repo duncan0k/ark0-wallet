@@ -1528,7 +1528,12 @@ pub fn open_page(app: AppHandle, state: State<'_, AppState>, page: String, value
 
 /// The address of a page `open_page` may open, or None; `recorded` and `own` say whether the value is a
 /// transaction this wallet recorded and one of its own addresses, and are asked only when it matters.
-fn page_url(page: &str, value: &str, recorded: impl Fn() -> bool, own: impl Fn() -> bool) -> Option<String> {
+fn page_url(
+    page: &str,
+    value: &str,
+    recorded: impl Fn() -> bool,
+    own: impl Fn() -> bool,
+) -> Option<String> {
     match page {
         "faucet" if value.is_empty() => Some(FAUCET.to_string()),
         "faucet" if own() => Some(format!("{FAUCET}?address={value}")),
@@ -4028,14 +4033,36 @@ mod tests {
     fn pages_open_only_for_this_wallets_own_values() {
         let own_address = "tb1zown";
         let recorded_txid = "ab".repeat(32);
-        let url = |page: &str, value: &str| page_url(page, value, || value == recorded_txid, || value == own_address);
-        assert_eq!(url("faucet", "").as_deref(), Some("https://faucet.ark0.si/"));
-        assert_eq!(url("faucet", own_address).as_deref(), Some("https://faucet.ark0.si/?address=tb1zown"));
+        let url = |page: &str, value: &str| {
+            page_url(
+                page,
+                value,
+                || value == recorded_txid,
+                || value == own_address,
+            )
+        };
+        assert_eq!(
+            url("faucet", "").as_deref(),
+            Some("https://faucet.ark0.si/")
+        );
+        assert_eq!(
+            url("faucet", own_address).as_deref(),
+            Some("https://faucet.ark0.si/?address=tb1zown")
+        );
         assert_eq!(url("faucet", "tb1zsomeoneelse"), None);
-        assert_eq!(url("explorer", "").as_deref(), Some("https://explorer.ark0.si/"));
-        assert_eq!(url("tx", &recorded_txid), Some(format!("https://explorer.ark0.si/tx/{recorded_txid}")));
+        assert_eq!(
+            url("explorer", "").as_deref(),
+            Some("https://explorer.ark0.si/")
+        );
+        assert_eq!(
+            url("tx", &recorded_txid),
+            Some(format!("https://explorer.ark0.si/tx/{recorded_txid}"))
+        );
         assert_eq!(url("tx", &"cd".repeat(32)), None);
-        assert_eq!(url("address", own_address).as_deref(), Some("https://explorer.ark0.si/address/tb1zown"));
+        assert_eq!(
+            url("address", own_address).as_deref(),
+            Some("https://explorer.ark0.si/address/tb1zown")
+        );
         assert_eq!(url("address", "tb1zsomeoneelse"), None);
         assert_eq!(url("settings", ""), None);
     }
