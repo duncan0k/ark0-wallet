@@ -507,6 +507,9 @@ mod tests {
         assert_eq!(locale("auto", Some("zh-Hant")), "zh-Hant");
         assert_eq!(locale("en", Some("zh-Hans")), "en");
         assert_eq!(locale("auto", Some("<script>")), "en");
+        assert_eq!(locale("auto", None), "en");
+        assert_eq!(locale("fr", Some("zh-Hans")), "en");
+        assert_eq!(locale("", None), "en");
         for code in ["ja", "ko", "ru", "es"] {
             assert_eq!(locale(code, Some("zh-Hans")), code);
             assert_eq!(locale("auto", Some(code)), code);
@@ -659,4 +662,97 @@ mod tests {
         }
     }
 
+
+
+    #[test]
+    fn removal_dialogs_in_each_language() {
+        for (locale, title, body, ok, cancel) in [
+            (
+                "zh-Hans",
+                "从这台设备移除钱包",
+                "这台设备上的钱包文件将被删除。之后只能用助记词或备份码恢复；没有它们，钱包里的币就再也取不回来。转账记录也会一并删除，还没有明确结果的转账将不再有防止重复付款的保护。",
+                "移除",
+                "取消",
+            ),
+            (
+                "zh-Hant",
+                "從這台裝置移除錢包",
+                "這台裝置上的錢包檔案將被刪除。之後只能用助記詞或備份碼還原；沒有它們，錢包裡的幣就再也取不回來。轉帳紀錄也會一併刪除，還沒有明確結果的轉帳將不再有防止重複付款的保護。",
+                "移除",
+                "取消",
+            ),
+            (
+                "en",
+                "Remove the wallet from this device",
+                "The wallet file on this device will be deleted. Only the recovery words or the backup code bring it back; without them, its coins are lost for good. Its record of payments goes too: a payment whose outcome is still unclear is no longer guarded against being paid twice.",
+                "Remove",
+                "Cancel",
+            ),
+            (
+                "ja",
+                "このデバイスからウォレットを削除",
+                "このデバイス上のウォレットのファイルが削除されます。その後はリカバリーワードかバックアップコードでしか復元できず、どちらもなければ、ウォレットのコインは二度と取り戻せません。送金の履歴も一緒に削除され、結果がまだはっきりしない送金については、二重払いを防ぐ保護がなくなります。",
+                "削除",
+                "キャンセル",
+            ),
+            (
+                "ko",
+                "이 기기에서 지갑 삭제",
+                "이 기기의 지갑 파일이 삭제됩니다. 이후에는 복구 단어나 백업 코드가 있어야만 되살릴 수 있고, 없으면 지갑의 코인은 다시는 되찾을 수 없습니다. 송금 기록도 함께 삭제되므로, 결과가 아직 확실하지 않은 송금은 더 이상 중복 지급을 막는 보호를 받지 못합니다.",
+                "삭제",
+                "취소",
+            ),
+            (
+                "ru",
+                "Удалить кошелёк с этого устройства",
+                "Файл кошелька на этом устройстве будет удалён. Вернуть кошелёк можно будет только по словам для восстановления или резервному коду; без них его монеты будут потеряны навсегда. История переводов тоже будет удалена: для переводов, результат которых ещё не ясен, защиты от повторной оплаты больше не будет.",
+                "Удалить",
+                "Отмена",
+            ),
+            (
+                "es",
+                "Eliminar la billetera de este dispositivo",
+                "Se borrará el archivo de la billetera de este dispositivo. Después, solo podrás restaurarla con las palabras de recuperación o el código de respaldo; sin ellos, las monedas de la billetera se pierden para siempre. También se borra su registro de transferencias: una transferencia cuyo resultado aún no está claro deja de estar protegida contra un pago duplicado.",
+                "Eliminar",
+                "Cancelar",
+            ),
+        ] {
+            let dialog = removal(locale);
+            assert_eq!(
+                (dialog.title, dialog.body.as_str(), dialog.ok, dialog.cancel),
+                (title, body, ok, cancel)
+            );
+        }
+    }
+
+    #[test]
+    fn payment_dialog_titles_and_buttons_in_each_language() {
+        for (locale, title, ok, cancel) in [
+            ("zh-Hans", "确认转出", "签名并发出", "取消"),
+            ("zh-Hant", "確認轉出", "簽章並發出", "取消"),
+            ("en", "Confirm the payment", "Sign and send", "Cancel"),
+            ("ja", "送金の確認", "署名して送金", "キャンセル"),
+            ("ko", "송금 확인", "서명하고 보내기", "취소"),
+            (
+                "ru",
+                "Подтверждение перевода",
+                "Подписать и отправить",
+                "Отмена",
+            ),
+            (
+                "es",
+                "Confirmar la transferencia",
+                "Firmar y enviar",
+                "Cancelar",
+            ),
+        ] {
+            for change in [0, 5] {
+                let dialog = payment(locale, 1, "x", 1, change, true, Flags::default());
+                assert_eq!(
+                    (dialog.title, dialog.ok, dialog.cancel),
+                    (title, ok, cancel)
+                );
+            }
+        }
+    }
 }
