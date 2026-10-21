@@ -20,13 +20,15 @@ export function Activity({ info, version }: { info: AppInfo | null; version: num
           <li class={`tx${open === s.txid ? ' open' : ''}`}>
             <button class="tx-row" onClick={() => setOpen(open === s.txid ? null : s.txid)}>
               <span class="tx-icon"><Icon name="send" size={16} /></span>
-              <span class="tx-main">
-                <strong>{m().activity.to} <Mono>{shorten(s.to, 10, 6)}</Mono></strong>
-                <small class="muted">{ago(s.created)} · {s.signature === 'mldsa44' ? 'ML-DSA-44' : 'Schnorr'}</small>
-              </span>
-              <span class="tx-side">
-                <span class="tx-amount num">−{coins(s.send)}</span>
-                <StatusChip s={s} />
+              <span class="tx-body">
+                <span class="tx-main">
+                  <strong>{m().activity.to} <Mono>{shorten(s.to, 10, 6)}</Mono></strong>
+                  <small class="muted">{ago(s.created)} · {s.signature === 'mldsa44' ? 'ML-DSA-44' : 'Schnorr'}</small>
+                </span>
+                <span class="tx-side">
+                  <span class="tx-amount num">−{coins(s.send)}</span>
+                  <StatusChip s={s} />
+                </span>
               </span>
               <span class="tx-chevron"><Icon name="chevron" size={16} /></span>
             </button>
