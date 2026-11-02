@@ -325,6 +325,40 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn pq2_needs_both_sources_and_either_sees_ml_dsa_disabled() {
+        use crate::chain::tests::m4_state;
+        use crate::chain::H4T;
+        let run = |a: Value, b: Value| {
+            let (left, first) = serve(vec![response(200, &a.to_string())]);
+            let (right, second) = serve(vec![response(200, &b.to_string())]);
+            let answer = block_on(Sources::new(left, right).state());
+            first.join().unwrap();
+            second.join().unwrap();
+            answer
+        };
+        for reverse in [false, true] {
+            let pair = |a: Value, b: Value| if reverse { run(b, a) } else { run(a, b) };
+            // Both open, one sees ML-DSA-44 disabled: disabled, and the answers disagree.
+            let answer = pair(m4_state(H4T + 10, true), m4_state(H4T + 10, false));
+            let c = answer.value.unwrap();
+            assert!(answer.flags.disagree && c.pq2_allowed);
+            assert_eq!(c.mldsa_disabled, Some(true));
+            assert!(!c.lattice_tripwires[1].unspent);
+            // One without the lattice state: unknown, no pq2.
+            let mut b = m4_state(H4T + 10, false);
+            b["tripwire"].as_object_mut().unwrap().remove("lattice");
+            let c = pair(m4_state(H4T + 10, false), b).value.unwrap();
+            assert_eq!((c.mldsa_disabled, c.pq2_allowed), (None, false));
+            // One node that does not run the M4 rules: no pq2 at all.
+            let c = pair(m4_state(H4T + 10, false), state(H4T + 10, false)).value.unwrap();
+            assert_eq!((c.lattice_height, c.pq2_allowed), (None, false));
+            // The lower tip decides the gate.
+            let c = pair(m4_state(H4T + 5, false), m4_state(H4T + 7, false)).value.unwrap();
+            assert_eq!((c.lattice_tip, c.pq2_allowed), (Some(H4T + 5), false));
+        }
+    }
+
+    #[test]
     fn lower_tip_controls_activation_and_six_blocks_is_the_boundary() {
         for (a, b, disagree) in [(30_006, 30_012, false), (30_013, 30_006, true), (8_605, 8_612, true)] {
             let (left, first) = serve(vec![response(200, &state(a, false).to_string())]);

@@ -397,6 +397,154 @@ pub(crate) mod tests {
         })
     }
 
+    /// A state from a node that runs the M4 rules: both deployments, and the lattice tripwire state in
+    /// gettripwireinfo's `lattice` object.
+    pub(crate) fn m4_state(tip: u32, mldsa_disabled: bool) -> Value {
+        let mut s = state(tip, false);
+        s["deployments"]["p2mr_slhdsa128s"] = json!({"type": "buried", "active": tip >= 32000, "height": 32000});
+        s["deployments"]["p2mr_lattice_tripwire"] = json!({"type": "buried", "active": tip >= H4T, "height": H4T});
+        s["tripwire"]["lattice"] = json!({
+            "height": H4T, "leaf_version": "e2",
+            "tripwires": [
+                {"outpoint": format!("{}:0", "c1".repeat(32)), "state": "unspent", "key_sha256": "591dae318a0fdde81a590eab8c8581e07657d2c30b97cf31d87bafe636c92805", "label": "NUMS ML-DSA-44"},
+                {"outpoint": format!("{}:1", "c2".repeat(32)), "state": if mldsa_disabled { "missing" } else { "unspent" }, "label": "destroyed key"},
+                {"outpoint": format!("{}:2", "c3".repeat(32)), "state": "unspent"}
+            ],
+            "mldsa_disabled_next_block": mldsa_disabled
+        });
+        s
+    }
+
+    #[test]
+    fn pq2_opens_at_h4t_plus_six_and_not_at_h4t_plus_five() {
+        let c = check(&m4_state(H4T + 5, false)).unwrap();
+        assert_eq!((c.lattice_height, c.lattice_tip, c.mldsa_disabled), (Some(H4T), Some(H4T + 5), Some(false)));
+        assert!(!c.pq2_allowed);
+        // Without pq2 open, a transaction keeps the lock time of the rules before it.
+        assert_eq!((c.lock_time_for(true), c.lock_time_for(false)), (TRIPWIRE_HEIGHT, TRIPWIRE_HEIGHT));
+        let c = check(&m4_state(H4T + 6, false)).unwrap();
+        assert!(c.pq2_allowed);
+        assert_eq!((c.lock_time_for(true), c.lock_time_for(false)), (H4T, TRIPWIRE_HEIGHT));
+        assert_eq!(c.lattice_tripwires.len(), 3);
+        assert_eq!(c.lattice_tripwires[0].label.as_deref(), Some("NUMS ML-DSA-44"));
+        assert_eq!(c.lattice_tripwires[2].key_sha256, None);
+        // The SLH-DSA leaf by default; the ML-DSA-44 leaf only when asked and allowed.
+        assert_eq!((c.pq2_path(None), c.pq2_path(Some(Path::Mldsa44))), (Path::Slhdsa128s, Path::Mldsa44));
+        let c = check(&m4_state(H4T + 100, true)).unwrap();
+        assert!(c.pq2_allowed && !c.pq2_mldsa44_allowed());
+        assert_eq!(c.pq2_path(Some(Path::Mldsa44)), Path::Slhdsa128s);
+        assert!(!c.lattice_tripwires[1].unspent);
+        // A reorganization back below H4T + 6 closes it again; the state read at a tip the node has not
+        // reached does not count.
+        assert!(!check(&m4_state(H4T + 2, false)).unwrap().pq2_allowed);
+        let mut s = m4_state(H4T + 5, false);
+        s["tripwire"]["tip_height"] = json!(H4T + 6);
+        let c = check(&s).unwrap();
+        assert_eq!((c.lattice_tip, c.mldsa_disabled, c.pq2_allowed), (None, None, false));
+    }
+
+    #[test]
+    fn pq2_status_follows_the_confirmation_height() {
+        let c = check(&m4_state(H4T + 10, false)).unwrap();
+        assert_eq!(c.pq2_status(None), Some(Pq2Status::Pending));
+        assert_eq!(c.pq2_status(Some(H4T)), Some(Pq2Status::Protected));
+        assert_eq!(c.pq2_status(Some(H4T + 9)), Some(Pq2Status::Protected));
+        assert_eq!(c.pq2_status(Some(H4T - 1)), Some(Pq2Status::Unprotected));
+        // Recomputed from what the chain says now: after a reorganization the same output may be pending
+        // again or confirmed at another height.
+        assert_eq!(check(&state(40_000, false)).unwrap().pq2_status(Some(H4T)), None);
+    }
+
+    #[test]
+    fn todays_nodes_are_ark0_without_pq2_and_other_heights_are_another_chain() {
+        // No M4 deployment at all, as today: not the wrong chain, simply no pq2.
+        let c = check(&state(60_000, false)).unwrap();
+        assert_eq!((c.lattice_height, c.lattice_tip, c.mldsa_disabled, c.pq2_allowed), (None, None, None, false));
+        assert!(c.lattice_tripwires.is_empty());
+        // Only one of the two: no pq2 either (leaf B needs OP_CHECKSLHDSA128S, the leaves need H4T).
+        for name in ["p2mr_slhdsa128s", "p2mr_lattice_tripwire"] {
+            let mut s = m4_state(H4T + 10, false);
+            s["deployments"].as_object_mut().unwrap().remove(name);
+            let c = check(&s).unwrap();
+            assert_eq!((c.lattice_height, c.pq2_allowed, c.mldsa_disabled), (None, false, None), "{name}");
+        }
+        // Either reported at another height: another chain, whatever else the answer says.
+        for (name, height) in [("p2mr_slhdsa128s", 31_999), ("p2mr_slhdsa128s", 55_000), ("p2mr_lattice_tripwire", 54_000), ("p2mr_lattice_tripwire", 1)] {
+            let mut s = m4_state(H4T + 10, false);
+            s["deployments"][name]["height"] = json!(height);
+            assert_eq!(check(&s), Err(ChainProblem::WrongChain), "{name} at {height}");
+            let mut s = state(40_000, false);
+            s["deployments"][name] = json!({"type": "buried", "active": true, "height": height});
+            assert_eq!(check(&s), Err(ChainProblem::WrongChain), "{name} at {height} alone");
+        }
+        // Listed in a form the wallet does not read: unknown, no pq2, not a reason to distrust the rest.
+        for broken in [json!({"type": "bip9", "height": H4T}), json!({"type": "buried"}), json!({"type": "buried", "height": "55000"}), json!(null), json!([])] {
+            let mut s = m4_state(H4T + 10, false);
+            s["deployments"]["p2mr_lattice_tripwire"] = broken.clone();
+            let c = check(&s).unwrap();
+            assert_eq!((c.lattice_height, c.pq2_allowed), (None, false), "{broken}");
+        }
+    }
+
+    #[test]
+    fn the_lattice_state_is_parsed_strictly_and_unknown_is_never_a_default() {
+        let unknown = |s: &Value, what: &str| {
+            let c = check(s).unwrap();
+            assert_eq!(c.lattice_height, Some(H4T), "{what}");
+            assert_eq!((c.lattice_tip, c.mldsa_disabled, c.pq2_allowed), (None, None, false), "{what}");
+            assert!(c.lattice_tripwires.is_empty(), "{what}");
+            // Unknown: no ML-DSA-44 leaf, and a spend goes through the SLH-DSA leaf.
+            assert!(!c.pq2_mldsa44_allowed(), "{what}");
+            assert_eq!(c.pq2_path(Some(Path::Mldsa44)), Path::Slhdsa128s, "{what}");
+        };
+        let edits: Vec<(&str, Box<dyn Fn(&mut Value)>)> = vec![
+            ("no lattice object", Box::new(|s| { s["tripwire"].as_object_mut().unwrap().remove("lattice"); })),
+            ("lattice not an object", Box::new(|s| s["tripwire"]["lattice"] = json!("e2"))),
+            ("no flag", Box::new(|s| { s["tripwire"]["lattice"].as_object_mut().unwrap().remove("mldsa_disabled_next_block"); })),
+            ("flag not a boolean", Box::new(|s| s["tripwire"]["lattice"]["mldsa_disabled_next_block"] = json!("false"))),
+            ("flag null", Box::new(|s| s["tripwire"]["lattice"]["mldsa_disabled_next_block"] = json!(null))),
+            ("flag a number", Box::new(|s| s["tripwire"]["lattice"]["mldsa_disabled_next_block"] = json!(0))),
+            ("other height", Box::new(|s| s["tripwire"]["lattice"]["height"] = json!(H4T + 1))),
+            ("height a string", Box::new(|s| s["tripwire"]["lattice"]["height"] = json!("55000"))),
+            ("no height", Box::new(|s| { s["tripwire"]["lattice"].as_object_mut().unwrap().remove("height"); })),
+            ("leaf version e0", Box::new(|s| s["tripwire"]["lattice"]["leaf_version"] = json!("e0"))),
+            ("leaf version upper case", Box::new(|s| s["tripwire"]["lattice"]["leaf_version"] = json!("E2"))),
+            ("leaf version a number", Box::new(|s| s["tripwire"]["lattice"]["leaf_version"] = json!(226))),
+            ("no tripwires", Box::new(|s| { s["tripwire"]["lattice"].as_object_mut().unwrap().remove("tripwires"); })),
+            ("empty tripwires", Box::new(|s| s["tripwire"]["lattice"]["tripwires"] = json!([]))),
+            ("too many tripwires", Box::new(|s| s["tripwire"]["lattice"]["tripwires"] = json!((0..=MAX_TRIPWIRES).map(|i| json!({"outpoint": format!("{}:{i}", "cd".repeat(32)), "state": "unspent"})).collect::<Vec<_>>()))),
+            ("a tripwire's state unknown", Box::new(|s| s["tripwire"]["lattice"]["tripwires"][0]["state"] = json!("spent"))),
+            ("a tripwire without state", Box::new(|s| { s["tripwire"]["lattice"]["tripwires"][0].as_object_mut().unwrap().remove("state"); })),
+            ("a malformed outpoint", Box::new(|s| s["tripwire"]["lattice"]["tripwires"][0]["outpoint"] = json!("c1:0"))),
+            ("an outpoint twice", Box::new(|s| s["tripwire"]["lattice"]["tripwires"][1]["outpoint"] = s["tripwire"]["lattice"]["tripwires"][0]["outpoint"].clone())),
+            ("a key hash that is not one", Box::new(|s| s["tripwire"]["lattice"]["tripwires"][0]["key_sha256"] = json!("abc"))),
+            ("a key hash in upper case", Box::new(|s| s["tripwire"]["lattice"]["tripwires"][0]["key_sha256"] = json!("AB".repeat(32)))),
+            ("a key hash null", Box::new(|s| s["tripwire"]["lattice"]["tripwires"][0]["key_sha256"] = json!(null))),
+            ("a label not a string", Box::new(|s| s["tripwire"]["lattice"]["tripwires"][0]["label"] = json!(7))),
+            ("a label with a line break", Box::new(|s| s["tripwire"]["lattice"]["tripwires"][0]["label"] = json!("a\nb"))),
+            ("a label far too long", Box::new(|s| s["tripwire"]["lattice"]["tripwires"][0]["label"] = json!("x".repeat(65)))),
+            ("no tip hash", Box::new(|s| { s["tripwire"].as_object_mut().unwrap().remove("tip_hash"); })),
+            ("no tip height", Box::new(|s| { s["tripwire"].as_object_mut().unwrap().remove("tip_height"); })),
+        ];
+        for (what, edit) in edits {
+            let mut s = m4_state(H4T + 100, false);
+            edit(&mut s);
+            unknown(&s, what);
+        }
+        // Optional fields may be left out.
+        let mut s = m4_state(H4T + 100, false);
+        for t in s["tripwire"]["lattice"]["tripwires"].as_array_mut().unwrap() {
+            t.as_object_mut().unwrap().retain(|k, _| k == "outpoint" || k == "state");
+        }
+        let c = check(&s).unwrap();
+        assert!(c.pq2_allowed && c.lattice_tripwires.iter().all(|t| t.key_sha256.is_none() && t.label.is_none()));
+        // The M3 state and the lattice state are independent: one unknown leaves the other as it is.
+        let mut s = m4_state(H4T + 100, true);
+        s["tripwire"]["leaf_version"] = json!("c0");
+        let c = check(&s).unwrap();
+        assert_eq!((c.ec_disabled, c.mldsa_disabled, c.pq2_allowed), (None, Some(true), true));
+    }
+
     #[test]
     fn gates_and_lock_time_follow_the_heights() {
         let c = check(&state(30005, false)).unwrap();
