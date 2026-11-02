@@ -9,22 +9,38 @@
 //! - ML-DSA-44 (M1): the S1 template of OP_CHECKMLDSA44 beside `OP_RETURN`, both 0xc0;
 //! - mixed (M3, "S3"): the Schnorr leaf beside the S1 leaf, both 0xe0. Once the network's drill tripwire is
 //!   pulled, elliptic-curve checks in 0xe0 leaves fail, and only the ML-DSA-44 leaf can spend.
+//!
+//! And the pq2 template (M4), one output per pair of fresh keys: the S1 leaf beside the SLH1 leaf
+//! (`<SLH-DSA-SHA2-128s key> OP_CHECKSLHDSA128S`), both leaf version 0xe2. Once any of the network's lattice
+//! tripwires is spent, ML-DSA-44 checks in 0xe2 leaves fail; the SLH-DSA leaf is never disabled. p2mr-ts's
+//! pq2 module is the reference, and `tests/vectors/pq2.json` holds its vectors.
 use bech32::{Fe32, Hrp};
 use sha2::{Digest, Sha256};
 
 pub const LEAF_VERSION: u8 = 0xc0;
 pub const TRIPWIRED_LEAF_VERSION: u8 = 0xe0;
+/// The leaf version of the pq2 template: its control blocks start with 0xe3.
+pub const LATTICE_TRIPWIRED_LEAF_VERSION: u8 = 0xe2;
 /// The sibling of a template leaf: `OP_RETURN`, which can only fail.
 pub const FAIL_LEAF: [u8; 1] = [0x6a];
 pub const OP_CHECKMLDSA44: u8 = 0xf0;
+pub const OP_CHECKSLHDSA128S: u8 = 0xf1;
 pub const MLDSA44_PUBLIC_KEY_LEN: usize = 1312;
-/// The signature message's key_version: 0 for BIP-340 signatures, 1 for OP_CHECKMLDSA44.
+pub const SLHDSA128S_PUBLIC_KEY_LEN: usize = 32;
+/// The signature message's key_version: 0 for BIP-340 signatures, 1 for OP_CHECKMLDSA44, 2 for
+/// OP_CHECKSLHDSA128S.
 pub const SCHNORR_KEY_VERSION: u8 = 0x00;
 pub const MLDSA44_KEY_VERSION: u8 = 0x01;
+pub const SLHDSA128S_KEY_VERSION: u8 = 0x02;
 /// The context string of every ML-DSA-44 signature OP_CHECKMLDSA44 checks.
 pub const MLDSA44_CONTEXT: &[u8] = b"P2MR/MLDSA44/EXP0";
 /// An ML-DSA-44 signature goes on the witness stack in these pieces (no element may exceed 520 bytes).
 pub const MLDSA44_SIGNATURE_CHUNKS: [usize; 5] = [520, 520, 520, 520, 340];
+/// The context string of every SLH-DSA signature OP_CHECKSLHDSA128S checks.
+pub const SLHDSA128S_CONTEXT: &[u8] = b"P2MR/SLHDSA128S/EXP0";
+/// An SLH-DSA-SHA2-128s signature (7,856 bytes) goes on the witness stack as fifteen pieces of 520 bytes
+/// and one of 56.
+pub const SLHDSA128S_SIGNATURE_CHUNKS: [usize; 16] = [520, 520, 520, 520, 520, 520, 520, 520, 520, 520, 520, 520, 520, 520, 520, 56];
 /// The address prefix of every test network, Ark-0 included.
 pub const HRP: &str = "tb";
 #[cfg(test)]
@@ -99,6 +115,15 @@ pub fn mldsa44_leaf_script(public_key: &[u8; MLDSA44_PUBLIC_KEY_LEN]) -> Vec<u8>
     s
 }
 
+/// SLH1: `<32-byte SLH-DSA-SHA2-128s key> OP_CHECKSLHDSA128S`.
+pub fn slhdsa128s_leaf_script(public_key: &[u8; SLHDSA128S_PUBLIC_KEY_LEN]) -> Vec<u8> {
+    let mut s = Vec::with_capacity(34);
+    s.push(0x20);
+    s.extend_from_slice(public_key);
+    s.push(OP_CHECKSLHDSA128S);
+    s
+}
+
 /// A leaf a spend runs, with the control block that proves it is in the tree.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Leaf {
@@ -149,6 +174,8 @@ pub enum Kind {
     Schnorr,
     Mldsa44,
     Mixed,
+    /// The pq2 template: one output per index, never the same keys twice.
+    Pq2,
 }
 
 /// Which leaf, and so which signature, a spend uses.
@@ -157,6 +184,7 @@ pub enum Kind {
 pub enum Path {
     Schnorr,
     Mldsa44,
+    Slhdsa128s,
 }
 
 /// One of the three outputs a key pair makes.
@@ -169,13 +197,16 @@ pub struct Template {
     pub address: String,
     /// The Schnorr leaf: the spending leaf of the Schnorr template, and the 0xe0 Schnorr leaf of the mixed one.
     pub schnorr_leaf: Option<Leaf>,
-    /// The S1 leaf: the spending leaf of the ML-DSA-44 template, and the 0xe0 S1 leaf of the mixed one.
+    /// The S1 leaf: the spending leaf of the ML-DSA-44 template, the 0xe0 S1 leaf of the mixed one and the
+    /// 0xe2 S1 leaf of pq2.
     pub mldsa44_leaf: Option<Leaf>,
+    /// The 0xe2 SLH1 leaf of pq2.
+    pub slhdsa128s_leaf: Option<Leaf>,
 }
 
 impl Template {
     fn new(kind: Kind, root: [u8; 32], schnorr_leaf: Option<Leaf>, mldsa44_leaf: Option<Leaf>) -> Self {
-        Template { kind, script_pubkey: script_pubkey(&root), address: address(&root), root, schnorr_leaf, mldsa44_leaf }
+        Template { kind, script_pubkey: script_pubkey(&root), address: address(&root), root, schnorr_leaf, mldsa44_leaf, slhdsa128s_leaf: None }
     }
 
     pub fn schnorr(xonly: &[u8; 32]) -> Self {
@@ -194,12 +225,26 @@ impl Template {
         Template::new(Kind::Mixed, root, Some(schnorr), Some(mldsa44))
     }
 
+    /// pq2: the S1 leaf beside the SLH1 leaf, both 0xe2, at depth one; control blocks `e3 <sibling hash>`.
+    pub fn pq2(mldsa44_key: &[u8; MLDSA44_PUBLIC_KEY_LEN], slhdsa128s_key: &[u8; SLHDSA128S_PUBLIC_KEY_LEN]) -> Self {
+        let (root, mldsa44, slhdsa128s) =
+            pair(mldsa44_leaf_script(mldsa44_key), slhdsa128s_leaf_script(slhdsa128s_key), LATTICE_TRIPWIRED_LEAF_VERSION);
+        Template { slhdsa128s_leaf: Some(slhdsa128s), ..Template::new(Kind::Pq2, root, None, Some(mldsa44)) }
+    }
+
     /// The leaf a spend along `path` runs, if this template has one.
     pub fn leaf(&self, path: Path) -> Option<&Leaf> {
         match path {
             Path::Schnorr => self.schnorr_leaf.as_ref(),
             Path::Mldsa44 => self.mldsa44_leaf.as_ref(),
+            Path::Slhdsa128s => self.slhdsa128s_leaf.as_ref(),
         }
+    }
+
+    /// Whether `script_pubkey` commits to exactly the pq2 tree of these keys: two leaves of version 0xe2
+    /// at depth one, one exactly S1 and the other exactly SLH1 (any other tree has another root).
+    pub fn is_pq2_of(script_pubkey: &[u8], mldsa44_key: &[u8; MLDSA44_PUBLIC_KEY_LEN], slhdsa128s_key: &[u8; SLHDSA128S_PUBLIC_KEY_LEN]) -> bool {
+        is_p2mr(script_pubkey) && script_pubkey[2..] == Template::pq2(mldsa44_key, slhdsa128s_key).root
     }
 }
 

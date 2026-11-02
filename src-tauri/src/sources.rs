@@ -74,7 +74,29 @@ fn combine<T, E>(left: Result<T, E>, right: Result<T, E>, merge: impl FnOnce(T, 
 fn merge_chain(mut a: Chain, mut b: Chain) -> (Chain, bool) {
     if a.tip > b.tip { std::mem::swap(&mut a, &mut b); }
     let wires = |c: &Chain| c.tripwires.iter().map(|t| (t.outpoint.clone(), t.unspent)).collect::<HashMap<_, _>>();
-    let disagree = b.tip - a.tip > 6 || a.ec_disabled != b.ec_disabled || wires(&a) != wires(&b);
+    let lattice_wires = |c: &Chain| c.lattice_tripwires.iter().map(|t| (t.outpoint.clone(), t.unspent)).collect::<HashMap<_, _>>();
+    let disagree = b.tip - a.tip > 6 || a.ec_disabled != b.ec_disabled || wires(&a) != wires(&b)
+        || a.lattice_height != b.lattice_height || a.mldsa_disabled != b.mldsa_disabled || lattice_wires(&a) != lattice_wires(&b);
+    // pq2 opens only when both run the M4 rules and know the lattice state; if either sees ML-DSA-44 disabled,
+    // it is disabled, and unknown on either side stays unknown.
+    a.mldsa_disabled = match (a.mldsa_disabled, b.mldsa_disabled) {
+        (Some(true), _) | (_, Some(true)) => Some(true),
+        (Some(false), Some(false)) => Some(false),
+        _ => None,
+    };
+    a.lattice_height = a.lattice_height.filter(|h| b.lattice_height == Some(*h));
+    a.lattice_tip = a.lattice_tip.zip(b.lattice_tip).map(|(x, y)| x.min(y));
+    a.pq2_allowed &= b.pq2_allowed && a.lattice_height.is_some();
+    let mut lattice_positions = a.lattice_tripwires.iter().enumerate().map(|(i, t)| (t.outpoint.clone(), i)).collect::<HashMap<_, _>>();
+    for wire in std::mem::take(&mut b.lattice_tripwires) {
+        match lattice_positions.get(&wire.outpoint) {
+            Some(&i) => a.lattice_tripwires[i].unspent &= wire.unspent,
+            None => {
+                lattice_positions.insert(wire.outpoint.clone(), a.lattice_tripwires.len());
+                a.lattice_tripwires.push(wire);
+            }
+        }
+    }
     // The mixed address opens only when both know the tripwire state; if either sees it pulled, the ML-DSA-44 leaf is used.
     a.ec_disabled = match (a.ec_disabled, b.ec_disabled) {
         (Some(true), _) | (_, Some(true)) => Some(true),

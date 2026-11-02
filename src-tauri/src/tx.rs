@@ -1,6 +1,6 @@
 //! Transactions: the segwit serialization (BIP-144), txid, sizes, the P2MR script-path signature
-//! message (BIP-341 with ext_flag 1, as p2mr-ts computes it), and the witnesses of the three templates.
-use crate::p2mr::{compact_size, is_p2mr, tagged_hash, Leaf, MLDSA44_SIGNATURE_CHUNKS};
+//! message (BIP-341 with ext_flag 1, as p2mr-ts computes it), and the witnesses of the templates.
+use crate::p2mr::{compact_size, is_p2mr, tagged_hash, Leaf, MLDSA44_SIGNATURE_CHUNKS, SLHDSA128S_SIGNATURE_CHUNKS};
 use sha2::{Digest, Sha256};
 
 /// Below 0xffffffff so that nLockTime applies; it also signals replaceability.
@@ -175,18 +175,29 @@ pub fn schnorr_witness(signature: &[u8; 64], leaf: &Leaf) -> Vec<Vec<u8>> {
     vec![signature.to_vec(), leaf.script.clone(), leaf.control_block.clone()]
 }
 
-/// The signature in its five pieces, then the leaf and the control block.
-pub fn mldsa44_witness(signature: &[u8], leaf: &Leaf) -> Vec<Vec<u8>> {
-    assert_eq!(signature.len(), MLDSA44_SIGNATURE_CHUNKS.iter().sum::<usize>(), "an ML-DSA-44 signature");
-    let mut witness = Vec::with_capacity(7);
+/// The signature in pieces of these sizes, then the leaf and the control block.
+fn chunked_witness(signature: &[u8], chunks: &[usize], leaf: &Leaf) -> Vec<Vec<u8>> {
+    assert_eq!(signature.len(), chunks.iter().sum::<usize>(), "a signature of the leaf's scheme");
+    let mut witness = Vec::with_capacity(chunks.len() + 2);
     let mut at = 0;
-    for n in MLDSA44_SIGNATURE_CHUNKS {
+    for &n in chunks {
         witness.push(signature[at..at + n].to_vec());
         at += n;
     }
     witness.push(leaf.script.clone());
     witness.push(leaf.control_block.clone());
     witness
+}
+
+/// The signature in its five pieces, then the leaf and the control block.
+pub fn mldsa44_witness(signature: &[u8], leaf: &Leaf) -> Vec<Vec<u8>> {
+    chunked_witness(signature, &MLDSA44_SIGNATURE_CHUNKS, leaf)
+}
+
+/// The SLH-DSA signature in its sixteen pieces (15 of 520 bytes, one of 56), then the leaf and the
+/// control block.
+pub fn slhdsa128s_witness(signature: &[u8], leaf: &Leaf) -> Vec<Vec<u8>> {
+    chunked_witness(signature, &SLHDSA128S_SIGNATURE_CHUNKS, leaf)
 }
 
 #[cfg(test)]

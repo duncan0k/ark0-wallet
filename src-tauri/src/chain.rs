@@ -5,8 +5,12 @@
 //! version 2 output is anyone's. The ML-DSA-44 address waits six blocks past M1's height, the mixed one six
 //! past M3's, and the mixed one also waits until the drill tripwire's state is known: it decides which of
 //! the two leaves a spend can use. These are the web wallet's rules (chain.ts, p2mr-ts).
+//!
+//! pq2 (M4) waits six blocks past H4T, the height of the lattice tripwire rules (leaf version 0xe2), and
+//! until the lattice tripwire state is known; a node that does not report those rules at all is on Ark-0
+//! still, it just offers no pq2. Unknown state never opens anything: no pq2 address, no ML-DSA-44 leaf.
 use crate::keys::ARK0_CHALLENGE;
-use crate::p2mr::{Path, TRIPWIRED_LEAF_VERSION};
+use crate::p2mr::{Path, LATTICE_TRIPWIRED_LEAF_VERSION, TRIPWIRED_LEAF_VERSION};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashSet;
@@ -22,8 +26,13 @@ const MAX_TRIPWIRES: usize = 16;
 pub const P2MR_HEIGHT: u32 = 1;
 pub const MLDSA44_HEIGHT: u32 = 8_600;
 pub const TRIPWIRE_HEIGHT: u32 = 30_000;
+/// OP_CHECKSLHDSA128S (M4-S) from 32,000, and H4T: leaves of version 0xe2 and the lattice tripwires
+/// (`p2mr_lattice_tripwire`, M4-T) from 55,000. A node that does not report them gives no pq2; one that
+/// reports other heights is not describing Ark-0.
+pub const SLHDSA128S_HEIGHT: u32 = 32_000;
+pub const H4T: u32 = 55_000;
 
-/// M2 ??????????????? ML-DSA-44 ???
+/// M2: from this height every block carries an ML-DSA-44 signature by this key.
 pub const PQBLOCK_HEIGHT: u32 = 20_000;
 pub const PQBLOCK_KEY: &str = concat!(
     "b92b2c1f1eca027e10bcb4f379c98691585d9d9479cbf2c76a1ba1c10fcc4692",
@@ -91,6 +100,40 @@ pub struct Chain {
     pub ec_disabled: Option<bool>,
     pub tripwires: Vec<Tripwire>,
     pub mixed_allowed: bool,
+    /// H4T when the node reports both M4 deployments at Ark-0's heights; None when it reports neither or
+    /// not both (then there is no pq2).
+    pub lattice_height: Option<u32>,
+    /// The tip the lattice tripwire state was read at; None when the state is unknown.
+    pub lattice_tip: Option<u32>,
+    /// Whether ML-DSA-44 checks in 0xe2 leaves fail from the next block on; None when unknown.
+    pub mldsa_disabled: Option<bool>,
+    /// The lattice tripwires as the node reports them.
+    pub lattice_tripwires: Vec<LatticeTripwire>,
+    /// pq2 addresses and outputs may be made: the tip is at least H4T + 6 and the state is known.
+    pub pq2_allowed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct LatticeTripwire {
+    pub outpoint: String,
+    pub unspent: bool,
+    /// SHA-256 of the output's ML-DSA-44 key, when the node gives it.
+    pub key_sha256: Option<String>,
+    /// The node's name for it ("NUMS ML-DSA-44", "destroyed key", "drill"), when it gives one.
+    pub label: Option<String>,
+}
+
+/// The status of a verified pq2 output (design section 8.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Pq2Status {
+    /// Confirmed at or above H4T: every spend of it comes when both of its leaves are executed.
+    Protected,
+    /// Not yet confirmed.
+    Pending,
+    /// Confirmed below H4T (a payment made before activation, or a deep reorganization): a spend could come
+    /// while 0xe2 leaves are not executed.
+    Unprotected,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -159,6 +202,58 @@ fn tripwire_state(v: &Value) -> Option<(u32, u32, String, bool, Vec<Tripwire>)> 
     ))
 }
 
+/// A label as a node writes it: short printable ASCII.
+fn is_label(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 64 && s.bytes().all(|b| (0x20..0x7f).contains(&b))
+}
+
+/// What `deployments` says of a deployment Ark-0 may not have yet: Ok(None) when it is not listed or is
+/// listed in a form the wallet does not read (unknown: no pq2), Ok(Some) at Ark-0's height, and the wrong
+/// chain when it is a buried deployment at any other height.
+fn optional_buried(deployments: &Value, name: &str, pinned: u32) -> Result<Option<u32>, ChainProblem> {
+    match deployments.get(name).map(|_| buried(deployments, name)) {
+        None | Some(None) => Ok(None),
+        Some(Some(h)) if h == pinned => Ok(Some(h)),
+        Some(Some(_)) => Err(ChainProblem::WrongChain),
+    }
+}
+
+/// The lattice tripwire state, gettripwireinfo's `lattice` object, when every field is of its type:
+/// (height, ML-DSA-44 disabled from the next block, the tripwires). None otherwise: it is then unknown.
+fn lattice_state(v: &Value) -> Option<(u32, bool, Vec<LatticeTripwire>)> {
+    if v.get("leaf_version")?.as_str()? != format!("{LATTICE_TRIPWIRED_LEAF_VERSION:x}") {
+        return None;
+    }
+    let list = v.get("tripwires")?.as_array()?;
+    if list.is_empty() || list.len() > MAX_TRIPWIRES {
+        return None;
+    }
+    let mut tripwires = Vec::new();
+    let mut seen = HashSet::new();
+    for t in list {
+        let outpoint = t.get("outpoint")?.as_str()?;
+        let unspent = match t.get("state")?.as_str()? {
+            "unspent" => true,
+            "missing" => false,
+            _ => return None,
+        };
+        if !is_outpoint(outpoint) || !seen.insert(outpoint) {
+            return None;
+        }
+        // Optional, but a field that is there must be of its type.
+        let key_sha256 = match t.get("key_sha256") {
+            None => None,
+            Some(k) => Some(k.as_str().filter(|k| is_hex64(k))?.to_string()),
+        };
+        let label = match t.get("label") {
+            None => None,
+            Some(l) => Some(l.as_str().filter(|l| is_label(l))?.to_string()),
+        };
+        tripwires.push(LatticeTripwire { outpoint: outpoint.to_string(), unspent, key_sha256, label });
+    }
+    Some((height(v.get("height")?)?, v.get("mldsa_disabled_next_block")?.as_bool()?, tripwires))
+}
+
 /// The chain the API's /api/state describes, when it is Ark-0 with P2MR active.
 pub fn check(state: &Value) -> Result<Chain, ChainProblem> {
     let tip = state.get("blocks").and_then(height).ok_or(ChainProblem::WrongChain)?;
@@ -178,12 +273,29 @@ pub fn check(state: &Value) -> Result<Chain, ChainProblem> {
         return Err(ChainProblem::WrongChain);
     }
     let (mldsa44_height, tripwire_height) = (Some(MLDSA44_HEIGHT), Some(TRIPWIRE_HEIGHT));
+    // Both M4 deployments, or no pq2: leaf B needs OP_CHECKSLHDSA128S, the 0xe2 leaves need H4T.
+    let slhdsa128s = optional_buried(deployments, "p2mr_slhdsa128s", SLHDSA128S_HEIGHT)?;
+    let lattice_height = optional_buried(deployments, "p2mr_lattice_tripwire", H4T)?.filter(|_| slhdsa128s.is_some());
     // The state counts only for the height and leaf version the mixed address is built for, read at a
     // tip the node has reached.
     let known = state.get("tripwire").and_then(tripwire_state).filter(|(at, h3, leaf, _, _)| {
         *at <= tip && Some(*h3) == tripwire_height && *leaf == format!("{TRIPWIRED_LEAF_VERSION:x}")
     });
     let tripwire_tip = known.as_ref().map(|k| k.0);
+    // The lattice state is read in the same snapshot as the M3 state (gettripwireinfo): it counts only at a
+    // tip the node has reached, for H4T and leaf version 0xe2, and only when the node runs those rules.
+    let tripwire = state.get("tripwire");
+    let read_at = tripwire
+        .filter(|t| t.get("tip_hash").and_then(Value::as_str).is_some_and(is_hex64))
+        .and_then(|t| t.get("tip_height"))
+        .and_then(height)
+        .filter(|at| *at <= tip);
+    let lattice = match (lattice_height, read_at) {
+        (Some(h4t), Some(at)) => tripwire.and_then(|t| t.get("lattice")).and_then(lattice_state).filter(|(h, _, _)| *h == h4t).map(|l| (at, l)),
+        _ => None,
+    };
+    let lattice_tip = lattice.as_ref().map(|(at, _)| *at);
+    let pq2_allowed = matches!((lattice_height, lattice_tip), (Some(h), Some(t)) if t >= h.saturating_add(MARGIN) && tip >= h.saturating_add(MARGIN));
     let mldsa44_allowed = mldsa44_height.is_some_and(|h| tip >= h.saturating_add(MARGIN));
     let mixed_allowed = matches!((tripwire_height, tripwire_tip), (Some(h3), Some(t)) if t >= h3.saturating_add(MARGIN));
     Ok(Chain {
@@ -196,6 +308,11 @@ pub fn check(state: &Value) -> Result<Chain, ChainProblem> {
         ec_disabled: known.as_ref().map(|k| k.3),
         tripwires: known.map(|k| k.4).unwrap_or_default(),
         mixed_allowed,
+        lattice_height,
+        lattice_tip,
+        mldsa_disabled: lattice.as_ref().map(|(_, l)| l.1),
+        lattice_tripwires: lattice.map(|(_, l)| l.2).unwrap_or_default(),
+        pq2_allowed,
     })
 }
 
@@ -214,10 +331,45 @@ impl Chain {
         0
     }
 
+    /// nLockTime of a transaction the wallet builds: H4T when it creates a pq2 output (change included),
+    /// which it does only while pq2 is open; otherwise as `lock_time`.
+    pub fn lock_time_for(&self, creates_pq2: bool) -> u32 {
+        match self.lattice_height {
+            Some(h4t) if creates_pq2 && self.pq2_allowed => h4t,
+            _ => self.lock_time(),
+        }
+    }
+
     /// The leaf a spend from the mixed address takes: Schnorr while elliptic-curve checks are on, ML-DSA-44
     /// once they are off, none while that is unknown.
     pub fn mixed_path(&self) -> Option<Path> {
         self.ec_disabled.map(|off| if off { Path::Mldsa44 } else { Path::Schnorr })
+    }
+
+    /// Whether a pq2 spend may go through the ML-DSA-44 leaf, when the user asks for it: only while the node
+    /// reports that ML-DSA-44 checks in 0xe2 leaves still work in the next block. Unknown means no.
+    pub fn pq2_mldsa44_allowed(&self) -> bool {
+        self.mldsa_disabled == Some(false)
+    }
+
+    /// The leaf a pq2 spend takes: SLH-DSA unless the user asks for ML-DSA-44 and that is allowed.
+    pub fn pq2_path(&self, wanted: Option<Path>) -> Path {
+        if wanted == Some(Path::Mldsa44) && self.pq2_mldsa44_allowed() {
+            Path::Mldsa44
+        } else {
+            Path::Slhdsa128s
+        }
+    }
+
+    /// The status of a verified pq2 output (one whose tree the wallet has checked is exactly its own S1 and
+    /// SLH1 at 0xe2) confirmed at `height`, or unconfirmed (None); None when H4T is unknown.
+    pub fn pq2_status(&self, height: Option<u32>) -> Option<Pq2Status> {
+        let h4t = self.lattice_height?;
+        Some(match height {
+            None => Pq2Status::Pending,
+            Some(h) if h >= h4t => Pq2Status::Protected,
+            Some(_) => Pq2Status::Unprotected,
+        })
     }
 }
 

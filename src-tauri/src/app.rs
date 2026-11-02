@@ -123,11 +123,13 @@ impl Session {
         })
     }
 
-    fn template(&self, kind: Kind) -> &Template {
+    /// The template of one of the three fixed addresses; pq2 addresses are looked up by address.
+    fn template(&self, kind: Kind) -> Res<Template> {
         match kind {
-            Kind::Schnorr => &self.schnorr,
-            Kind::Mldsa44 => &self.mldsa44,
-            Kind::Mixed => &self.mixed,
+            Kind::Schnorr => Ok(self.schnorr.clone()),
+            Kind::Mldsa44 => Ok(self.mldsa44.clone()),
+            Kind::Mixed => Ok(self.mixed.clone()),
+            Kind::Pq2 => Err(Failure::new("address_not_ready")),
         }
     }
 }
@@ -688,6 +690,7 @@ fn path_now(kind: Kind, chain: &Chain) -> Option<Path> {
         Kind::Schnorr => Some(Path::Schnorr),
         Kind::Mldsa44 => Some(Path::Mldsa44),
         Kind::Mixed => chain.mixed_path(),
+        Kind::Pq2 => Some(chain.pq2_path(None)),
     }
 }
 
@@ -696,6 +699,7 @@ fn shown(kind: Kind, chain: &Chain) -> bool {
         Kind::Schnorr => true,
         Kind::Mldsa44 => chain.mldsa44_allowed,
         Kind::Mixed => chain.mixed_allowed && chain.mixed_path().is_some(),
+        Kind::Pq2 => chain.pq2_allowed,
     }
 }
 
@@ -785,7 +789,7 @@ pub async fn plan_send(state: State<'_, AppState>, from: Kind, to: String, amoun
 
 async fn plan_payment(state: &AppState, from: Kind, to: String, amount: String) -> Res<SendPlan> {
     state.touch();
-    let template = guard(&state.session).as_ref().ok_or_else(|| Failure::new("locked"))?.template(from).clone();
+    let template = guard(&state.session).as_ref().ok_or_else(|| Failure::new("locked"))?.template(from)?;
     let own: Vec<Template> = { let (a, b, c) = state.templates()?; vec![a, b, c] };
     let destination = parse_destination(&to)?;
     let amount = if amount.trim() == "all" { Amount::All } else { Amount::Sats(parse_coins(&amount).ok_or_else(|| Failure::new("invalid_amount"))?) };
@@ -939,7 +943,7 @@ fn signed_record(pending: &PendingSend, signed: &wallet::Signed, sign_ms: f64) -
 async fn recheck_payment(state: &AppState, pending: &mut PendingSend) -> Res<(Account, Coins, PendingCoins)> {
     let mut flags = pending.sources;
     let chain = current_chain(&state.sources, &mut flags).await?;
-    let template = guard(&state.session).as_ref().ok_or_else(|| Failure::new("locked"))?.template(pending.kind).clone();
+    let template = guard(&state.session).as_ref().ok_or_else(|| Failure::new("locked"))?.template(pending.kind)?;
     let account = account_for(template, &chain, None)?;
     if account.path != pending.path || chain.lock_time() != pending.plan.lock_time {
         return Err(Failure::new("chain_changed"));

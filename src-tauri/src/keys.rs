@@ -9,6 +9,11 @@
 //! classic, the post-quantum and the mixed address share none. tools/derivation/derive.py computes the
 //! same with Python's standard library alone, and tests/vectors/derivation.json holds its results.
 //!
+//! The pq2 template ("e2-pq2") is the one template with more than one output: every pq2 address has two
+//! keys of its own, at account 0 and a fresh index, on the receiving chain (0) or the change chain (1). Its
+//! ML-DSA-44 key is KeyGen on 32 bytes of HKDF output, its SLH-DSA-SHA2-128s key slh_keygen_internal on 48
+//! (SK.seed, SK.prf and PK.seed, 16 bytes each); both at attempt 0 and the same chain and index.
+//!
 //! This is not BIP-32: the 24 words open this wallet only. Typed into another wallet they give other
 //! keys, and on an Ethereum wallet they would make a hot wallet of the words.
 //!
@@ -16,9 +21,10 @@
 //! keys are derived as the web wallet derives them (keys.ts): the BIP-340 key is HMAC-SHA256 keyed with
 //! `ark0-wallet v1 schnorr` over the seed and a counter byte, for the first counter from 0 that gives a
 //! valid key; the ML-DSA-44 key is KeyGen on HMAC-SHA256 keyed with `ark0-wallet v1 mldsa44` over the seed.
-//! As in the web wallet, its three templates share these two keys.
-use crate::mldsa;
-use crate::p2mr::{Kind, Template, MLDSA44_CONTEXT};
+//! As in the web wallet, its three templates share these two keys. It has no pq2: its derivation has no
+//! index, and every pq2 output needs keys of its own.
+use crate::p2mr::{Kind, Template, MLDSA44_CONTEXT, SLHDSA128S_CONTEXT};
+use crate::{mldsa, slhdsa};
 use hkdf::Hkdf;
 use hmac::{Hmac, KeyInit, Mac};
 use secp256k1::{schnorr, Keypair, XOnlyPublicKey};
@@ -49,7 +55,16 @@ pub enum KeyError {
     /// A Schnorr signature could not be made, or did not verify.
     Schnorr,
     Mldsa44,
+    Slhdsa128s,
+    /// A wallet restored from a backup code has no pq2 keys.
+    Pq2Unavailable,
 }
+
+/// The two chains of pq2 addresses.
+pub const RECEIVE_CHAIN: u32 = 0;
+pub const CHANGE_CHAIN: u32 = 1;
+/// Indices are hardened-style u32 values; the wallet never goes near the top.
+pub const MAX_PQ2_INDEX: u32 = 0x7fff_ffff;
 
 /// 32 secret bytes, hex in the vault's encrypted payload, wiped when dropped.
 #[derive(Clone, PartialEq, Eq)]
@@ -187,19 +202,20 @@ fn info(fields: &[&[u8]]) -> Vec<u8> {
     out
 }
 
-/// The template field of the HKDF info: the P2MR leaf version (0xc0 or 0xe0) and what the template holds.
+/// The template field of the HKDF info: the P2MR leaf version (0xc0, 0xe0 or 0xe2) and what the template
+/// holds. Each name stands for one tree for good; another tree gets another name.
 fn template_label(kind: Kind) -> &'static [u8] {
     match kind {
         Kind::Schnorr => b"c0-schnorr",
         Kind::Mldsa44 => b"c0-mldsa44",
         Kind::Mixed => b"e0-hybrid",
+        Kind::Pq2 => b"e2-pq2",
     }
 }
 
-/// The HKDF info of one key. Account 0, the receiving chain and index 0: the one key of each leaf a
-/// wallet uses so far; the fields are there so that more never collide with it.
-fn key_info(network: &[u8; 32], algorithm: &[u8], kind: Kind, attempt: u8) -> Vec<u8> {
-    let (account, chain, index) = (0u32, 0u32, 0u32);
+/// The HKDF info of one key at account 0 and the given chain and index.
+fn key_info_at(network: &[u8; 32], algorithm: &[u8], kind: Kind, chain: u32, index: u32, attempt: u8) -> Vec<u8> {
+    let account = 0u32;
     info(&[
         LABEL_WALLET,
         LABEL_VERSION,
@@ -211,6 +227,12 @@ fn key_info(network: &[u8; 32], algorithm: &[u8], kind: Kind, attempt: u8) -> Ve
         &index.to_be_bytes(),
         &[attempt],
     ])
+}
+
+/// The HKDF info of one key of the three fixed templates. Account 0, the receiving chain and index 0: the
+/// one key of each of their leaves; the fields are there so that more never collide with it.
+fn key_info(network: &[u8; 32], algorithm: &[u8], kind: Kind, attempt: u8) -> Vec<u8> {
+    key_info_at(network, algorithm, kind, 0, 0, attempt)
 }
 
 /// The standard BIP-39 seed of 24 words, without a passphrase.
@@ -225,6 +247,24 @@ fn hkdf32(seed: &[u8; 64], label: &[u8]) -> Zeroizing<[u8; 32]> {
     let mut out = Zeroizing::new([0u8; 32]);
     hk.expand(label, out.as_mut()).expect("32 bytes is a valid HKDF-SHA-512 length");
     out
+}
+
+/// 48 bytes for one SLH-DSA-SHA2-128s key.
+fn hkdf48(seed: &[u8; 64], label: &[u8]) -> Zeroizing<[u8; 48]> {
+    let hk = Hkdf::<Sha512>::new(Some(HKDF_SALT), seed);
+    let mut out = Zeroizing::new([0u8; 48]);
+    hk.expand(label, out.as_mut()).expect("48 bytes is a valid HKDF-SHA-512 length");
+    out
+}
+
+/// The ML-DSA-44 KeyGen seed of the pq2 output at this chain and index.
+fn pq2_mldsa44_seed(seed: &[u8; 64], network: &[u8; 32], chain: u32, index: u32) -> Zeroizing<[u8; 32]> {
+    hkdf32(seed, &key_info_at(network, b"mldsa44", Kind::Pq2, chain, index, 0))
+}
+
+/// The SLH-DSA-SHA2-128s seed (SK.seed, SK.prf, PK.seed) of the pq2 output at this chain and index.
+fn pq2_slhdsa128s_seed(seed: &[u8; 64], network: &[u8; 32], chain: u32, index: u32) -> Zeroizing<[u8; 48]> {
+    hkdf48(seed, &key_info_at(network, b"slhdsa128s", Kind::Pq2, chain, index, 0))
 }
 
 /// A template's BIP-340 key of a 24-word wallet: the first attempt that gives a valid secret key.
@@ -282,6 +322,73 @@ pub struct Keys {
     mldsa44: mldsa::KeyPair,
     mixed_schnorr: SchnorrKey,
     mixed_mldsa44: mldsa::KeyPair,
+    /// The BIP-39 seed of a 24-word wallet, from which pq2 keys are derived when they are needed; None for
+    /// a backup code's wallet. Wiped when dropped.
+    pq2_seed: Option<Zeroizing<[u8; 64]>>,
+}
+
+/// The two key pairs of one pq2 output (both wipe their secrets).
+pub struct Pq2Keys {
+    pub chain: u32,
+    pub index: u32,
+    mldsa44: mldsa::KeyPair,
+    slhdsa128s: slhdsa::KeyPair,
+}
+
+impl Pq2Keys {
+    pub fn template(&self) -> Template {
+        Template::pq2(&self.mldsa44.public, &self.slhdsa128s.public)
+    }
+
+    pub fn mldsa44_public_key(&self) -> &[u8; mldsa::PUBLIC_KEY_LEN] {
+        &self.mldsa44.public
+    }
+
+    pub fn slhdsa128s_public_key(&self) -> &[u8; slhdsa::PUBLIC_KEY_LEN] {
+        &self.slhdsa128s.public
+    }
+
+    /// ML-DSA-44 (hedged) with the key of leaf A, checked before it is returned.
+    pub fn sign_mldsa44(&self, message: &[u8; 32]) -> Result<[u8; mldsa::SIGNATURE_LEN], KeyError> {
+        let signature = mldsa::sign(message, MLDSA44_CONTEXT, &self.mldsa44.secret).map_err(|_| KeyError::Mldsa44)?;
+        checked(&self.mldsa44, message, signature)
+    }
+
+    /// SLH-DSA-SHA2-128s (hedged: 16 bytes of fresh randomness) with the key of leaf B and
+    /// OP_CHECKSLHDSA128S's context string, checked before it is returned.
+    pub fn sign_slhdsa128s(&self, message: &[u8; 32]) -> Result<Box<[u8; slhdsa::SIGNATURE_LEN]>, KeyError> {
+        let signature = slhdsa::sign(message, SLHDSA128S_CONTEXT, &self.slhdsa128s.secret).map_err(|_| KeyError::Slhdsa128s)?;
+        checked_slh(&self.slhdsa128s, message, signature)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sign_slhdsa128s_deterministic(&self, message: &[u8; 32]) -> Box<[u8; slhdsa::SIGNATURE_LEN]> {
+        let signature = slhdsa::sign_deterministic(message, SLHDSA128S_CONTEXT, &self.slhdsa128s.secret).expect("signs");
+        checked_slh(&self.slhdsa128s, message, signature).expect("verifies")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sign_slhdsa128s_with(&self, message: &[u8; 32], randomness: &[u8; 16]) -> Box<[u8; slhdsa::SIGNATURE_LEN]> {
+        let signature = slhdsa::sign_with_randomness(message, SLHDSA128S_CONTEXT, &self.slhdsa128s.secret, randomness).expect("signs");
+        checked_slh(&self.slhdsa128s, message, signature).expect("verifies")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sign_mldsa44_deterministic(&self, message: &[u8; 32]) -> [u8; mldsa::SIGNATURE_LEN] {
+        let signature = mldsa::sign_deterministic(message, MLDSA44_CONTEXT, &self.mldsa44.secret).expect("signs");
+        checked(&self.mldsa44, message, signature).expect("verifies")
+    }
+
+    /// From the two keygen seeds themselves (test vectors of other implementations).
+    #[cfg(test)]
+    pub(crate) fn from_seeds(mldsa44_seed: &[u8; 32], slhdsa128s_seed: &[u8; 48]) -> Pq2Keys {
+        Pq2Keys {
+            chain: 0,
+            index: 0,
+            mldsa44: mldsa::keypair_from_seed(mldsa44_seed).unwrap(),
+            slhdsa128s: slhdsa::keypair_from_seed(slhdsa128s_seed).unwrap(),
+        }
+    }
 }
 
 impl Keys {
@@ -296,6 +403,7 @@ impl Keys {
                     mldsa44: keypair(&bip39_mldsa44_seed(&seed, &network, Kind::Mldsa44))?,
                     mixed_schnorr: SchnorrKey::new(bip39_schnorr(&seed, &network, Kind::Mixed)?),
                     mixed_mldsa44: keypair(&bip39_mldsa44_seed(&seed, &network, Kind::Mixed))?,
+                    pq2_seed: Some(seed),
                 })
             }
             Secret::Legacy { seed } => {
@@ -305,9 +413,27 @@ impl Keys {
                     mldsa44: keypair(&mldsa_seed)?,
                     mixed_schnorr: SchnorrKey::new(schnorr),
                     mixed_mldsa44: keypair(&mldsa_seed)?,
+                    pq2_seed: None,
                 })
             }
         }
+    }
+
+    /// Whether this wallet has pq2 keys: only a 24-word wallet does.
+    pub fn has_pq2(&self) -> bool {
+        self.pq2_seed.is_some()
+    }
+
+    /// The two key pairs of the pq2 output at this chain (0 receiving, 1 change) and index.
+    pub fn pq2(&self, chain: u32, index: u32) -> Result<Pq2Keys, KeyError> {
+        let seed = self.pq2_seed.as_ref().ok_or(KeyError::Pq2Unavailable)?;
+        if chain > CHANGE_CHAIN || index > MAX_PQ2_INDEX {
+            return Err(KeyError::Pq2Unavailable);
+        }
+        let network = network_id(ARK0_CHALLENGE);
+        let mldsa44 = mldsa::keypair_from_seed(&pq2_mldsa44_seed(seed, &network, chain, index)).map_err(|_| KeyError::Mldsa44)?;
+        let slhdsa128s = slhdsa::keypair_from_seed(&pq2_slhdsa128s_seed(seed, &network, chain, index)).map_err(|_| KeyError::Slhdsa128s)?;
+        Ok(Pq2Keys { chain, index, mldsa44, slhdsa128s })
     }
 
     /// The key of a template's Schnorr leaf (the post-quantum template has none and is never asked).
@@ -338,12 +464,14 @@ impl Keys {
         &self.mldsa44_key(kind).public
     }
 
-    /// A template, made from its own keys.
+    /// A template of the three with one output, made from its own keys. pq2 outputs come from `pq2`, never
+    /// from here: asked for one, this answers with the tree of all-zero keys, which no key signs for.
     pub fn template(&self, kind: Kind) -> Template {
         match kind {
             Kind::Schnorr => Template::schnorr(&self.schnorr.xonly.to_byte_array()),
             Kind::Mldsa44 => Template::mldsa44(&self.mldsa44.public),
             Kind::Mixed => Template::mixed(&self.mixed_schnorr.xonly.to_byte_array(), &self.mixed_mldsa44.public),
+            Kind::Pq2 => Template::pq2(&[0u8; mldsa::PUBLIC_KEY_LEN], &[0u8; slhdsa::PUBLIC_KEY_LEN]),
         }
     }
 
@@ -375,6 +503,15 @@ impl Keys {
         let key = self.mldsa44_key(kind);
         let signature = mldsa::sign_deterministic(message, MLDSA44_CONTEXT, &key.secret).expect("signs");
         checked(key, message, signature).expect("verifies")
+    }
+}
+
+/// A fresh SLH-DSA signature, verified before it is used.
+fn checked_slh(key: &slhdsa::KeyPair, message: &[u8; 32], signature: Box<[u8; slhdsa::SIGNATURE_LEN]>) -> Result<Box<[u8; slhdsa::SIGNATURE_LEN]>, KeyError> {
+    if slhdsa::verify(&signature, message, SLHDSA128S_CONTEXT, &key.public) {
+        Ok(signature)
+    } else {
+        Err(KeyError::Slhdsa128s)
     }
 }
 
@@ -431,6 +568,32 @@ mod tests {
                 assert_eq!(got, want, "{} {}", k["template"], algorithm);
             }
         }
+        // pq2: both keys of each output at its chain and index, their public keys and the address.
+        let mut rows = 0;
+        for w in v["wallets"].as_array().unwrap() {
+            let entropy: [u8; 32] = h(&w["entropy"]).try_into().unwrap();
+            let seed = bip39_seed(&entropy).unwrap();
+            let keys = Keys::from_secret(&bip39(entropy)).unwrap();
+            for r in w["pq2"].as_array().unwrap() {
+                let (chain, index) = (r["chain"].as_u64().unwrap() as u32, r["index"].as_u64().unwrap() as u32);
+                assert_eq!((r["template"].as_str(), r["account"].as_u64(), r["attempt"].as_u64()), (Some("e2-pq2"), Some(0), Some(0)));
+                let ml_info = key_info_at(&network, b"mldsa44", Kind::Pq2, chain, index, 0);
+                let slh_info = key_info_at(&network, b"slhdsa128s", Kind::Pq2, chain, index, 0);
+                // Design section 8.2: 89 and 92 bytes, under the 110 the rescue statement takes.
+                assert_eq!((ml_info.len(), slh_info.len()), (89, 92));
+                assert_eq!(hex::encode(&ml_info), r["mldsa44"]["info"].as_str().unwrap());
+                assert_eq!(hex::encode(&slh_info), r["slhdsa128s"]["info"].as_str().unwrap());
+                assert_eq!(hex::encode(*pq2_mldsa44_seed(&seed, &network, chain, index)), r["mldsa44"]["keygen_seed"].as_str().unwrap());
+                assert_eq!(hex::encode(*pq2_slhdsa128s_seed(&seed, &network, chain, index)), r["slhdsa128s"]["keygen_seed"].as_str().unwrap());
+                let pair = keys.pq2(chain, index).unwrap();
+                assert_eq!(hex::encode(Sha256::digest(pair.mldsa44_public_key())), r["mldsa44"]["public_key_sha256"].as_str().unwrap());
+                assert_eq!(hex::encode(pair.slhdsa128s_public_key()), r["slhdsa128s"]["public_key"].as_str().unwrap());
+                assert_eq!(hex::encode(Sha256::digest(pair.slhdsa128s_public_key())), r["slhdsa128s"]["public_key_sha256"].as_str().unwrap());
+                assert_eq!(pair.template().address, r["address"].as_str().unwrap(), "chain {chain} index {index}");
+                rows += 1;
+            }
+        }
+        assert_eq!(rows, 4 * 2 * 3);
         // The web wallet's own independent vector (keys.test.ts).
         let (legacy, legacy_seed) = legacy_material(&core::array::from_fn(|i| i as u8)).unwrap();
         assert_eq!(hex::encode(legacy.to_secret_bytes()), "2176887b814d6b1ea71118d2ec33d1daa3aab5c28c03fcd691143e292606d69e");
@@ -460,6 +623,32 @@ mod tests {
         let mixed = keys.template(Kind::Mixed);
         assert_eq!(mixed.schnorr_leaf.as_ref().unwrap().script[1..33], keys.mixed_schnorr.xonly.to_byte_array());
         assert_ne!(keys.template(Kind::Schnorr).address, mixed.address);
+    }
+
+    #[test]
+    fn pq2_keys_are_fresh_per_index_and_chain_and_absent_for_backup_codes() {
+        let keys = Keys::from_secret(&bip39([5u8; 32])).unwrap();
+        let mut seen = std::collections::HashSet::new();
+        for chain in [RECEIVE_CHAIN, CHANGE_CHAIN] {
+            for index in 0..3 {
+                let p = keys.pq2(chain, index).unwrap();
+                assert!(seen.insert(*p.slhdsa128s_public_key()));
+                assert!(seen.insert(p.mldsa44_public_key()[..32].try_into().unwrap()));
+                assert!(seen.insert(p.template().root));
+            }
+        }
+        // None of them is a key of the fixed templates.
+        let fixed: [u8; 32] = keys.mldsa44.public[..32].try_into().unwrap();
+        assert!(!seen.contains(&fixed));
+        assert_eq!(keys.pq2(2, 0).err(), Some(KeyError::Pq2Unavailable));
+        let legacy = Keys::from_secret(&Secret::from_backup_code("ark0w1-000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f-630dcd29").unwrap()).unwrap();
+        assert!(!legacy.has_pq2() && keys.has_pq2());
+        assert_eq!(legacy.pq2(0, 0).err(), Some(KeyError::Pq2Unavailable));
+        // Signatures of both leaves verify (they are checked before they are returned).
+        let p = keys.pq2(0, 0).unwrap();
+        let message = [9u8; 32];
+        assert!(slhdsa::verify(&p.sign_slhdsa128s(&message).unwrap(), &message, SLHDSA128S_CONTEXT, p.slhdsa128s_public_key()));
+        assert!(mldsa::verify(&p.sign_mldsa44(&message).unwrap(), &message, MLDSA44_CONTEXT, p.mldsa44_public_key()));
     }
 
     #[test]

@@ -3,6 +3,11 @@
 //
 //   node tools/vectors/run.mjs <path to ark0-web/wallet>
 //
+// and src-tauri/tests/vectors/pq2.json from a checkout of p2mr-ts with pq2 (node_modules installed), which
+// also verifies the Rust core's pq2 spends and the pq2 derivation rows with it (see pq2.ts):
+//
+//   node tools/vectors/run.mjs --pq2 <path to p2mr-ts>
+//
 // gen.ts imports the web wallet's own modules and the p2mr-ts sources it vendors; esbuild from that
 // checkout bundles it, and node runs the bundle.
 import { execFileSync } from 'node:child_process';
@@ -11,9 +16,15 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const here = dirname(fileURLToPath(import.meta.url));
+if (process.argv[2] === '--pq2') {
+  const p2mrDir = resolve(process.argv[3] ?? '');
+  const tsx = pathToFileURL(join(p2mrDir, 'node_modules/tsx/dist/esm/index.mjs')).href;
+  execFileSync(process.execPath, ['--import', tsx, join(here, 'pq2.ts'), p2mrDir], { stdio: 'inherit' });
+  process.exit(0);
+}
 const walletDir = resolve(process.argv[2] ?? '');
 const require = createRequire(join(walletDir, 'package.json'));
 const esbuild = require('esbuild');
