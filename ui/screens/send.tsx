@@ -231,10 +231,9 @@ export function ReviewDialog({ plan, all, onClose, onSent }: { plan: SendPlan; a
         <div><dt>{s.rowTo}</dt><dd><Mono class="break">{plan.to}</Mono></dd></div>
         <div><dt>{s.rowFee}</dt><dd>{withUnit(plan.fee)} <span class="muted">· {plan.fee_rate} sat/vB</span></dd></div>
         {plan.change > 0 && <div><dt>{s.rowChange}</dt><dd>{withUnit(plan.change)}</dd></div>}
-        <div><dt>{s.rowSignature}</dt><dd>{SIGNATURE_NAME[plan.signature]}</dd></div>
+        <div><dt>{s.rowSignature}</dt><dd>{SIGNATURE_NAME[plan.signature]}{plan.pq2 && <span class="muted"> · {fill(m().pq2.witness, { n: group(plan.pq2.witness_bytes) })}</span>}</dd></div>
         <div><dt>{s.rowSize}</dt><dd class="num">{group(plan.vsize)} vB <span class="muted">· {group(plan.size)} B</span></dd></div>
         <div><dt>{s.rowInputs}</dt><dd class="num">{plan.inputs}</dd></div>
-        {plan.pq2 && <div><dt>{s.rowSignature}</dt><dd class="num">{fill(m().pq2.witness, { n: group(plan.pq2.witness_bytes) })}</dd></div>}
       </dl>
       {plan.pq2?.rebuilt_from === '' && <Notice tone="warn">{m().pq2.rebuiltBefore}</Notice>}
       {plan.pq2?.rebuilt_from && <Notice tone="warn">{m().pq2.rebuiltRefused}</Notice>}

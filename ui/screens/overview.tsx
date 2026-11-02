@@ -123,8 +123,10 @@ function Pq2Card({ pq2, onScanned }: { pq2: Pq2View; onScanned: () => void }) {
   return (
     <section class="card accounts">
       <header class="card-head"><h3>{p.title}</h3><span class="badge">{m().kinds.pq2.badge}</span></header>
-      <p class="muted small">{p.lead}</p>
-      {blocked && <Notice tone={pq2.blocked === 'legacy' ? 'warn' : 'info'}>{blocked}</Notice>}
+      <div class="card-pad">
+        <p class="muted small">{p.lead}</p>
+        {blocked && <Notice tone={pq2.blocked === 'legacy' ? 'warn' : 'info'}>{blocked}</Notice>}
+      </div>
       {pq2.addresses.length > 0 && (
         <ul class="account-list">
           {pq2.addresses.map((a) => (
@@ -149,9 +151,9 @@ function Pq2Card({ pq2, onScanned }: { pq2: Pq2View; onScanned: () => void }) {
           ))}
         </ul>
       )}
-      {pq2.addresses.length > 0 && <p class="faint small">{p.statusHelp}</p>}
+      {pq2.addresses.length > 0 && <div class="card-pad"><p class="faint small">{p.statusHelp}</p></div>}
       {restored && (
-        <div class="stack">
+        <div class="card-pad">
           <h4>{p.scanTitle}</h4>
           {pq2.blocked !== 'scan_needed' && <p class="muted small">{fill(p.scanned, { r: pq2.scanned[0], c: pq2.scanned[1] })}</p>}
           <div class="row-actions">
