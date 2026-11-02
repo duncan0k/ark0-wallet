@@ -16,9 +16,11 @@ Ark-0 is a test network for trying things out. It may be reset at any time.
   bytes), with fresh keys for every address. Payments go through the SLH-DSA leaf unless the ML-DSA-44 leaf
   is chosen, and that is offered only while the node reports ML-DSA-44 checks in these leaves on. If the
   node starts reporting them off before such a payment is broadcast, or refuses it, or drops it, the wallet
-  rebuilds it through the SLH-DSA leaf for review. Each address is shown once; at most 20 shown and unpaid
-  at a time. A restored wallet checks its pq2 addresses first (20 in a row with nothing, on each chain), and
-  can check further.
+  rebuilds it through the SLH-DSA leaf for review; a rebuild always spends a coin of the payment it
+  replaces. Through SLH-DSA a payment takes only the coins it needs; through ML-DSA-44 it takes every coin of
+  the address. Each address is shown once; at most 20 shown and unpaid at a time. A restored wallet checks
+  its pq2 addresses first by their history on the site (until 20 in a row were never paid, on each chain),
+  and can check further.
 - **Keys stay on the device.** They come from 24 recovery words, and the wallet file is encrypted with a
   password (Argon2id, AES-256-GCM). Signing happens in the Rust core, not in the web view.
 - **Two confirmations for every payment.** A payment is reviewed in the window, then confirmed in a dialog of
