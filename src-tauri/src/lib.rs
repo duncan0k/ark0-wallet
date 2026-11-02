@@ -6,6 +6,7 @@ mod keys;
 mod mldsa;
 mod p2mr;
 mod proof;
+mod slhdsa;
 mod sources;
 pub mod selftest;
 mod store;
