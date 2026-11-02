@@ -399,6 +399,7 @@ export const zhHant: Messages = {
     rebuild_original_went_out: '原來那筆付款最終已經發出（已確認或在等待進塊），所以不再重複付款',
     rebuild_inputs_spent: '原來那筆付款的幣已經不在了，所以不改用別的幣重新付款',
     rebuild_no_common_input: '這筆付款不會花原來那筆的任何一個幣，兩筆可能都成功，已停止',
+    history_unavailable: '網站暫時無法告知哪些 pq2 地址用過，所以檢查沒有完成。請稍後再試；在此之前不會顯示新的 pq2 地址。',
     internal: '內部錯誤',
   },
 };

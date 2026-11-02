@@ -9,12 +9,15 @@
 //! - Gap limit 20 per chain: while 20 addresses this device handed out on a chain have no output seen
 //!   paid to them, it hands out no new one on that chain. On the change chain that means no payment with
 //!   change until one of them is seen (the wallet offers to send without change, or to wait).
-//! - "Used": the network's API lists only unspent outputs, so an address counts as used once the wallet
-//!   has seen any output paid to it, and the book keeps that for good.
-//! - Recovery: each chain is scanned until 20 addresses in a row have nothing; every index up to the
-//!   highest one seen plus 20 is then recorded as issued (reserved), so that no address another copy of
+//! - "Used": an address is used when the site reports history for it (an output paid to it in a block),
+//!   or it holds coins now (confirmed or on their way), or the book already says so; the book keeps that
+//!   for good.
+//! - Recovery: each chain is scanned until 20 addresses in a row are not used; every index up to the
+//!   highest used one plus 20 is then recorded as issued (reserved), so that no address another copy of
 //!   the wallet may have handed out is handed out here again. Reserved addresses do not count towards the
-//!   gap limit: this device never handed them out. Coins beyond the scanned range need a wider scan.
+//!   gap limit: this device never handed them out. Each refresh asks the site whether any of them received
+//!   something in the blocks since its last check. Coins beyond the scanned range need a wider scan, which
+//!   looks at the scanned range again too.
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -33,8 +36,8 @@ pub struct ChainBook {
     pub used: BTreeSet<u32>,
     /// Every index below this was looked at by a recovery scan.
     pub scanned: u32,
-    /// The address of every index handed out or used, so that the wallet knows its own addresses without
-    /// deriving keys.
+    /// The address of every index handed out, used, or reserved by a scan, so that the wallet knows its own
+    /// addresses without deriving keys.
     pub addresses: BTreeMap<u32, String>,
 }
 
@@ -77,6 +80,12 @@ impl ChainBook {
         self.handed_out.union(&self.used).copied().collect()
     }
 
+    /// Indices a scan reserved, neither handed out here nor seen used: their history is checked on every
+    /// refresh, from the tip of the last check.
+    pub fn reserved(&self) -> Vec<u32> {
+        (0..self.issued).filter(|i| !self.handed_out.contains(i) && !self.used.contains(i)).collect()
+    }
+
     /// After a scan has looked at every index below `end`: reserve every index up to the highest one seen
     /// plus 20 (indices 0 to 19 when none was seen).
     pub fn scanned_to(&mut self, end: u32) {
@@ -105,13 +114,17 @@ pub struct Book {
     /// A wallet restored here, or one made before this version, may have pq2 addresses another copy handed
     /// out: none is handed out here until a recovery scan has run.
     pub scan_needed: bool,
+    /// The site's tip at the last history check of the reserved addresses (or at the scan): the next check
+    /// asks only about blocks from there on.
+    #[serde(default)]
+    pub history_tip: Option<u32>,
 }
 
 impl Book {
     /// The book of a wallet whose receiving address at index 0 is `wallet`. `made_here`: the words were
     /// made on this device just now, so no other copy has handed out anything.
     pub fn new(wallet: &str, made_here: bool) -> Book {
-        Book { version: FILE_VERSION, wallet: wallet.to_string(), chains: Default::default(), scan_needed: !made_here }
+        Book { version: FILE_VERSION, wallet: wallet.to_string(), chains: Default::default(), scan_needed: !made_here, history_tip: None }
     }
 
     /// The chain and index of one of the wallet's own pq2 addresses (handed out or used).
@@ -125,8 +138,7 @@ impl Book {
     pub fn valid(&self) -> bool {
         self.version == FILE_VERSION
             && self.chains.iter().all(|c| {
-                c.handed_out.iter().chain(&c.used).all(|i| *i < c.issued)
-                    && c.addresses.keys().all(|i| c.handed_out.contains(i) || c.used.contains(i))
+                c.handed_out.iter().chain(&c.used).all(|i| *i < c.issued) && c.addresses.keys().all(|i| *i < c.issued)
             })
     }
 }

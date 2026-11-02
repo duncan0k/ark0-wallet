@@ -397,6 +397,7 @@ export const en = {
     rebuild_original_went_out: 'The original payment has gone out after all (it is confirmed or waiting for a block), so it is not paid again',
     rebuild_inputs_spent: 'The coins of the original payment are no longer there, so it is not paid again from other coins',
     rebuild_no_common_input: 'This would not spend any coin of the original payment, so both could go through; it was stopped',
+    history_unavailable: 'The site cannot say yet which pq2 addresses were used, so the check did not complete. Try again later; until then no new pq2 address is shown.',
     internal: 'Internal error',
   },
 };

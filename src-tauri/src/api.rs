@@ -62,6 +62,19 @@ pub struct Coins {
     pub truncated: bool,
 }
 
+/// The site's answer about addresses' history: whether any output was paid to each of them in a block from
+/// `from` to `tip_height` (confirmed payments only; mempool payments are in /api/utxos).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct History {
+    pub tip_height: u32,
+    pub from: u32,
+    /// One per address asked about, in the same order.
+    pub used: Vec<bool>,
+}
+
+/// At most this many addresses per history request.
+pub const MAX_HISTORY_ADDRESSES: usize = 20;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum TxStatus {
@@ -201,6 +214,35 @@ fn coins_from(status: u16, body: &Value) -> Result<Coins, ApiError> {
     Ok(coins)
 }
 
+/// /api/history's answer, read strictly: exactly the four fields, `from` as asked and not above the tip,
+/// and exactly one entry {address, used} per address asked about, in the order asked. Anything else fails
+/// the whole answer, which is then never read as "not used".
+fn history_from(status: u16, body: &Value, addresses: &[String], from: u32) -> Result<History, ApiError> {
+    let object = body.as_object().filter(|_| status == 200).ok_or(ApiError::Malformed)?;
+    if object.len() != 4 {
+        return Err(ApiError::Malformed);
+    }
+    let tip_height = object.get("tip_height").and_then(u32_of).ok_or(ApiError::Malformed)?;
+    object.get("tip_hash").and_then(Value::as_str).filter(|h| is_txid(h)).ok_or(ApiError::Malformed)?;
+    let answered_from = object.get("from").and_then(u32_of).ok_or(ApiError::Malformed)?;
+    if answered_from != from || from > tip_height {
+        return Err(ApiError::Malformed);
+    }
+    let entries = object.get("addresses").and_then(Value::as_array).ok_or(ApiError::Malformed)?;
+    if entries.len() != addresses.len() {
+        return Err(ApiError::Malformed);
+    }
+    let mut used = Vec::with_capacity(entries.len());
+    for (entry, address) in entries.iter().zip(addresses) {
+        let entry = entry.as_object().filter(|e| e.len() == 2).ok_or(ApiError::Malformed)?;
+        if entry.get("address").and_then(Value::as_str) != Some(address.as_str()) {
+            return Err(ApiError::Malformed);
+        }
+        used.push(entry.get("used").and_then(Value::as_bool).ok_or(ApiError::Malformed)?);
+    }
+    Ok(History { tip_height, from, used })
+}
+
 /// TLS with ring and the Mozilla roots: reqwest is built without a crypto provider of its own.
 fn tls_config() -> rustls::ClientConfig {
     let roots = rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
@@ -274,6 +316,26 @@ impl Api {
     pub async fn coins(&self, address: &str) -> Result<Coins, ApiError> {
         let (status, body) = self.get(&format!("/api/utxos?address={address}")).await?;
         coins_from(status, &body)
+    }
+
+    /// Whether outputs were paid to these addresses (1 to 20, of this network) in blocks from `from` on.
+    /// A refusal (400), a "try later" (503), a missing endpoint or any malformed answer is an error.
+    pub async fn history(&self, addresses: &[String], from: u32) -> Result<History, ApiError> {
+        if addresses.is_empty() || addresses.len() > MAX_HISTORY_ADDRESSES
+            || !addresses.iter().all(|a| !a.is_empty() && a.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()))
+        {
+            return Err(ApiError::Malformed);
+        }
+        let mut path = format!("/api/history?from={from}");
+        for a in addresses {
+            path.push_str("&address=");
+            path.push_str(a);
+        }
+        let (status, body) = self.get(&path).await?;
+        if status == 503 && matches!(body.get("error").and_then(Value::as_str), Some("busy" | "unavailable")) {
+            return Err(ApiError::Unreachable);
+        }
+        history_from(status, &body, addresses, from)
     }
 
     pub async fn tx_status(&self, txid: &str) -> Result<TxStatus, ApiError> {
@@ -517,6 +579,56 @@ pub(crate) mod tests {
         assert!(requests.iter().all(|r| r.starts_with(&format!("GET /api/proof?txid={txid} HTTP/1.1\r\n"))));
         assert_eq!(tauri::async_runtime::block_on(api.proof("invalid&txid=other")), Err(ApiError::Malformed));
         assert_eq!(tauri::async_runtime::block_on(api.proof(&"a".repeat(65))), Err(ApiError::Malformed));
+    }
+
+    #[test]
+    fn history_answers_are_read_strictly() {
+        let asked = vec!["tb1zaa".to_string(), "tb1zbb".to_string()];
+        let good = json!({"tip_height": 60_000, "tip_hash": "ab".repeat(32), "from": 55_000,
+            "addresses": [{"address": "tb1zaa", "used": true}, {"address": "tb1zbb", "used": false}]});
+        assert_eq!(history_from(200, &good, &asked, 55_000), Ok(History { tip_height: 60_000, from: 55_000, used: vec![true, false] }));
+        let broken: Vec<(&str, Box<dyn Fn(&mut Value)>)> = vec![
+            ("an entry missing", Box::new(|v| { v["addresses"].as_array_mut().unwrap().pop(); })),
+            ("an extra entry", Box::new(|v| v["addresses"].as_array_mut().unwrap().push(json!({"address": "tb1zcc", "used": false})))),
+            ("reordered", Box::new(|v| v["addresses"].as_array_mut().unwrap().reverse())),
+            ("used not a boolean", Box::new(|v| v["addresses"][1]["used"] = json!("false"))),
+            ("used missing", Box::new(|v| { v["addresses"][1].as_object_mut().unwrap().remove("used"); })),
+            ("an extra field in an entry", Box::new(|v| v["addresses"][1]["height"] = json!(1))),
+            ("another address", Box::new(|v| v["addresses"][1]["address"] = json!("tb1zxx"))),
+            ("an extra field", Box::new(|v| v["more"] = json!(1))),
+            ("no tip hash", Box::new(|v| { v.as_object_mut().unwrap().remove("tip_hash"); })),
+            ("a bad tip hash", Box::new(|v| v["tip_hash"] = json!("xyz"))),
+            ("another from", Box::new(|v| v["from"] = json!(0))),
+            ("from above the tip", Box::new(|v| v["tip_height"] = json!(54_999))),
+            ("not an object", Box::new(|v| *v = json!([]))),
+        ];
+        for (what, edit) in broken {
+            let mut v = good.clone();
+            edit(&mut v);
+            assert_eq!(history_from(200, &v, &asked, 55_000), Err(ApiError::Malformed), "{what}");
+        }
+        assert_eq!(history_from(404, &good, &asked, 55_000), Err(ApiError::Malformed));
+        // Over HTTP: the query, and "try later" and refusals as errors.
+        let body = good.to_string();
+        let (api, server) = serve(vec![
+            response(200, &body),
+            response(503, r#"{"error":"busy"}"#),
+            response(503, r#"{"error":"unavailable"}"#),
+            response(400, r#"{"error":"request"}"#),
+            response(404, r#"{"error":"not_found"}"#),
+        ]);
+        let results = tauri::async_runtime::block_on(async {
+            let mut r = Vec::new();
+            for _ in 0..5 { r.push(api.history(&asked, 55_000).await); }
+            r
+        });
+        let requests = server.join().unwrap();
+        assert!(requests[0].starts_with("GET /api/history?from=55000&address=tb1zaa&address=tb1zbb HTTP/1.1"));
+        assert!(results[0].is_ok());
+        assert_eq!(&results[1..], &[Err(ApiError::Unreachable), Err(ApiError::Unreachable), Err(ApiError::Malformed), Err(ApiError::Malformed)]);
+        let too_many: Vec<String> = (0..21).map(|i| format!("tb1z{i}")).collect();
+        assert_eq!(tauri::async_runtime::block_on(api.history(&too_many, 0)), Err(ApiError::Malformed));
+        assert_eq!(tauri::async_runtime::block_on(api.history(&["tb1z&x=1".to_string()], 0)), Err(ApiError::Malformed));
     }
 
     pub(crate) fn utxo(txid: char, vout: u32, sats: u64) -> Value {

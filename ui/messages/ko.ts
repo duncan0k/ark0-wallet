@@ -399,6 +399,7 @@ export const ko: Messages = {
     rebuild_original_went_out: '원래 지불이 결국 나갔으므로(확인되었거나 블록을 기다리는 중) 다시 지불하지 않습니다',
     rebuild_inputs_spent: '원래 지불의 코인이 더 이상 없으므로 다른 코인으로 다시 지불하지 않습니다',
     rebuild_no_common_input: '원래 지불의 코인을 하나도 쓰지 않아 둘 다 처리될 수 있으므로 중지했습니다',
+    history_unavailable: '사이트가 아직 어떤 pq2 주소가 쓰였는지 알려 주지 못해 확인을 마치지 못했습니다. 나중에 다시 시도하세요. 그때까지 새 pq2 주소는 표시되지 않습니다.',
     internal: '내부 오류',
   },
 };

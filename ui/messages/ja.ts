@@ -399,6 +399,7 @@ export const ja: Messages = {
     rebuild_original_went_out: '元の支払いは結局送られています（承認済みか、ブロック待ち）。そのため再度は支払いません',
     rebuild_inputs_spent: '元の支払いのコインがもうないため、別のコインで支払い直すことはしません',
     rebuild_no_common_input: '元の支払いのコインを 1 枚も使わないため両方が通るおそれがあり、止めました',
+    history_unavailable: 'どの pq2 アドレスが使われたかをサイトがまだ答えられないため、確認は完了しませんでした。後でもう一度お試しください。それまで新しい pq2 アドレスは表示しません。',
     internal: '内部エラー',
   },
 };

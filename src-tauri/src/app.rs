@@ -953,7 +953,14 @@ async fn pq2_overview(state: &AppState, chain: &Chain, sources: &Sources, flags:
         scanned: book.as_ref().map_or([0, 0], |b| [b.chains[0].scanned, b.chains[1].scanned]),
         issued: book.as_ref().map_or([0, 0], |b| [b.chains[0].issued, b.chains[1].issued]),
     };
-    let Some(book) = book else { return Some(view) };
+    if book.is_none() {
+        return Some(view);
+    }
+    // Reserved addresses first: one that received something since the last check is looked up below.
+    if !check_reserved(state, sources, flags).await {
+        view.complete = false;
+    }
+    let Some(book) = state.book().ok() else { return Some(view) };
     for (c, chain_book) in book.chains.iter().enumerate() {
         for index in chain_book.watched() {
             // Verified: only an address the wallet's own keys give at that index (a book changed on disk
@@ -1094,10 +1101,11 @@ pub struct ScanResult {
     issued: [u32; 2],
 }
 
-/// The recovery scan of both pq2 chains: each until 20 addresses in a row have nothing paid to them (a
-/// wider scan: at least 100 more than the last scan looked at). Every index up to the highest one seen
-/// plus 20 is then recorded as issued. An address whose outputs are all spent shows nothing in the API,
-/// so the scan cannot see it.
+/// The recovery scan of both pq2 chains, 20 addresses at a time: an index is used when the site reports
+/// history for its address, or it holds coins now (confirmed or on their way), or the book says so. Each
+/// chain is scanned until 20 indices in a row are not used (a wider scan: from index 0 again, and at least
+/// 100 past where the last scan ended). Every index up to the highest used one plus 20 is then recorded as
+/// issued. When the site cannot answer about history, the scan does not complete.
 #[tauri::command]
 pub async fn pq2_scan(state: State<'_, AppState>, wider: bool) -> Res<ScanResult> {
     scan_pq2(&state, wider).await
@@ -1109,30 +1117,58 @@ async fn scan_pq2(state: &AppState, wider: bool) -> Res<ScanResult> {
     let book = state.book()?;
     let mut found = 0;
     let mut flags = Flags::default();
+    let mut tip = u32::MAX;
+    let batch = crate::api::MAX_HISTORY_ADDRESSES as u32;
     for c in [RECEIVE_CHAIN, CHANGE_CHAIN] {
-        let start = if wider { book.chains[c as usize].scanned } else { 0 };
-        let minimum = if wider { WIDER_SCAN } else { GAP_LIMIT };
-        let mut at = start;
+        let minimum = if wider { book.chains[c as usize].scanned.saturating_add(WIDER_SCAN) } else { GAP_LIMIT };
+        let mut at = 0;
+        // The addresses of indices that are not used: those that end up reserved are kept in the book.
+        let mut unused: HashMap<u32, String> = HashMap::new();
         loop {
-            let done = state.edit_book(|b| b.chains[c as usize].scan_done(start, at, minimum))?;
-            if done || at >= crate::keys::MAX_PQ2_INDEX {
+            let done = state.edit_book(|b| b.chains[c as usize].scan_done(0, at, minimum))?;
+            if done || at >= crate::keys::MAX_PQ2_INDEX - batch {
                 break;
             }
             if state.generation() != generation {
                 return Err(Failure::new("locked"));
             }
-            let template = state.pq2_template(c, at)?;
-            let coins = flags.take(state.sources.coins(&template.address).await)?;
-            if anything_paid(&coins) {
-                found += 1;
-                state.edit_book(|b| b.chains[c as usize].mark_used(at, &template.address))?;
+            let mut templates = Vec::new();
+            for index in at..at + batch {
+                templates.push(state.pq2_template(c, index)?);
             }
-            at += 1;
+            let addresses: Vec<String> = templates.iter().map(|t| t.address.clone()).collect();
+            let history = flags.take(state.sources.history(&addresses, 0).await).map_err(|_| Failure::new("history_unavailable"))?;
+            tip = tip.min(history.tip_height);
+            for (i, template) in templates.iter().enumerate() {
+                let index = at + i as u32;
+                let coins = flags.take(state.sources.coins(&template.address).await)?;
+                let used = history.used[i] || anything_paid(&coins);
+                if used {
+                    if state.edit_book(|b| b.chains[c as usize].mark_used(index, &template.address))? {
+                        found += 1;
+                    }
+                } else {
+                    unused.insert(index, template.address.clone());
+                }
+            }
+            at += batch;
         }
-        state.edit_book(|b| b.chains[c as usize].scanned_to(at))?;
+        state.edit_book(|b| {
+            let chain = &mut b.chains[c as usize];
+            chain.scanned_to(at);
+            let issued = chain.issued;
+            for (i, a) in unused {
+                if i < issued {
+                    chain.addresses.entry(i).or_insert(a);
+                }
+            }
+        })?;
     }
     let book = state.edit_book(|b| {
         b.scan_needed = false;
+        if tip != u32::MAX {
+            b.history_tip = Some(b.history_tip.map_or(tip, |t| t.min(tip)));
+        }
         b.clone()
     })?;
     Ok(ScanResult {
@@ -1140,6 +1176,37 @@ async fn scan_pq2(state: &AppState, wider: bool) -> Res<ScanResult> {
         scanned: [book.chains[0].scanned, book.chains[1].scanned],
         issued: [book.chains[0].issued, book.chains[1].issued],
     })
+}
+
+/// Asks the site whether any reserved address received something in the blocks since the last check
+/// (`history_tip`); one that did becomes used, and its coins are looked up like the others'. False when the
+/// site could not answer: the tip of the last check stays where it was.
+async fn check_reserved(state: &AppState, sources: &Sources, flags: &mut Flags) -> bool {
+    let Ok(book) = state.book() else { return true };
+    let reserved: Vec<(u32, u32, String)> = book
+        .chains
+        .iter()
+        .enumerate()
+        .flat_map(|(c, chain)| chain.reserved().into_iter().filter_map(move |i| chain.addresses.get(&i).map(|a| (c as u32, i, a.clone()))))
+        .collect();
+    if reserved.is_empty() {
+        return true;
+    }
+    let from = book.history_tip.unwrap_or(0);
+    let mut tip = u32::MAX;
+    for part in reserved.chunks(crate::api::MAX_HISTORY_ADDRESSES) {
+        let addresses: Vec<String> = part.iter().map(|(_, _, a)| a.clone()).collect();
+        let Ok(history) = flags.take(sources.history(&addresses, from).await) else { return false };
+        tip = tip.min(history.tip_height);
+        for ((c, i, a), used) in part.iter().zip(history.used) {
+            // Only an address the wallet's own keys give at that index.
+            if used && state.pq2_template(*c, *i).is_ok_and(|t| &t.address == a) {
+                let _ = state.edit_book(|b| b.chains[*c as usize].mark_used(*i, a));
+            }
+        }
+    }
+    let _ = state.edit_book(|b| b.history_tip = Some(tip));
+    true
 }
 
 /// What the review shows of a payment from a pq2 address.
@@ -4928,6 +4995,12 @@ mod pq2_tests {
         broadcasts: Arc<Mutex<Vec<String>>>,
         /// /api/tx answers by txid; unknown otherwise.
         txs: Arc<Mutex<HashMap<String, Value>>>,
+        /// /api/history: the height from which each address has history (none: never used).
+        history: Arc<Mutex<HashMap<String, u32>>>,
+        /// /api/history answers this instead, when set: (HTTP status, body).
+        history_fails: Arc<Mutex<Option<(u16, String)>>>,
+        /// The `from` of every history request.
+        history_from: Arc<Mutex<Vec<u32>>>,
     }
 
     struct Wallet {
@@ -4959,6 +5032,27 @@ mod pq2_tests {
         if let Some(txid) = path.strip_prefix("/api/tx?txid=") {
             let answer = guard(&net.txs).get(txid).cloned().unwrap_or(json!({"status": "unknown"}));
             return response(200, &answer.to_string());
+        }
+        if let Some(query) = path.strip_prefix("/api/history?") {
+            if let Some((status, body)) = guard(&net.history_fails).clone() {
+                return response(status, &body);
+            }
+            let mut from = 0;
+            let mut addresses = Vec::new();
+            for pair in query.split('&') {
+                match pair.split_once('=') {
+                    Some(("from", f)) => from = f.parse().unwrap(),
+                    Some(("address", a)) => addresses.push(a.to_string()),
+                    _ => return response(400, r#"{"error":"request"}"#),
+                }
+            }
+            guard(&net.history_from).push(from);
+            let tip = guard(&net.state)["blocks"].as_u64().unwrap();
+            let history = guard(&net.history).clone();
+            let entries: Vec<Value> = addresses.iter()
+                .map(|a| json!({"address": a, "used": history.get(a).is_some_and(|h| u64::from(*h) >= u64::from(from) && u64::from(*h) <= tip)}))
+                .collect();
+            return response(200, &json!({"tip_height": tip, "tip_hash": "ab".repeat(32), "from": from, "addresses": entries}).to_string());
         }
         if path.starts_with("/api/proof?") {
             return response(404, r#"{"error":"not_confirmed"}"#);
@@ -5132,8 +5226,8 @@ mod pq2_tests {
         guard(&w.net.utxos).insert(pq2_address(&w, 1, 0), vec![utxo('b', 1, 20_000, H4T + 2)]);
         let r = block(scan_pq2(&w.state, false)).unwrap();
         assert_eq!(r.found, 2);
-        // Stopped after 20 empty in a row; everything up to the highest seen plus 20 is issued.
-        assert_eq!((r.scanned, r.issued), ([23, 21], [23, 21]));
+        // Stopped after 20 unused in a row (20 at a time); everything up to the highest used plus 20 is issued.
+        assert_eq!((r.scanned, r.issued), ([40, 40], [23, 21]));
         assert_eq!(block(new_pq2_address(&w.state)).unwrap().index, 23);
         let p = block(overview_of(&w.state)).unwrap().pq2.unwrap();
         assert_eq!(p.addresses.len(), 2);
@@ -5143,8 +5237,84 @@ mod pq2_tests {
         let r = block(scan_pq2(&w.state, true)).unwrap();
         assert_eq!(r.found, 1);
         assert_eq!(r.issued[0], 81);
-        assert!(r.scanned[0] >= 123 && r.scanned[1] >= 121);
+        assert!(r.scanned[0] >= 140 && r.scanned[1] >= 140);
         assert_eq!(block(new_pq2_address(&w.state)).unwrap().index, 81);
+    }
+
+    #[test]
+    fn recovery_goes_by_history_and_never_hands_out_an_emptied_address() {
+        let w = wallet("history", words(0x55), false, m4_state(H4T + 100, false));
+        // Indices 0 to 39 received and were emptied; 40 holds coins now.
+        for i in 0..40 {
+            guard(&w.net.history).insert(pq2_address(&w, 0, i), H4T + 10 + i);
+        }
+        guard(&w.net.utxos).insert(pq2_address(&w, 0, 40), vec![utxo('a', 0, 9_000, H4T + 60)]);
+        // A payment on its way (no history yet) counts too, on the change chain.
+        guard(&w.net.incoming).insert(pq2_address(&w, 1, 3), vec![json!({"txid": "bc".repeat(32), "vout": 0, "sats": 2_000})]);
+        let r = block(scan_pq2(&w.state, false)).unwrap();
+        assert_eq!(r.found, 42);
+        assert_eq!(r.issued, [61, 24]);
+        // The first address handed out comes after all of them, and the coins at 40 are shown.
+        assert_eq!(block(new_pq2_address(&w.state)).unwrap().index, 61);
+        let p = block(overview_of(&w.state)).unwrap().pq2.unwrap();
+        assert!(p.addresses.iter().any(|a| a.index == 40 && a.spendable == 9_000));
+    }
+
+    #[test]
+    fn without_an_answer_about_history_the_scan_does_not_complete() {
+        for (status, body) in [(404, r#"{"error":"not_found"}"#.to_string()), (503, r#"{"error":"busy"}"#.to_string()), (503, r#"{"error":"unavailable"}"#.to_string()),
+            (200, json!({"tip_height": 1, "tip_hash": "ab".repeat(32), "from": 0, "addresses": []}).to_string())] {
+            let w = wallet("history-fails", words(0x56), false, m4_state(H4T + 100, false));
+            *guard(&w.net.history_fails) = Some((status, body.clone()));
+            assert_eq!(block(scan_pq2(&w.state, false)).unwrap_err().code, "history_unavailable", "{status} {body}");
+            // Still waiting for a scan: no address is handed out.
+            assert!(w.state.book().unwrap().scan_needed);
+            assert_eq!(block(new_pq2_address(&w.state)).unwrap_err().code, "pq2_scan_needed");
+            *guard(&w.net.history_fails) = None;
+            assert!(block(scan_pq2(&w.state, false)).is_ok());
+            assert_eq!(block(new_pq2_address(&w.state)).unwrap().index, GAP_LIMIT);
+        }
+    }
+
+    #[test]
+    fn a_late_payment_to_a_reserved_address_is_seen() {
+        let w = wallet("reserved", words(0x57), false, m4_state(H4T + 100, false));
+        let r = block(scan_pq2(&w.state, false)).unwrap();
+        assert_eq!((r.found, r.issued), (0, [20, 20]));
+        assert_eq!(w.state.book().unwrap().history_tip, Some(H4T + 100));
+        // Index 0 was reserved, never handed out here; another copy of the wallet hands it out and it is
+        // paid in a later block.
+        *guard(&w.net.state) = m4_state(H4T + 110, false);
+        let address = pq2_address(&w, 0, 0);
+        guard(&w.net.history).insert(address.clone(), H4T + 105);
+        guard(&w.net.utxos).insert(address.clone(), vec![utxo('c', 1, 12_000, H4T + 105)]);
+        guard(&w.net.history_from).clear();
+        let p = block(overview_of(&w.state)).unwrap().pq2.unwrap();
+        // One cheap check from the last tip, for the reserved addresses of both chains (39 left: 2 requests).
+        assert_eq!(*guard(&w.net.history_from), vec![H4T + 100, H4T + 100, H4T + 100, H4T + 100]);
+        assert!(p.addresses.iter().any(|a| a.index == 0 && a.spendable == 12_000));
+        let book = w.state.book().unwrap();
+        assert!(book.chains[0].used.contains(&0));
+        assert_eq!(book.history_tip, Some(H4T + 110));
+        // The next refresh asks from the new tip only.
+        guard(&w.net.history_from).clear();
+        block(overview_of(&w.state)).unwrap();
+        assert!(guard(&w.net.history_from).iter().all(|f| *f == H4T + 110));
+    }
+
+    #[test]
+    fn the_wider_scan_looks_at_the_scanned_range_again() {
+        let w = wallet("wider-again", words(0x58), false, m4_state(H4T + 100, false));
+        block(scan_pq2(&w.state, false)).unwrap();
+        // A payment to index 5 that the history check of a refresh missed (the site could not answer then).
+        *guard(&w.net.history_fails) = Some((503, r#"{"error":"busy"}"#.to_string()));
+        guard(&w.net.history).insert(pq2_address(&w, 0, 5), H4T + 50);
+        assert!(!block(overview_of(&w.state)).unwrap().pq2.unwrap().complete);
+        assert!(!w.state.book().unwrap().chains[0].used.contains(&5));
+        *guard(&w.net.history_fails) = None;
+        let r = block(scan_pq2(&w.state, true)).unwrap();
+        assert_eq!(r.found, 1);
+        assert!(w.state.book().unwrap().chains[0].used.contains(&5));
     }
 
     /// A wallet with one pq2 receiving address holding two coins, at H4T + 10.

@@ -1,5 +1,5 @@
 //! Two independently hosted APIs: what can be spent needs both, what may already have been paid needs either.
-use crate::api::{Api, ApiError, BroadcastResult, CheckResult, Coin, Coins, TxStatus};
+use crate::api::{Api, ApiError, BroadcastResult, CheckResult, Coin, Coins, History, TxStatus};
 use crate::chain::{self, Chain, ChainProblem};
 use crate::proof;
 use std::collections::{HashMap, HashSet};
@@ -212,6 +212,17 @@ impl Sources {
     pub async fn coins(&self, address: &str) -> Answer<Result<Coins, ApiError>> {
         let (a, b) = together(self.first.coins(address), self.second.coins(address)).await;
         combine(a, b, merge_coins)
+    }
+
+    /// Address history from both: used when either says so (the cautious answer for handing addresses
+    /// out), and the lower tip, so that the next check from there misses no block of either.
+    pub async fn history(&self, addresses: &[String], from: u32) -> Answer<Result<History, ApiError>> {
+        let (a, b) = together(self.first.history(addresses, from), self.second.history(addresses, from)).await;
+        combine(a, b, |a, b| {
+            let disagree = a.used != b.used;
+            let used = a.used.iter().zip(&b.used).map(|(x, y)| *x || *y).collect();
+            (History { tip_height: a.tip_height.min(b.tip_height), from: a.from, used }, disagree)
+        })
     }
 
     pub async fn tx_status(&self, txid: &str) -> Answer<Result<TxStatus, ApiError>> {
