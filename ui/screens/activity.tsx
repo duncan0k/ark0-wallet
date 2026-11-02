@@ -1,16 +1,29 @@
 // What this wallet sent, and how big each signature made it.
 import { useEffect, useState } from 'preact/hooks';
-import { core, type AppInfo, type Sent } from '../api';
+import { codeOf, core, type AppInfo, type SendPlan, type Sent } from '../api';
 import { Button, Chip, CompareBars, CopyButton, Icon, Mono, Notice } from '../components';
 import { errorText, fill, m } from '../i18n';
 import { ago, amount, coins, group, ms, shorten } from '../format';
+import { ReviewDialog, SIGNATURE_NAME } from './send';
 
 export function Activity({ info, version }: { info: AppInfo | null; version: number }) {
   const [list, setList] = useState<Sent[] | null>(null);
   const [open, setOpen] = useState<string | null>(null);
+  const [plan, setPlan] = useState<SendPlan | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [again, setAgain] = useState(0);
   useEffect(() => {
     core.activity().then(setList).catch(() => setList([]));
-  }, [version]);
+  }, [version, again]);
+  // A pq2 payment through ML-DSA-44 that did not go through, paid again through SLH-DSA after a review.
+  const rebuild = async (txid: string) => {
+    setError(null);
+    try {
+      setPlan(await core.planRebuild(txid));
+    } catch (err) {
+      setError(errorText(codeOf(err)));
+    }
+  };
   if (list === null) return <div class="page"><div class="skeleton-card" /></div>;
   if (list.length === 0) return <div class="page"><Notice tone="info">{m().activity.empty}</Notice></div>;
   return (
@@ -23,7 +36,7 @@ export function Activity({ info, version }: { info: AppInfo | null; version: num
               <span class="tx-body">
                 <span class="tx-main">
                   <strong>{m().activity.to} <Mono>{shorten(s.to, 10, 6)}</Mono></strong>
-                  <small class="muted">{ago(s.created)} · {s.signature === 'mldsa44' ? 'ML-DSA-44' : 'Schnorr'}</small>
+                  <small class="muted">{ago(s.created)} · {SIGNATURE_NAME[s.signature].split(' · ')[0]}</small>
                 </span>
                 <span class="tx-side">
                   <span class="tx-amount num">−{coins(s.send)}</span>
@@ -33,9 +46,18 @@ export function Activity({ info, version }: { info: AppInfo | null; version: num
               <span class="tx-chevron"><Icon name="chevron" size={16} /></span>
             </button>
             {open === s.txid && <Details s={s} info={info} />}
+            {s.rebuild && (
+              <div class="tx-details">
+                <Notice tone="warn">{m().pq2.rebuildNote}</Notice>
+                <Button kind="primary" size="sm" onClick={() => rebuild(s.txid)}>{m().pq2.rebuild}</Button>
+              </div>
+            )}
           </li>
         ))}
       </ul>
+      {error && <Notice tone="bad">{error}</Notice>}
+      {plan && <ReviewDialog plan={plan} all={false} onClose={() => setPlan(null)}
+        onSent={(r) => { setPlan(r.rebuilt ?? null); setAgain((n) => n + 1); }} />}
     </div>
   );
 }
@@ -54,7 +76,7 @@ function StatusChip({ s }: { s: Sent }) {
 function Details({ s, info }: { s: Sent; info: AppInfo | null }) {
   const a = m().activity;
   const schnorr = info?.costs.find((c) => c.kind === 'schnorr');
-  const mine = info?.costs.find((c) => c.kind === (s.from === 'mixed' ? 'mixed' : s.from) && c.signature === s.signature);
+  const mine = info?.costs.find((c) => c.kind === s.from && c.signature === s.signature);
   return (
     <div class="tx-details">
       <dl class="rows">
@@ -63,12 +85,12 @@ function Details({ s, info }: { s: Sent; info: AppInfo | null }) {
         <div><dt>{m().send.rowTo}</dt><dd><Mono class="break">{s.to}</Mono></dd></div>
         <div><dt>{m().send.rowFee}</dt><dd>{amount(s.fee)}</dd></div>
         <div><dt>{m().send.rowSize}</dt><dd class="num">{group(s.vsize)} vB · {group(s.size)} B</dd></div>
-        <div><dt>{m().send.rowSignature}</dt><dd>{s.signature === 'mldsa44' ? 'ML-DSA-44 · FIPS 204' : 'Schnorr · BIP-340'} · {fill(m().send.signedIn, { ms: ms(s.sign_ms) })}</dd></div>
+        <div><dt>{m().send.rowSignature}</dt><dd>{SIGNATURE_NAME[s.signature]} · {fill(m().send.signedIn, { ms: ms(s.sign_ms) })}</dd></div>
       </dl>
       {s.reason && s.status === 'rejected' && <pre class="node-says">{s.reason}</pre>}
       {s.reason && s.status === 'failed' && <p class="faint small">{errorText(s.reason)}</p>}
       {s.status === 'replaced' && <p class="faint small">{a.replacedNote}</p>}
-      {s.signature === 'mldsa44' && mine && schnorr && (
+      {s.signature !== 'schnorr' && mine && schnorr && (
         <div class="compare">
           <h4>{a.signatureCompare}</h4>
           <CompareBars rows={[

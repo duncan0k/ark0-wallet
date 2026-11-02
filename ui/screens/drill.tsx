@@ -1,6 +1,6 @@
 // The drill: the network's tripwire, and both leaves of the mixed address tried against the node.
 import { useState } from 'preact/hooks';
-import { codeOf, core, type DrillResult, type Overview, type Path } from '../api';
+import { codeOf, core, type Chain, type DrillResult, type Overview, type Path } from '../api';
 import { Button, Card, Chip, Icon, Notice, useToast } from '../components';
 import { errorText, fill, locale, m } from '../i18n';
 import { group, ms } from '../format';
@@ -12,6 +12,7 @@ export function Drill({ data, legacy }: { data: Overview | null; legacy: boolean
   const mixed = data?.accounts.find((a) => a.kind === 'mixed');
   const toast = useToast();
   const [results, setResults] = useState<Partial<Record<Path, DrillResult | string>>>({});
+  const tries: Path[] = ['schnorr', 'mldsa44'];
   const [busy, setBusy] = useState<Path | null>(null);
 
   const run = async (path: Path) => {
@@ -64,6 +65,8 @@ export function Drill({ data, legacy }: { data: Overview | null; legacy: boolean
         </Card>
       </div>
 
+      {chain && chain.lattice_height !== null && <LatticeCard chain={chain} />}
+
       <Card title={d.tryTitle}>
         <p class="muted">{d.tryHint}</p>
         {!mixed?.shown ? (
@@ -75,7 +78,7 @@ export function Drill({ data, legacy }: { data: Overview | null; legacy: boolean
           </div>
         ) : (
           <div class="drill-tries">
-            {(['schnorr', 'mldsa44'] as Path[]).map((p) => (
+            {tries.map((p) => (
               <div class="drill-try">
                 <Button kind={p === 'mldsa44' ? 'primary' : 'secondary'} busy={busy === p} disabled={busy !== null} onClick={() => run(p)}>
                   {p === 'schnorr' ? d.trySchnorr : d.tryMldsa44}
@@ -87,6 +90,34 @@ export function Drill({ data, legacy }: { data: Overview | null; legacy: boolean
         )}
       </Card>
     </div>
+  );
+}
+
+/**
+ * The lattice tripwires of pq2 as the node reports them: their outputs, the node's name and key hash for
+ * each, the node's word for its state, and whether ML-DSA-44 checks in pq2 addresses work in the next
+ * block. It draws no conclusion about which of them was spent, or why.
+ */
+function LatticeCard({ chain }: { chain: Chain }) {
+  const p = m().pq2;
+  const state = chain.mldsa_disabled == null ? p.latticeUnknown : chain.mldsa_disabled ? p.latticeOn : p.latticeOff;
+  return (
+    <Card title={p.latticeTitle}>
+      <div class="tripwire">
+        <span class={`tripwire-light ${chain.mldsa_disabled ? 'on' : chain.mldsa_disabled === false ? 'off' : 'unknown'}`} />
+        <p>{state}</p>
+      </div>
+      <dl class="facts compact">
+        <div><dt>{p.h4t}</dt><dd class="num">{chain.lattice_height === null ? '—' : group(chain.lattice_height)}</dd></div>
+        {chain.lattice_tripwires.map((t) => (
+          <div>
+            <dt class="mono small">{t.outpoint.slice(0, 10)}…:{t.outpoint.split(':')[1]}{t.label ? ` · ${t.label}` : ''}</dt>
+            <dd><Chip tone="neutral" dot>{t.unspent ? p.reported_unspent : p.reported_missing}</Chip>{t.key_sha256 && <span class="mono small faint"> {t.key_sha256.slice(0, 12)}…</span>}</dd>
+          </div>
+        ))}
+      </dl>
+      <p class="faint small">{p.latticeNote}</p>
+    </Card>
   );
 }
 

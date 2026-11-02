@@ -1,12 +1,14 @@
-// The overview: what the wallet can spend, its three addresses, and the network.
-import type { AccountView, Chain, Kind, Overview as OverviewData } from '../api';
+// The overview: what the wallet can spend, its three addresses, its pq2 coins, and the network.
+import { useState } from 'preact/hooks';
+import type { AccountView, Chain, FixedKind, Kind, Overview as OverviewData, Pq2Status, Pq2View } from '../api';
 import { codeOf, core } from '../api';
 import { Amount, Button, Card, Chip, CopyButton, Icon, Mono, Notice, useToast } from '../components';
 import { errorText, fill, m } from '../i18n';
 import { ago, amount, coins, group, shorten } from '../format';
 
-export const ORDER: Kind[] = ['mldsa44', 'schnorr', 'mixed'];
-export const KIND_ICON: Record<Kind, string> = { mldsa44: 'drill', schnorr: 'lock', mixed: 'leaf' };
+export const ORDER: FixedKind[] = ['mldsa44', 'schnorr', 'mixed'];
+export const KIND_ICON: Record<Kind, string> = { mldsa44: 'drill', schnorr: 'lock', mixed: 'leaf', pq2: 'drill' };
+export const PQ2_TONE: Record<Pq2Status, 'good' | 'accent' | 'warn'> = { protected: 'good', pending: 'accent', unprotected: 'warn' };
 
 export function statusOf(a: AccountView, chain: Chain | null): { tone: 'good' | 'warn' | 'neutral'; text: string } {
   const s = m().status;
@@ -43,10 +45,11 @@ export function Overview({ data, legacy, loading, onRetry, onSend, onReceive }: 
     );
   }
   const shown = data.accounts.filter((a) => a.shown);
-  const available = shown.reduce((s, a) => s + a.spendable, 0);
-  const incoming = data.accounts.reduce((s, a) => s + a.incoming, 0);
-  const outgoing = data.accounts.reduce((s, a) => s + a.pending, 0);
-  const complete = data.accounts.every((a) => a.complete);
+  const pq2 = data.pq2;
+  const available = shown.reduce((s, a) => s + a.spendable, 0) + (pq2?.spendable ?? 0);
+  const incoming = data.accounts.reduce((s, a) => s + a.incoming, 0) + (pq2?.incoming ?? 0);
+  const outgoing = data.accounts.reduce((s, a) => s + a.pending, 0) + (pq2?.pending ?? 0);
+  const complete = data.accounts.every((a) => a.complete) && (pq2?.complete ?? true);
   const sorted = ORDER.map((k) => data.accounts.find((a) => a.kind === k)).filter((a): a is AccountView => !!a);
 
   return (
@@ -78,8 +81,87 @@ export function Overview({ data, legacy, loading, onRetry, onSend, onReceive }: 
         </ul>
       </section>
 
+      {pq2 && <Pq2Card pq2={pq2} onScanned={onRetry} />}
+
       {data.chain && <NetworkCard chain={data.chain} fetched={data.fetched} />}
     </div>
+  );
+}
+
+/** Why no new pq2 address can be shown now, in words. */
+export function pq2Blocked(pq2: Pq2View): string | null {
+  const p = m().pq2;
+  switch (pq2.blocked) {
+    case null: return null;
+    case 'waiting': return fill(p.blocked_waiting, { n: group(pq2.opens_at) });
+    default: return p[`blocked_${pq2.blocked}`];
+  }
+}
+
+/**
+ * pq2: its coins with their status, why no new address can be shown when none can, and the recovery check
+ * of a restored wallet, with the wider check for coins beyond the range it covered.
+ */
+function Pq2Card({ pq2, onScanned }: { pq2: Pq2View; onScanned: () => void }) {
+  const p = m().pq2;
+  const toast = useToast();
+  const [busy, setBusy] = useState(false);
+  const blocked = pq2Blocked(pq2);
+  const scan = async (wider: boolean) => {
+    setBusy(true);
+    try {
+      const r = await core.pq2Scan(wider);
+      toast(fill(p.scanFound, { n: r.found }), 'good');
+      onScanned();
+    } catch (err) {
+      toast(errorText(codeOf(err)), 'bad');
+    } finally {
+      setBusy(false);
+    }
+  };
+  const restored = pq2.blocked !== 'legacy' && (pq2.blocked === 'scan_needed' || pq2.scanned[0] > 0 || pq2.scanned[1] > 0);
+  return (
+    <section class="card accounts">
+      <header class="card-head"><h3>{p.title}</h3><span class="badge">{m().kinds.pq2.badge}</span></header>
+      <p class="muted small">{p.lead}</p>
+      {blocked && <Notice tone={pq2.blocked === 'legacy' ? 'warn' : 'info'}>{blocked}</Notice>}
+      {pq2.addresses.length > 0 && (
+        <ul class="account-list">
+          {pq2.addresses.map((a) => (
+            <li class="account">
+              <span class="kind-mark kind-mldsa44"><Icon name={KIND_ICON.pq2} size={18} /></span>
+              <div class="account-main">
+                <div class="account-addr">
+                  <Mono class="addr-text" title={a.address}>{shorten(a.address, 14, 12)}</Mono>
+                  <CopyButton text={a.address} />
+                </div>
+                <dl class="rows compact">
+                  {a.coins.map((c) => (
+                    <div><dt class="num">{coins(c.sats)}</dt><dd><Chip tone={PQ2_TONE[c.status]} dot>{p[`status_${c.status}`]}</Chip></dd></div>
+                  ))}
+                </dl>
+              </div>
+              <div class="account-side">
+                <Amount sats={a.spendable} />
+                {a.incoming > 0 && <small class="muted num">+{coins(a.incoming)}</small>}
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+      {pq2.addresses.length > 0 && <p class="faint small">{p.statusHelp}</p>}
+      {restored && (
+        <div class="stack">
+          <h4>{p.scanTitle}</h4>
+          {pq2.blocked !== 'scan_needed' && <p class="muted small">{fill(p.scanned, { r: pq2.scanned[0], c: pq2.scanned[1] })}</p>}
+          <div class="row-actions">
+            <Button size="sm" icon="refresh" busy={busy} onClick={() => scan(pq2.blocked !== 'scan_needed')}>
+              {busy ? p.scanning : pq2.blocked === 'scan_needed' ? p.scan : p.scanWider}
+            </Button>
+          </div>
+        </div>
+      )}
+    </section>
   );
 }
 
@@ -144,6 +226,7 @@ function NetworkCard({ chain, fetched }: { chain: Chain; fetched: number }) {
         <div><dt>{o.tip}</dt><dd class="num">{group(chain.tip)}</dd></div>
         <div><dt>{o.m1}</dt><dd>{milestone(chain.mldsa44_height)}</dd></div>
         <div><dt>{o.m3}</dt><dd>{milestone(chain.tripwire_height)} · <span class={chain.ec_disabled ? 'tone-warn' : ''}>{tripwire}</span></dd></div>
+        {chain.lattice_height !== null && <div><dt>{m().pq2.network}</dt><dd>{milestone(chain.lattice_height + 6)}</dd></div>}
       </dl>
     </Card>
   );

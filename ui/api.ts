@@ -1,8 +1,10 @@
 // The core's commands (src-tauri/src/app.rs), typed. A failed command rejects with { code }.
 import { invoke } from '@tauri-apps/api/core';
 
-export type Kind = 'schnorr' | 'mldsa44' | 'mixed';
-export type Path = 'schnorr' | 'mldsa44';
+export type Kind = 'schnorr' | 'mldsa44' | 'mixed' | 'pq2';
+export type Path = 'schnorr' | 'mldsa44' | 'slhdsa128s';
+/** The three addresses with one output each; pq2 has one per index. */
+export type FixedKind = Exclude<Kind, 'pq2'>;
 
 export interface Status { exists: boolean; unlocked: boolean; legacy: boolean | null }
 
@@ -16,10 +18,50 @@ export interface Chain {
   ec_disabled: boolean | null;
   tripwires: { outpoint: string; unspent: boolean }[];
   mixed_allowed: boolean;
+  /** H4T, when the node reports the M4 rules at Ark-0's heights. */
+  lattice_height: number | null;
+  lattice_tip: number | null;
+  /** The node reports ML-DSA-44 checks in pq2 (0xe2) leaves off from the next block; null when unknown. */
+  mldsa_disabled: boolean | null;
+  lattice_tripwires: { outpoint: string; unspent: boolean; key_sha256: string | null; label: string | null }[];
+  pq2_allowed: boolean;
+}
+
+export type Pq2Status = 'protected' | 'pending' | 'unprotected';
+export type Pq2Blocked = 'legacy' | 'waiting' | 'unknown_state' | 'scan_needed' | 'gap_limit';
+
+export interface Pq2Coin { txid: string; vout: number; sats: number; height: number | null; status: Pq2Status; spending: boolean }
+export interface Pq2Address { chain: number; index: number; address: string; spendable: number; pending: number; incoming: number; coins: Pq2Coin[]; complete: boolean }
+export interface Pq2View {
+  blocked: Pq2Blocked | null;
+  allowed: boolean;
+  opens_at: number;
+  mldsa44_allowed: boolean;
+  mldsa_disabled: boolean | null;
+  addresses: Pq2Address[];
+  spendable: number;
+  pending: number;
+  incoming: number;
+  complete: boolean;
+  change_blocked: boolean;
+  scanned: [number, number];
+  issued: [number, number];
+}
+
+export interface Pq2PlanView {
+  address: string;
+  mldsa44_allowed: boolean;
+  mldsa44_reason: 'disabled' | 'unknown' | null;
+  witness_bytes: number;
+  several_coins: boolean;
+  change_address: string | null;
+  change_blocked: boolean;
+  /** The txid of the payment this one rebuilds ('' when that one was never sent). */
+  rebuilt_from: string | null;
 }
 
 export interface AccountView {
-  kind: Kind;
+  kind: FixedKind;
   address: string;
   shown: boolean;
   path: Path | null;
@@ -30,7 +72,7 @@ export interface AccountView {
   complete: boolean;
 }
 
-export interface Overview { chain: Chain | null; problem: string | null; accounts: AccountView[]; fetched: number }
+export interface Overview { chain: Chain | null; problem: string | null; accounts: AccountView[]; pq2: Pq2View | null; fetched: number }
 
 export interface SendPlan {
   id: string;
@@ -53,6 +95,7 @@ export interface SendPlan {
   unrecorded: boolean;
   one_source: boolean;
   sources_disagree: boolean;
+  pq2: Pq2PlanView | null;
 }
 
 export type BroadcastResult =
@@ -61,7 +104,7 @@ export type BroadcastResult =
   | { kind: 'failed'; error: string }
   | { kind: 'unknown' };
 
-export interface SendResult { result: BroadcastResult; txid: string; sign_ms: number }
+export interface SendResult { result: BroadcastResult; txid: string; sign_ms: number; rebuilt: SendPlan | null }
 
 export interface Sent {
   txid: string;
@@ -82,6 +125,10 @@ export interface Sent {
   /** An earlier answer about this payment was unclear (or its confirmation is not yet verified). */
   doubted: boolean;
   reason: string;
+  /** The pq2 address a pq2 payment spent from. */
+  address?: string;
+  /** A pq2 payment through the ML-DSA-44 leaf that did not go through and can be rebuilt now. */
+  rebuild: boolean;
 }
 
 export type CheckResult =
@@ -123,7 +170,11 @@ export const core = {
   // The core asks the user in a system dialog first, in this language when the setting follows the system.
   forgetWallet: (locale: string) => invoke<Status>('forget_wallet', { locale }),
   overview: () => invoke<Overview>('overview'),
-  planSend: (from: Kind, to: string, amount: string) => invoke<SendPlan>('plan_send', { from, to, amount }),
+  planSend: (from: Kind, to: string, amount: string, address?: string, path?: Path) =>
+    invoke<SendPlan>('plan_send', { from, to, amount, address: address ?? null, path: path ?? null }),
+  pq2NewAddress: () => invoke<{ address: string; index: number }>('pq2_new_address'),
+  pq2Scan: (wider: boolean) => invoke<{ found: number; scanned: [number, number]; issued: [number, number] }>('pq2_scan', { wider }),
+  planRebuild: (txid: string) => invoke<SendPlan>('plan_rebuild', { txid }),
   confirmSend: (id: string, locale: string) => invoke<SendResult>('confirm_send', { id, locale }),
   activity: () => invoke<Sent[]>('activity'),
   drillCheck: (path: Path, locale: string) => invoke<DrillResult>('drill_check', { path, locale }),

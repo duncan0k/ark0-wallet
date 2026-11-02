@@ -1,13 +1,22 @@
 // Sending: choose an address, a destination and an amount; the core plans it, the user reviews the plan,
 // and only that plan is signed and sent. Beside the form, what the chosen address's signature costs.
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { codeOf, core, type AccountView, type AppInfo, type Kind, type Overview, type SendPlan, type SendResult } from '../api';
+import { codeOf, core, type AppInfo, type Kind, type Overview, type Path, type SendPlan, type SendResult } from '../api';
 import { Amount, Button, CompareBars, CopyButton, Field, Icon, Modal, Mono, Notice, useToast } from '../components';
 import { errorText, fill, locale, m } from '../i18n';
-import { amount as withUnit, coins, group, ms, unit, unitOfCoins } from '../format';
+import { amount as withUnit, coins, group, ms, shorten, unit, unitOfCoins } from '../format';
 import { ORDER } from './overview';
 
-const SIGNATURE_NAME = { mldsa44: 'ML-DSA-44 · FIPS 204', schnorr: 'Schnorr · BIP-340' };
+export const SIGNATURE_NAME: Record<Path, string> = { mldsa44: 'ML-DSA-44 · FIPS 204', schnorr: 'Schnorr · BIP-340', slhdsa128s: 'SLH-DSA-SHA2-128s · FIPS 205' };
+
+/** Where a payment can come from: one of the three addresses, or one pq2 address. */
+interface Source {
+  key: string;
+  kind: Kind;
+  address: string;
+  spendable: number;
+  path: Path | null;
+}
 
 export function Send({ data, info, onSent, onActivity, preferred }: {
   data: Overview | null;
@@ -16,8 +25,16 @@ export function Send({ data, info, onSent, onActivity, preferred }: {
   onActivity: () => void;
   preferred?: Kind;
 }) {
-  const usable = ORDER.map((k) => data?.accounts.find((a) => a.kind === k)).filter((a): a is AccountView => !!a && a.shown);
-  const [from, setFrom] = useState<Kind | null>(null);
+  const usable: Source[] = [
+    ...ORDER.map((k) => data?.accounts.find((a) => a.kind === k))
+      .filter((a): a is NonNullable<typeof a> => !!a && a.shown)
+      .map((a) => ({ key: a.kind, kind: a.kind as Kind, address: a.address, spendable: a.spendable, path: a.path })),
+    // pq2 addresses with coins, while pq2 may be used.
+    ...(data?.pq2?.allowed ? data.pq2.addresses.filter((a) => a.spendable > 0) : [])
+      .map((a) => ({ key: `pq2:${a.address}`, kind: 'pq2' as Kind, address: a.address, spendable: a.spendable, path: 'slhdsa128s' as Path })),
+  ];
+  const [from, setFrom] = useState<string | null>(null);
+  const [leaf, setLeaf] = useState<Path>('slhdsa128s');
   const [to, setTo] = useState('');
   const [amount, setAmount] = useState('');
   const [all, setAll] = useState(false);
@@ -29,22 +46,25 @@ export function Send({ data, info, onSent, onActivity, preferred }: {
   const toast = useToast();
 
   useEffect(() => {
-    if (from === null || !usable.some((a) => a.kind === from)) {
+    if (from === null || !usable.some((a) => a.key === from)) {
       const pick = usable.find((a) => a.kind === preferred && a.spendable > 0) ?? usable.find((a) => a.spendable > 0) ?? usable[0];
-      if (pick) setFrom(pick.kind);
+      if (pick) setFrom(pick.key);
     }
   }, [data]);
 
   if (!data) return <div class="page"><div class="skeleton-card" /></div>;
   if (usable.length === 0) return <div class="page narrow"><Notice tone="info">{m().send.nothingToSend}</Notice></div>;
-  const source = usable.find((a) => a.kind === from) ?? usable[0]!;
+  const source = usable.find((a) => a.key === from) ?? usable[0]!;
+  const pq2 = source.kind === 'pq2' ? data.pq2 : null;
+  // The ML-DSA-44 leaf only when the node reports it on; otherwise the SLH-DSA leaf, the default.
+  const chosen: Path | undefined = pq2 ? (leaf === 'mldsa44' && pq2.mldsa44_allowed ? 'mldsa44' : 'slhdsa128s') : undefined;
 
   const review = async (e: Event) => {
     e.preventDefault();
     setBusy(true);
     setError(null);
     try {
-      setPlan(await core.planSend(source.kind, to.trim(), all ? 'all' : amount.trim()));
+      setPlan(await core.planSend(source.kind, to.trim(), all ? 'all' : amount.trim(), pq2 ? source.address : undefined, chosen));
     } catch (err) {
       setError(errorText(codeOf(err)));
     } finally {
@@ -82,14 +102,16 @@ export function Send({ data, info, onSent, onActivity, preferred }: {
           <Field label={m().send.from}>
             <div class="source-list" role="radiogroup">
               {usable.map((a) => (
-                <button type="button" role="radio" aria-checked={a.kind === source.kind} class={`source${a.kind === source.kind ? ' selected' : ''}`} onClick={() => setFrom(a.kind)}>
-                  <span class="source-title">{m().kinds[a.kind].title}</span>
+                <button type="button" role="radio" aria-checked={a.key === source.key} class={`source${a.key === source.key ? ' selected' : ''}`} onClick={() => setFrom(a.key)}>
+                  <span class="source-title">{m().kinds[a.kind].title}{a.kind === 'pq2' && <> · <Mono>{shorten(a.address, 8, 6)}</Mono></>}</span>
                   <span class="badge">{m().kinds[a.kind].badge}</span>
                   <span class="source-amount"><Amount sats={a.spendable} /></span>
                 </button>
               ))}
             </div>
           </Field>
+          {pq2 && <LeafChoice leaf={chosen ?? 'slhdsa128s'} onLeaf={setLeaf} mldsa44Allowed={pq2.mldsa44_allowed} mldsaDisabled={pq2.mldsa_disabled} info={info} />}
+          {pq2?.change_blocked && <Notice tone="info">{m().pq2.changeBlocked}</Notice>}
           <Field label={m().send.to} id="to">
             <div class="input-wrap">
               <input ref={toInput} id="to" class="input mono" placeholder={m().send.toPlaceholder} spellcheck={false} autocomplete="off" value={to}
@@ -110,17 +132,47 @@ export function Send({ data, info, onSent, onActivity, preferred }: {
             {busy ? m().send.reviewing : m().send.review}
           </Button>
         </form>
-        <Summary source={source} info={info} />
+        <Summary source={source} info={info} path={chosen} />
       </div>
-      {plan && <ReviewDialog plan={plan} all={all} onClose={() => setPlan(null)} onSent={(r) => { setPlan(null); setResult(r); onSent(); }} />}
+      {plan && <ReviewDialog plan={plan} all={all} onClose={() => setPlan(null)}
+        onSent={(r) => { if (r.rebuilt) { setPlan(r.rebuilt); onSent(); } else { setPlan(null); setResult(r); onSent(); } }} />}
     </div>
   );
 }
 
+/**
+ * The leaf a pq2 payment goes through: SLH-DSA by default; ML-DSA-44 only when chosen and while the node
+ * reports it on, and otherwise shown disabled with the reason. Each with its size per coin.
+ */
+function LeafChoice({ leaf, onLeaf, mldsa44Allowed, mldsaDisabled, info }: {
+  leaf: Path;
+  onLeaf: (p: Path) => void;
+  mldsa44Allowed: boolean;
+  mldsaDisabled: boolean | null;
+  info: AppInfo | null;
+}) {
+  const p = m().pq2;
+  const bytes = (path: Path) => group(info?.costs.find((c) => c.kind === 'pq2' && c.signature === path)?.signature_bytes ?? 0);
+  return (
+    <Field label={p.leafChoice}>
+      <div class="source-list" role="radiogroup">
+        <button type="button" role="radio" aria-checked={leaf === 'slhdsa128s'} class={`source${leaf === 'slhdsa128s' ? ' selected' : ''}`} onClick={() => onLeaf('slhdsa128s')}>
+          <span class="source-title">{p.leafSlh}</span>
+          <span class="muted small">{fill(p.leafSlhHint, { n: bytes('slhdsa128s') })}</span>
+        </button>
+        <button type="button" role="radio" aria-checked={leaf === 'mldsa44'} disabled={!mldsa44Allowed} class={`source${leaf === 'mldsa44' ? ' selected' : ''}`} onClick={() => onLeaf('mldsa44')}>
+          <span class="source-title">{p.leafMldsa}</span>
+          <span class="muted small">{mldsa44Allowed ? fill(p.leafMldsaHint, { n: bytes('mldsa44') }) : mldsaDisabled ? p.mldsaDisabled : p.mldsaUnknown}</span>
+        </button>
+      </div>
+    </Field>
+  );
+}
+
 /** What a payment from the chosen address costs: its signature, the size of one input, the fee. */
-function Summary({ source, info }: { source: AccountView; info: AppInfo | null }) {
+function Summary({ source, info, path: chosen }: { source: Source; info: AppInfo | null; path: Path | undefined }) {
   const s = m().send;
-  const path = source.path ?? (source.kind === 'schnorr' ? 'schnorr' : 'mldsa44');
+  const path = chosen ?? source.path ?? (source.kind === 'schnorr' ? 'schnorr' : 'mldsa44');
   const cost = info?.costs.find((c) => c.kind === source.kind && c.signature === path);
   const pq = info?.costs.find((c) => c.kind === 'mldsa44');
   const classic = info?.costs.find((c) => c.kind === 'schnorr');
@@ -148,7 +200,7 @@ function Summary({ source, info }: { source: AccountView; info: AppInfo | null }
   );
 }
 
-function ReviewDialog({ plan, all, onClose, onSent }: { plan: SendPlan; all: boolean; onClose: () => void; onSent: (r: SendResult) => void }) {
+export function ReviewDialog({ plan, all, onClose, onSent }: { plan: SendPlan; all: boolean; onClose: () => void; onSent: (r: SendResult) => void }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const s = m().send;
@@ -175,14 +227,22 @@ function ReviewDialog({ plan, all, onClose, onSent }: { plan: SendPlan; all: boo
         <Amount sats={plan.send} size="lg" />
       </div>
       <dl class="rows">
-        <div><dt>{s.rowFrom}</dt><dd>{m().kinds[plan.from].title}</dd></div>
+        <div><dt>{s.rowFrom}</dt><dd>{m().kinds[plan.from].title}{plan.pq2 && <> · <Mono class="break">{plan.pq2.address}</Mono></>}</dd></div>
         <div><dt>{s.rowTo}</dt><dd><Mono class="break">{plan.to}</Mono></dd></div>
         <div><dt>{s.rowFee}</dt><dd>{withUnit(plan.fee)} <span class="muted">· {plan.fee_rate} sat/vB</span></dd></div>
         {plan.change > 0 && <div><dt>{s.rowChange}</dt><dd>{withUnit(plan.change)}</dd></div>}
         <div><dt>{s.rowSignature}</dt><dd>{SIGNATURE_NAME[plan.signature]}</dd></div>
         <div><dt>{s.rowSize}</dt><dd class="num">{group(plan.vsize)} vB <span class="muted">· {group(plan.size)} B</span></dd></div>
         <div><dt>{s.rowInputs}</dt><dd class="num">{plan.inputs}</dd></div>
+        {plan.pq2 && <div><dt>{s.rowSignature}</dt><dd class="num">{fill(m().pq2.witness, { n: group(plan.pq2.witness_bytes) })}</dd></div>}
       </dl>
+      {plan.pq2?.rebuilt_from === '' && <Notice tone="warn">{m().pq2.rebuiltBefore}</Notice>}
+      {plan.pq2?.rebuilt_from && <Notice tone="warn">{m().pq2.rebuiltRefused}</Notice>}
+      {plan.pq2?.several_coins && <Notice tone="info">{fill(m().pq2.severalCoins, { n: plan.inputs })}</Notice>}
+      {plan.pq2?.change_address && <Notice tone="info">{m().pq2.changeTo}</Notice>}
+      {plan.pq2 && plan.signature !== 'mldsa44' && !plan.pq2.mldsa44_allowed && (
+        <p class="faint small">{plan.pq2.mldsa44_reason === 'disabled' ? m().pq2.mldsaDisabled : m().pq2.mldsaUnknown}</p>
+      )}
       {plan.to_self && <Notice tone="info">{s.toSelf}</Notice>}
       {plan.left > 0 && <Notice tone="warn">{fill(s.leftOut, { n: plan.left })}</Notice>}
       {all && plan.truncated && <Notice tone="warn">{s.truncatedAll}</Notice>}
