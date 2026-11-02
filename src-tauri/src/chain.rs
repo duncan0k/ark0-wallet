@@ -111,6 +111,9 @@ pub struct Chain {
     pub lattice_tripwires: Vec<LatticeTripwire>,
     /// pq2 addresses and outputs may be made: the tip is at least H4T + 6 and the state is known.
     pub pq2_allowed: bool,
+    /// pq2 coins may be spent (through the SLH-DSA leaf when the state is unknown): the tip is at least
+    /// H4T + 6.
+    pub pq2_spendable: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -296,6 +299,7 @@ pub fn check(state: &Value) -> Result<Chain, ChainProblem> {
     };
     let lattice_tip = lattice.as_ref().map(|(at, _)| *at);
     let pq2_allowed = matches!((lattice_height, lattice_tip), (Some(h), Some(t)) if t >= h.saturating_add(MARGIN) && tip >= h.saturating_add(MARGIN));
+    let pq2_spendable = lattice_height.is_some_and(|h| tip >= h.saturating_add(MARGIN));
     let mldsa44_allowed = mldsa44_height.is_some_and(|h| tip >= h.saturating_add(MARGIN));
     let mixed_allowed = matches!((tripwire_height, tripwire_tip), (Some(h3), Some(t)) if t >= h3.saturating_add(MARGIN));
     Ok(Chain {
@@ -313,6 +317,7 @@ pub fn check(state: &Value) -> Result<Chain, ChainProblem> {
         mldsa_disabled: lattice.as_ref().map(|(_, l)| l.1),
         lattice_tripwires: lattice.map(|(_, l)| l.2).unwrap_or_default(),
         pq2_allowed,
+        pq2_spendable,
     })
 }
 
@@ -441,6 +446,14 @@ pub(crate) mod tests {
         s["tripwire"]["tip_height"] = json!(H4T + 6);
         let c = check(&s).unwrap();
         assert_eq!((c.lattice_tip, c.mldsa_disabled, c.pq2_allowed), (None, None, false));
+        // Spending waits for H4T + 6 as well, but not for the state: unknown means the SLH-DSA leaf.
+        assert!(!check(&m4_state(H4T + 5, false)).unwrap().pq2_spendable);
+        assert!(check(&m4_state(H4T + 6, false)).unwrap().pq2_spendable);
+        let mut s = m4_state(H4T + 6, false);
+        s["tripwire"].as_object_mut().unwrap().remove("lattice");
+        let c = check(&s).unwrap();
+        assert!(c.pq2_spendable && !c.pq2_allowed);
+        assert_eq!(c.pq2_path(Some(Path::Mldsa44)), Path::Slhdsa128s);
     }
 
     #[test]

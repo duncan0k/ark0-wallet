@@ -35,6 +35,8 @@ export interface Pq2Address { chain: number; index: number; address: string; spe
 export interface Pq2View {
   blocked: Pq2Blocked | null;
   allowed: boolean;
+  /** pq2 coins may be spent (through SLH-DSA, without change, while the lattice state is unknown). */
+  spend_allowed: boolean;
   opens_at: number;
   mldsa44_allowed: boolean;
   mldsa_disabled: boolean | null;

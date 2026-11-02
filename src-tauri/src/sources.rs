@@ -87,6 +87,7 @@ fn merge_chain(mut a: Chain, mut b: Chain) -> (Chain, bool) {
     a.lattice_height = a.lattice_height.filter(|h| b.lattice_height == Some(*h));
     a.lattice_tip = a.lattice_tip.zip(b.lattice_tip).map(|(x, y)| x.min(y));
     a.pq2_allowed &= b.pq2_allowed && a.lattice_height.is_some();
+    a.pq2_spendable &= b.pq2_spendable && a.lattice_height.is_some();
     let mut lattice_positions = a.lattice_tripwires.iter().enumerate().map(|(i, t)| (t.outpoint.clone(), i)).collect::<HashMap<_, _>>();
     for wire in std::mem::take(&mut b.lattice_tripwires) {
         match lattice_positions.get(&wire.outpoint) {

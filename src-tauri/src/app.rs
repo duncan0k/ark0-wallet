@@ -832,6 +832,9 @@ pub struct Pq2View {
     blocked: Option<&'static str>,
     /// pq2 may be used: the tip is at least H4T + 6 and the state is known.
     allowed: bool,
+    /// pq2 coins may be spent: the tip is at least H4T + 6 (through the SLH-DSA leaf while the state is
+    /// unknown, and without change then).
+    spend_allowed: bool,
     /// H4T + 6.
     opens_at: u32,
     /// The ML-DSA-44 leaf may be chosen for a spend: the node reports ML-DSA-44 checks still on.
@@ -922,6 +925,7 @@ async fn pq2_overview(state: &AppState, chain: &Chain, sources: &Sources, flags:
     let mut view = Pq2View {
         blocked: pq2_blocked(legacy, chain, book.as_ref(), RECEIVE_CHAIN),
         allowed: chain.pq2_allowed && !legacy,
+        spend_allowed: chain.pq2_spendable && !legacy,
         opens_at: h4t.saturating_add(crate::chain::MARGIN),
         mldsa44_allowed: chain.pq2_mldsa44_allowed(),
         mldsa_disabled: chain.mldsa_disabled,
@@ -981,12 +985,12 @@ async fn pq2_overview(state: &AppState, chain: &Chain, sources: &Sources, flags:
         }
     }
     // Nothing is spendable from pq2 while it may not be used (a reorganization below H4T + 6).
-    if !view.allowed {
+    if !view.spend_allowed {
         view.spendable = 0;
     }
     let book = state.book().ok();
     view.blocked = pq2_blocked(legacy, chain, book.as_ref(), RECEIVE_CHAIN);
-    view.change_blocked = book.as_ref().is_none_or(|b| !b.chains[CHANGE_CHAIN as usize].can_issue());
+    view.change_blocked = !chain.pq2_allowed || book.as_ref().is_none_or(|b| !b.chains[CHANGE_CHAIN as usize].can_issue());
     Some(view)
 }
 
@@ -1299,7 +1303,9 @@ async fn plan_pq2_payment(state: &AppState, address: String, to: String, amount:
     let sources = state.sources.clone();
     let mut flags = Flags::default();
     let chain = current_chain(&sources, &mut flags).await?;
-    if !chain.pq2_allowed {
+    // Spending waits for H4T + 6; with the lattice state unknown it goes through the SLH-DSA leaf, and
+    // without change (no new pq2 output then).
+    if !chain.pq2_spendable {
         return Err(Failure::new("address_not_ready"));
     }
     let own = state.own_templates()?;
@@ -1324,14 +1330,22 @@ async fn plan_pq2_payment(state: &AppState, address: String, to: String, amount:
     let went_out = earlier.spent || surfaced(&sent);
     // Several coins on one address go together: one spend reveals the leaf all of them are locked to.
     let required = earlier.usable.clone();
-    let change_index = state.book()?.chains[CHANGE_CHAIN as usize].next();
+    let change_index = state.book()?.chains[CHANGE_CHAIN as usize].next().filter(|_| chain.pq2_allowed);
     let change = match change_index {
         Some(i) => Some(state.pq2_template(CHANGE_CHAIN, i)?),
         None => None,
     };
-    let plan = wallet::plan_spend_to(&account, &earlier.usable, &required, &destination, amount, chain.lock_time_for(true), change.as_ref().map(|t| &t.script_pubkey))
+    // nLockTime H4T when the payment creates a pq2 output: its change, or one of the wallet's own pq2
+    // addresses as destination. The lock time does not change the sizes, so it is set once planned.
+    let to_own_pq2 = own_pq2(state).contains(&destination.address);
+    let mut plan = wallet::plan_spend_to(&account, &earlier.usable, &required, &destination, amount, chain.lock_time(), change.as_ref().map(|t| &t.script_pubkey))
         .map_err(|e| if e == PlanError::NeedsChange { Failure::new("pq2_change_limit") } else { e.into() })?;
     let change_used = plan.change > 0;
+    let creates_pq2 = change_used || to_own_pq2;
+    if creates_pq2 && !chain.pq2_allowed {
+        return Err(Failure::new("destination_not_ready"));
+    }
+    plan.lock_time = chain.lock_time_for(creates_pq2);
     let mut id = [0u8; 16];
     getrandom::fill(&mut id).map_err(|_| Failure::new("internal"))?;
     let view = SendPlan {
@@ -1373,7 +1387,7 @@ async fn plan_pq2_payment(state: &AppState, address: String, to: String, amount:
     let caution = went_out || earlier.elsewhere || earlier.unrecorded;
     *guard(&state.pending) = Some(PendingSend {
         id: view.id.clone(), created: Instant::now(), kind: Kind::Pq2, path: account.path, destination, plan, caution, sources: flags,
-        creates_pq2: true,
+        creates_pq2,
         pq2: Some(Pq2Pending { chain: chain_index, index, change: change_index.filter(|_| change_used), wanted }),
         plan_address: address,
     });
@@ -1498,7 +1512,7 @@ async fn send_plan<F: Future<Output = bool>>(
     // checks in 0xe2 leaves are off (or that is unknown) the transaction cannot go through. It is dropped
     // unsent and rebuilt through the SLH-DSA leaf.
     if pending.pq2.is_some() && pending.path == Path::Mldsa44 {
-        let still = current_chain(&state.sources, &mut Flags::default()).await.is_ok_and(|c| c.pq2_allowed && c.pq2_mldsa44_allowed());
+        let still = current_chain(&state.sources, &mut Flags::default()).await.is_ok_and(|c| c.pq2_spendable && c.pq2_mldsa44_allowed());
         if !still {
             return rebuild_unsent(state, &pending).await;
         }
@@ -1600,7 +1614,7 @@ async fn recheck_payment(state: &AppState, pending: &mut PendingSend) -> Res<(Ac
     let chain = current_chain(&state.sources, &mut flags).await?;
     let account = match pending.pq2 {
         Some(p) => {
-            if !chain.pq2_allowed {
+            if !chain.pq2_spendable || (pending.creates_pq2 && !chain.pq2_allowed) {
                 return Err(Failure::new("chain_changed"));
             }
             // Through the ML-DSA-44 leaf only while the node reports it on; otherwise rebuilt (send_plan).
@@ -5079,8 +5093,13 @@ mod pq2_tests {
             *guard(&w.net.state) = s;
             let result = block(plan_pq2_payment(&w.state, address.clone(), elsewhere(), "0.001".into(), Some(Path::Mldsa44), None));
             if flag.is_null() {
-                // Unknown state: no pq2 at all (no new output may be made), so no plan either.
-                assert_eq!(result.err().unwrap().code, "address_not_ready");
+                // Unknown state: no new pq2 output, so no change; a spend goes through the SLH-DSA leaf,
+                // without change, with the lock time of the rules before.
+                assert_eq!(result.err().unwrap().code, "pq2_change_limit");
+                let view = block(plan_pq2_payment(&w.state, address.clone(), elsewhere(), "all".into(), Some(Path::Mldsa44), None)).unwrap();
+                assert_eq!((view.signature, view.change), (Path::Slhdsa128s, 0));
+                assert_eq!(view.pq2.as_ref().unwrap().mldsa44_reason, Some("unknown"));
+                assert_eq!(guard(&w.state.pending).take().unwrap().plan.lock_time, crate::chain::TRIPWIRE_HEIGHT);
             } else {
                 let view = result.unwrap();
                 assert_eq!(view.signature, Path::Slhdsa128s);

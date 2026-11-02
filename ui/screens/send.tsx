@@ -30,7 +30,7 @@ export function Send({ data, info, onSent, onActivity, preferred }: {
       .filter((a): a is NonNullable<typeof a> => !!a && a.shown)
       .map((a) => ({ key: a.kind, kind: a.kind as Kind, address: a.address, spendable: a.spendable, path: a.path })),
     // pq2 addresses with coins, while pq2 may be used.
-    ...(data?.pq2?.allowed ? data.pq2.addresses.filter((a) => a.spendable > 0) : [])
+    ...(data?.pq2?.spend_allowed ? data.pq2.addresses.filter((a) => a.spendable > 0) : [])
       .map((a) => ({ key: `pq2:${a.address}`, kind: 'pq2' as Kind, address: a.address, spendable: a.spendable, path: 'slhdsa128s' as Path })),
   ];
   const [from, setFrom] = useState<string | null>(null);
