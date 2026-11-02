@@ -148,15 +148,18 @@ pub struct Sent {
     pub txid: String,
     /// Seconds since 1970.
     pub created: u64,
-    /// "schnorr", "mldsa44" or "mixed".
+    /// "schnorr", "mldsa44", "mixed" or "pq2".
     pub from: String,
+    /// The pq2 address a pq2 payment spends from (empty for the other kinds, which have one address each).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub address: String,
     pub to: String,
     pub send: u64,
     pub fee: u64,
     pub change: u64,
     pub vsize: usize,
     pub size: usize,
-    /// "schnorr" or "mldsa44": the signature its inputs carry.
+    /// "schnorr", "mldsa44" or "slhdsa128s": the signature its inputs carry.
     pub signature: String,
     pub inputs: usize,
     /// Milliseconds the signing core took for all inputs.

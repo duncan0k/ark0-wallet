@@ -240,12 +240,6 @@ impl Template {
             Path::Slhdsa128s => self.slhdsa128s_leaf.as_ref(),
         }
     }
-
-    /// Whether `script_pubkey` commits to exactly the pq2 tree of these keys: two leaves of version 0xe2
-    /// at depth one, one exactly S1 and the other exactly SLH1 (any other tree has another root).
-    pub fn is_pq2_of(script_pubkey: &[u8], mldsa44_key: &[u8; MLDSA44_PUBLIC_KEY_LEN], slhdsa128s_key: &[u8; SLHDSA128S_PUBLIC_KEY_LEN]) -> bool {
-        is_p2mr(script_pubkey) && script_pubkey[2..] == Template::pq2(mldsa44_key, slhdsa128s_key).root
-    }
 }
 
 /// A valid address of a kind that has spending rules on Ark-0.

@@ -6,9 +6,10 @@
 //! there. Secrets live in `Session` while the wallet is unlocked and are wiped when it locks (by hand, or
 //! after the idle time).
 use crate::api::{ApiError, BroadcastResult, CheckResult, Coin, Coins, TxStatus};
-use crate::chain::{Chain, ChainProblem};
-use crate::keys::{looks_like_backup_code, word_list, KeyError, Keys, Secret};
-use crate::p2mr::{parse_destination, Destination, DestinationError, Kind, Path, Template, MLDSA44_SIGNATURE_CHUNKS};
+use crate::chain::{Chain, ChainProblem, Pq2Status};
+use crate::keys::{looks_like_backup_code, word_list, KeyError, Keys, Secret, CHANGE_CHAIN, RECEIVE_CHAIN};
+use crate::p2mr::{parse_destination, Destination, DestinationError, Kind, Path, Template, MLDSA44_SIGNATURE_CHUNKS, SLHDSA128S_SIGNATURE_CHUNKS};
+use crate::pq2::{Book, GAP_LIMIT, WIDER_SCAN};
 use crate::proof::REQUIRED_BLOCKS;
 use crate::sources::{Flags, Sources, StateError};
 use crate::store::{self, Sent, Settings};
@@ -109,18 +110,43 @@ struct Session {
     schnorr: Template,
     mldsa44: Template,
     mixed: Template,
+    /// The pq2 receiving address at index 0, which names the wallet's pq2 book; None without pq2.
+    pq2_wallet: Option<String>,
+    /// pq2 templates derived so far, by chain and index (public data only).
+    pq2: HashMap<(u32, u32), Template>,
 }
 
 impl Session {
     fn new(secret: &Secret) -> Result<Session, KeyError> {
         let keys = Keys::from_secret(secret)?;
+        let mut pq2 = HashMap::new();
+        let pq2_wallet = if keys.has_pq2() {
+            let first = keys.pq2(RECEIVE_CHAIN, 0)?.template();
+            let address = first.address.clone();
+            pq2.insert((RECEIVE_CHAIN, 0), first);
+            Some(address)
+        } else {
+            None
+        };
         Ok(Session {
             legacy: secret.is_legacy(),
             schnorr: keys.template(Kind::Schnorr),
             mldsa44: keys.template(Kind::Mldsa44),
             mixed: keys.template(Kind::Mixed),
             keys,
+            pq2_wallet,
+            pq2,
         })
+    }
+
+    /// The pq2 output at this chain and index, derived once per session.
+    fn pq2_template(&mut self, chain: u32, index: u32) -> Res<Template> {
+        if let Some(t) = self.pq2.get(&(chain, index)) {
+            return Ok(t.clone());
+        }
+        let t = self.keys.pq2(chain, index)?.template();
+        self.pq2.insert((chain, index), t.clone());
+        Ok(t)
     }
 
     /// The template of one of the three fixed addresses; pq2 addresses are looked up by address.
@@ -144,6 +170,24 @@ struct PendingSend {
     /// The system dialog showed the warnings, so recording may go ahead with them.
     caution: bool,
     sources: Flags,
+    /// The payment creates a pq2 output (its change, or the destination is one of the wallet's own pq2
+    /// addresses): its lock time is H4T.
+    creates_pq2: bool,
+    /// A spend from a pq2 address.
+    pq2: Option<Pq2Pending>,
+    /// The address the payment spends from.
+    plan_address: String,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Pq2Pending {
+    /// The receiving or change chain and the index of the address spent from.
+    chain: u32,
+    index: u32,
+    /// The change chain index the change goes to, handed out when the payment is recorded.
+    change: Option<u32>,
+    /// The leaf the user asked for (None: the default, SLH-DSA).
+    wanted: Option<Path>,
 }
 
 /// A new wallet's words, between showing them and saving the vault.
@@ -166,6 +210,8 @@ pub struct AppState {
     vault_ops: Mutex<()>,
     /// Held while the record of sent transactions is read, changed and saved (`edit_sent`).
     sent_ops: Mutex<()>,
+    /// Held while the pq2 book is read, changed and saved (`edit_book`).
+    pq2_ops: Mutex<()>,
     /// Lookups started by any refresh, until their results have been saved.
     sent_lookups: Mutex<HashSet<String>>,
     /// Counts locks. Work that began before a lock (an unlock's key derivation, a send waiting on the
@@ -191,6 +237,7 @@ impl AppState {
             last_use: Mutex::new((Instant::now(), SystemTime::now())),
             vault_ops: Mutex::new(()),
             sent_ops: Mutex::new(()),
+            pq2_ops: Mutex::new(()),
             sent_lookups: Mutex::new(HashSet::new()),
             generation: AtomicU64::new(0),
             locked: watch::channel(()).0,
@@ -212,6 +259,10 @@ impl AppState {
 
     fn sent_path(&self) -> PathBuf {
         self.dir.join("sent.json")
+    }
+
+    fn pq2_path(&self) -> PathBuf {
+        self.dir.join("pq2.json")
     }
 
     fn touch(&self) {
@@ -262,9 +313,11 @@ impl AppState {
         Ok((s.schnorr.clone(), s.mldsa44.clone(), s.mixed.clone()))
     }
 
-    /// Opens the wallet, unless it was locked since `generation` was read.
-    fn open_session(&self, secret: &Secret, generation: u64) -> Res<()> {
+    /// Opens the wallet, unless it was locked since `generation` was read. `made_here`: the words were just
+    /// made on this device, so no other copy of the wallet has handed out pq2 addresses.
+    fn open_session(&self, secret: &Secret, generation: u64, made_here: bool) -> Res<()> {
         let session = Session::new(secret)?;
+        let wallet = session.pq2_wallet.clone();
         let mut current = guard(&self.session);
         if self.generation() != generation {
             return Err(Failure::new("locked"));
@@ -272,7 +325,69 @@ impl AppState {
         *current = Some(session);
         drop(current);
         self.touch();
+        // A pq2 book of another wallet, or none: a fresh one, which scans first unless the words are new.
+        if let Some(wallet) = wallet {
+            let _ = self.edit_book_raw(|book| {
+                if book.as_ref().is_none_or(|b| b.wallet != wallet || !b.valid()) {
+                    *book = Some(Book::new(&wallet, made_here));
+                }
+            });
+        }
         Ok(())
+    }
+
+    /// The pq2 book, read, changed and saved under its lock; saved only when it changed. A file that cannot
+    /// be read is not replaced.
+    fn edit_book_raw<R>(&self, change: impl FnOnce(&mut Option<Book>) -> R) -> std::io::Result<R> {
+        let _one_at_a_time = guard(&self.pq2_ops);
+        let path = self.pq2_path();
+        let mut book: Option<Book> = match store::read_capped(&path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).ok(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+        };
+        let before = book.clone();
+        let result = change(&mut book);
+        if book != before {
+            if let Some(b) = &book {
+                store::save(&path, b)?;
+            }
+        }
+        Ok(result)
+    }
+
+    /// The unlocked wallet's pq2 book, changed under its lock; `pq2_unavailable` for a wallet without pq2.
+    fn edit_book<R>(&self, change: impl FnOnce(&mut Book) -> R) -> Res<R> {
+        let wallet = guard(&self.session).as_ref().ok_or_else(|| Failure::new("locked"))?.pq2_wallet.clone();
+        let wallet = wallet.ok_or_else(|| Failure::new("pq2_unavailable"))?;
+        self.edit_book_raw(|book| match book {
+            Some(b) if b.wallet == wallet && b.valid() => Ok(change(b)),
+            _ => Err(Failure::new("pq2_unavailable")),
+        })
+        .map_err(|_| Failure::new("io"))?
+    }
+
+    fn book(&self) -> Res<Book> {
+        self.edit_book(|b| b.clone())
+    }
+
+    /// The pq2 template at this chain and index.
+    fn pq2_template(&self, chain: u32, index: u32) -> Res<Template> {
+        guard(&self.session).as_mut().ok_or_else(|| Failure::new("locked"))?.pq2_template(chain, index)
+    }
+
+    /// The wallet's own addresses: the three fixed ones, and the pq2 addresses it handed out or saw used.
+    fn own_templates(&self) -> Res<Vec<Template>> {
+        let (a, b, c) = self.templates()?;
+        let mut own = vec![a, b, c];
+        if let Ok(book) = self.book() {
+            for (chain, c) in book.chains.iter().enumerate() {
+                for index in c.watched() {
+                    own.push(self.pq2_template(chain as u32, index)?);
+                }
+            }
+        }
+        Ok(own)
     }
 }
 
@@ -385,7 +500,7 @@ fn create_confirmed_wallet(state: &AppState, password: String) -> Res<()> {
         vault::create(&state.vault_path(), &password, &new.secret)?;
         pending.take().expect("the pending wallet was checked above")
     };
-    state.open_session(&new.secret, generation)
+    state.open_session(&new.secret, generation, true)
 }
 
 #[derive(Serialize)]
@@ -423,7 +538,7 @@ fn restore_wallet_from_text(state: &AppState, text: String, password: String) ->
         remove_orphaned_record(state)?;
         vault::create(&state.vault_path(), &password, &secret)?;
     }
-    state.open_session(&secret, generation)
+    state.open_session(&secret, generation, false)
 }
 
 #[tauri::command]
@@ -442,7 +557,7 @@ fn unlock_wallet(state: &AppState, password: String) -> Res<()> {
     let generation = state.generation();
     let _one_at_a_time = guard(&state.vault_ops);
     let secret = vault::open(&state.vault_path(), &password)?;
-    state.open_session(&secret, generation)
+    state.open_session(&secret, generation, false)
 }
 
 #[tauri::command]
@@ -638,9 +753,12 @@ fn remove_orphaned_record(state: &AppState) -> Res<()> {
         Err(_) => return Err(Failure::new("io")),
     }
     let _sent = guard(&state.sent_ops);
-    if let Err(error) = std::fs::remove_file(state.sent_path()) {
-        if error.kind() != std::io::ErrorKind::NotFound {
-            return Err(Failure::new("io"));
+    let _pq2 = guard(&state.pq2_ops);
+    for path in [state.sent_path(), state.pq2_path()] {
+        if let Err(error) = std::fs::remove_file(path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(Failure::new("io"));
+            }
         }
     }
     Ok(())
@@ -649,7 +767,8 @@ fn remove_orphaned_record(state: &AppState) -> Res<()> {
 /// Called under vault_ops after locking; a vault that cannot be removed must leave the record intact.
 fn remove_wallet_files(state: &AppState) -> Res<()> {
     let _sent = guard(&state.sent_ops);
-    for path in [state.vault_path(), state.sent_path()] {
+    let _pq2 = guard(&state.pq2_ops);
+    for path in [state.vault_path(), state.sent_path(), state.pq2_path()] {
         if let Err(error) = std::fs::remove_file(path) {
             if error.kind() != std::io::ErrorKind::NotFound {
                 return Err(Failure::new("io"));
@@ -677,11 +796,67 @@ pub struct AccountView {
     complete: bool,
 }
 
+/// One output paid to a pq2 address, with its status (design section 8.3).
+#[derive(Serialize)]
+pub struct Pq2CoinView {
+    txid: String,
+    vout: u32,
+    sats: u64,
+    /// None while unconfirmed.
+    height: Option<u32>,
+    status: Pq2Status,
+    /// Spent by a transaction waiting for a block.
+    spending: bool,
+}
+
+#[derive(Serialize)]
+pub struct Pq2AddressView {
+    chain: u32,
+    index: u32,
+    address: String,
+    spendable: u64,
+    pending: u64,
+    incoming: u64,
+    coins: Vec<Pq2CoinView>,
+    complete: bool,
+}
+
+/// pq2 as the overview shows it. There is none at all while the node does not report the lattice tripwire
+/// rules; until it may be used, it says why not yet and shows no address.
+#[derive(Serialize)]
+pub struct Pq2View {
+    /// Why no new pq2 address can be handed out now: "legacy" (a backup code's wallet), "waiting" (the
+    /// tip is not yet H4T + 6), "unknown_state" (the lattice tripwire state is unknown), "scan_needed"
+    /// (a restored wallet's addresses have not been scanned yet), "gap_limit" (20 handed out unused);
+    /// None when one can.
+    blocked: Option<&'static str>,
+    /// pq2 may be used: the tip is at least H4T + 6 and the state is known.
+    allowed: bool,
+    /// H4T + 6.
+    opens_at: u32,
+    /// The ML-DSA-44 leaf may be chosen for a spend: the node reports ML-DSA-44 checks still on.
+    mldsa44_allowed: bool,
+    /// The node reports ML-DSA-44 checks in 0xe2 leaves off from the next block (None: unknown).
+    mldsa_disabled: Option<bool>,
+    addresses: Vec<Pq2AddressView>,
+    spendable: u64,
+    pending: u64,
+    incoming: u64,
+    complete: bool,
+    /// No payment with change while the change chain is at the gap limit.
+    change_blocked: bool,
+    /// Every index below these was looked at by a recovery scan, on each chain.
+    scanned: [u32; 2],
+    /// Every index below these is issued (handed out, or reserved by a scan), on each chain.
+    issued: [u32; 2],
+}
+
 #[derive(Serialize)]
 pub struct Overview {
     chain: Option<Chain>,
     problem: Option<String>,
     accounts: Vec<AccountView>,
+    pq2: Option<Pq2View>,
     fetched: u64,
 }
 
@@ -707,14 +882,126 @@ async fn current_chain(sources: &Sources, flags: &mut Flags) -> Res<Chain> {
     Ok(flags.take(sources.state().await)?)
 }
 
+/// Whether the API lists anything paid to the address: an unspent output, one being spent, or one on its way.
+fn anything_paid(coins: &Coins) -> bool {
+    !coins.spendable.is_empty() || !coins.pending.is_empty() || !coins.incoming.is_empty()
+}
+
+/// Records the pq2 address as used when its coins show anything paid to it.
+fn note_used(state: &AppState, chain: u32, index: u32, address: &str, coins: &Coins) {
+    if anything_paid(coins) {
+        let _ = state.edit_book(|b| b.chains[chain as usize].mark_used(index, address));
+    }
+}
+
+/// Why no new pq2 address can be handed out on `chain_index` now, or None.
+fn pq2_blocked(legacy: bool, chain: &Chain, book: Option<&Book>, chain_index: u32) -> Option<&'static str> {
+    if legacy {
+        return Some("legacy");
+    }
+    if chain.mldsa_disabled.is_none() && chain.lattice_tip.is_none() && chain.tip >= chain.lattice_height?.saturating_add(crate::chain::MARGIN) {
+        return Some("unknown_state");
+    }
+    if !chain.pq2_allowed {
+        return Some("waiting");
+    }
+    let Some(book) = book else { return Some("unknown_state") };
+    if book.scan_needed {
+        return Some("scan_needed");
+    }
+    if !book.chains[chain_index as usize].can_issue() {
+        return Some("gap_limit");
+    }
+    None
+}
+
+async fn pq2_overview(state: &AppState, chain: &Chain, sources: &Sources, flags: &mut Flags) -> Option<Pq2View> {
+    let h4t = chain.lattice_height?;
+    let legacy = guard(&state.session).as_ref().is_none_or(|s| s.pq2_wallet.is_none());
+    let book = state.book().ok();
+    let mut view = Pq2View {
+        blocked: pq2_blocked(legacy, chain, book.as_ref(), RECEIVE_CHAIN),
+        allowed: chain.pq2_allowed && !legacy,
+        opens_at: h4t.saturating_add(crate::chain::MARGIN),
+        mldsa44_allowed: chain.pq2_mldsa44_allowed(),
+        mldsa_disabled: chain.mldsa_disabled,
+        addresses: Vec::new(),
+        spendable: 0,
+        pending: 0,
+        incoming: 0,
+        complete: true,
+        change_blocked: book.as_ref().is_none_or(|b| !b.chains[CHANGE_CHAIN as usize].can_issue()),
+        scanned: book.as_ref().map_or([0, 0], |b| [b.chains[0].scanned, b.chains[1].scanned]),
+        issued: book.as_ref().map_or([0, 0], |b| [b.chains[0].issued, b.chains[1].issued]),
+    };
+    let Some(book) = book else { return Some(view) };
+    for (c, chain_book) in book.chains.iter().enumerate() {
+        for index in chain_book.watched() {
+            // Verified: only an address the wallet's own keys give at that index (a book changed on disk
+            // gets no status).
+            let Some(address) = chain_book.addresses.get(&index).cloned() else { continue };
+            if state.pq2_template(c as u32, index).ok().is_none_or(|t| t.address != address) {
+                view.complete = false;
+                continue;
+            }
+            let found = flags.take(sources.coins(&address).await);
+            let Ok(coins) = found else {
+                view.complete = false;
+                continue;
+            };
+            note_used(state, c as u32, index, &address, &coins);
+            let sum = |c: &[Coin]| c.iter().map(|c| c.sats).sum::<u64>();
+            let mut list: Vec<Pq2CoinView> = Vec::new();
+            for (c, spending) in coins.spendable.iter().map(|c| (c, false)).chain(coins.pending.iter().map(|c| (c, true))) {
+                // Confirmed: the API gives the height of the block it is in on the chain as it is now.
+                let status = chain.pq2_status(Some(c.height)).unwrap_or(Pq2Status::Pending);
+                list.push(Pq2CoinView { txid: c.txid.clone(), vout: c.vout, sats: c.sats, height: Some(c.height), status, spending });
+            }
+            for i in &coins.incoming {
+                list.push(Pq2CoinView { txid: i.txid.clone(), vout: i.vout, sats: i.sats, height: None, status: Pq2Status::Pending, spending: false });
+            }
+            let incoming: u64 = coins.incoming.iter().map(|i| i.sats).sum();
+            let complete = coins.incoming_complete && !coins.truncated;
+            view.complete &= complete;
+            view.spendable += sum(&coins.spendable);
+            view.pending += sum(&coins.pending);
+            view.incoming += incoming;
+            if !list.is_empty() {
+                view.addresses.push(Pq2AddressView {
+                    chain: c as u32,
+                    index,
+                    address,
+                    spendable: sum(&coins.spendable),
+                    pending: sum(&coins.pending),
+                    incoming,
+                    coins: list,
+                    complete,
+                });
+            }
+        }
+    }
+    // Nothing is spendable from pq2 while it may not be used (a reorganization below H4T + 6).
+    if !view.allowed {
+        view.spendable = 0;
+    }
+    let book = state.book().ok();
+    view.blocked = pq2_blocked(legacy, chain, book.as_ref(), RECEIVE_CHAIN);
+    view.change_blocked = book.as_ref().is_none_or(|b| !b.chains[CHANGE_CHAIN as usize].can_issue());
+    Some(view)
+}
+
 #[tauri::command]
 pub async fn overview(state: State<'_, AppState>) -> Res<Overview> {
+    overview_of(&state).await
+}
+
+async fn overview_of(state: &AppState) -> Res<Overview> {
     let (schnorr, mldsa44, mixed) = state.templates()?;
     let sources = state.sources.clone();
     let mut flags = Flags::default();
     let chain = match current_chain(&sources, &mut flags).await {
         Ok(c) => c,
-        Err(f) => return Ok(Overview { chain: None, problem: Some(f.code), accounts: vec![], fetched: now() }),
+        Err(f) => return Ok(Overview { chain: None, problem: Some(f.code), accounts: vec![], pq2: None, fetched: now() }),
     };
     let mut accounts = Vec::new();
     for t in [schnorr, mldsa44, mixed] {
@@ -739,7 +1026,118 @@ pub async fn overview(state: State<'_, AppState>) -> Res<Overview> {
             complete,
         });
     }
-    Ok(Overview { chain: Some(chain), problem: None, accounts, fetched: now() })
+    let pq2 = pq2_overview(state, &chain, &sources, &mut flags).await;
+    Ok(Overview { chain: Some(chain), problem: None, accounts, pq2, fetched: now() })
+}
+
+#[derive(Serialize)]
+pub struct NewAddress {
+    address: String,
+    index: u32,
+}
+
+/// Hands out the next pq2 receiving address: a fresh index, recorded as issued before it is shown, so that
+/// it is never handed out again. Only while pq2 may be used, after a restored wallet's scan, and below the
+/// gap limit.
+#[tauri::command]
+pub async fn pq2_new_address(state: State<'_, AppState>) -> Res<NewAddress> {
+    new_pq2_address(&state).await
+}
+
+async fn new_pq2_address(state: &AppState) -> Res<NewAddress> {
+    state.touch();
+    let legacy = guard(&state.session).as_ref().ok_or_else(|| Failure::new("locked"))?.pq2_wallet.is_none();
+    let chain = current_chain(&state.sources, &mut Flags::default()).await?;
+    if chain.lattice_height.is_none() {
+        return Err(Failure::new("address_not_ready"));
+    }
+    let book = if legacy { None } else { Some(state.book()?) };
+    if let Some(reason) = pq2_blocked(legacy, &chain, book.as_ref(), RECEIVE_CHAIN) {
+        return Err(Failure::new(&format!("pq2_{reason}")));
+    }
+    let index = book.as_ref().and_then(|b| b.chains[RECEIVE_CHAIN as usize].next()).ok_or_else(|| Failure::new("pq2_gap_limit"))?;
+    let template = state.pq2_template(RECEIVE_CHAIN, index)?;
+    let issued = state.edit_book(|b| !b.scan_needed && b.chains[RECEIVE_CHAIN as usize].issue(index, &template.address))?;
+    if !issued {
+        return Err(Failure::new("pq2_gap_limit"));
+    }
+    Ok(NewAddress { address: template.address, index })
+}
+
+#[derive(Serialize)]
+pub struct ScanResult {
+    /// Addresses with something paid to them, found on both chains.
+    found: usize,
+    scanned: [u32; 2],
+    issued: [u32; 2],
+}
+
+/// The recovery scan of both pq2 chains: each until 20 addresses in a row have nothing paid to them (a
+/// wider scan: at least 100 more than the last scan looked at). Every index up to the highest one seen
+/// plus 20 is then recorded as issued. An address whose outputs are all spent shows nothing in the API,
+/// so the scan cannot see it.
+#[tauri::command]
+pub async fn pq2_scan(state: State<'_, AppState>, wider: bool) -> Res<ScanResult> {
+    scan_pq2(&state, wider).await
+}
+
+async fn scan_pq2(state: &AppState, wider: bool) -> Res<ScanResult> {
+    state.touch();
+    let generation = state.generation();
+    let book = state.book()?;
+    let mut found = 0;
+    let mut flags = Flags::default();
+    for c in [RECEIVE_CHAIN, CHANGE_CHAIN] {
+        let start = if wider { book.chains[c as usize].scanned } else { 0 };
+        let minimum = if wider { WIDER_SCAN } else { GAP_LIMIT };
+        let mut at = start;
+        loop {
+            let done = state.edit_book(|b| b.chains[c as usize].scan_done(start, at, minimum))?;
+            if done || at >= crate::keys::MAX_PQ2_INDEX {
+                break;
+            }
+            if state.generation() != generation {
+                return Err(Failure::new("locked"));
+            }
+            let template = state.pq2_template(c, at)?;
+            let coins = flags.take(state.sources.coins(&template.address).await)?;
+            if anything_paid(&coins) {
+                found += 1;
+                state.edit_book(|b| b.chains[c as usize].mark_used(at, &template.address))?;
+            }
+            at += 1;
+        }
+        state.edit_book(|b| b.chains[c as usize].scanned_to(at))?;
+    }
+    let book = state.edit_book(|b| {
+        b.scan_needed = false;
+        b.clone()
+    })?;
+    Ok(ScanResult {
+        found,
+        scanned: [book.chains[0].scanned, book.chains[1].scanned],
+        issued: [book.chains[0].issued, book.chains[1].issued],
+    })
+}
+
+/// What the review shows of a payment from a pq2 address.
+#[derive(Serialize)]
+pub struct Pq2PlanView {
+    address: String,
+    /// The ML-DSA-44 leaf may be chosen: the node reports ML-DSA-44 checks in 0xe2 leaves still on.
+    mldsa44_allowed: bool,
+    /// Why not, when not: "disabled" (the node reports them off from the next block) or "unknown".
+    mldsa44_reason: Option<&'static str>,
+    /// Bytes of witness per input through the leaf taken (design section 8.1: 7,972 or 3,795).
+    witness_bytes: usize,
+    /// The address holds several coins, all spent together.
+    several_coins: bool,
+    /// The change address, on the change chain.
+    change_address: Option<String>,
+    /// The change chain is at the gap limit: the payment can only go without change.
+    change_blocked: bool,
+    /// This plan replaces a payment through the ML-DSA-44 leaf that can no longer go through.
+    rebuilt_from: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -771,6 +1169,8 @@ pub struct SendPlan {
     unrecorded: bool,
     one_source: bool,
     sources_disagree: bool,
+    /// A payment from a pq2 address.
+    pq2: Option<Pq2PlanView>,
 }
 
 fn account_for(template: Template, chain: &Chain, path: Option<Path>) -> Res<Account> {
@@ -781,18 +1181,53 @@ fn account_for(template: Template, chain: &Chain, path: Option<Path>) -> Res<Acc
     Account::new(template, path).ok_or_else(|| Failure::new("address_not_ready"))
 }
 
-/// Plans a send; nothing is signed until `confirm_send` with the plan's id.
+/// Plans a send; nothing is signed until `confirm_send` with the plan's id. From a pq2 address, `address`
+/// names it and `path` may ask for the ML-DSA-44 leaf; the SLH-DSA leaf is the default.
 #[tauri::command]
-pub async fn plan_send(state: State<'_, AppState>, from: Kind, to: String, amount: String) -> Res<SendPlan> {
+pub async fn plan_send(state: State<'_, AppState>, from: Kind, to: String, amount: String, address: Option<String>, path: Option<Path>) -> Res<SendPlan> {
+    if from == Kind::Pq2 {
+        let address = address.ok_or_else(|| Failure::new("address_not_ready"))?;
+        return plan_pq2_payment(&state, address, to, amount, path, None).await;
+    }
     plan_payment(&state, from, to, amount).await
+}
+
+/// The name a payment's account goes by in the record: its kind, or "pq2:" and its address.
+fn account_name(kind: Kind, pq2_address: Option<&str>) -> String {
+    match pq2_address {
+        Some(a) if kind == Kind::Pq2 => format!("pq2:{a}"),
+        _ => kind_name(kind),
+    }
+}
+
+/// The account a recorded payment was made from, as `account_name` names it.
+fn account_of(s: &Sent) -> String {
+    if s.from == "pq2" {
+        format!("pq2:{}", s.address)
+    } else {
+        s.from.clone()
+    }
+}
+
+fn parse_amount(amount: &str) -> Res<Amount> {
+    if amount.trim() == "all" {
+        Ok(Amount::All)
+    } else {
+        Ok(Amount::Sats(parse_coins(amount).ok_or_else(|| Failure::new("invalid_amount"))?))
+    }
+}
+
+/// The book's pq2 addresses this wallet may pay itself at: only those it handed out or saw used.
+fn own_pq2(state: &AppState) -> HashSet<String> {
+    state.book().map(|b| b.chains.iter().flat_map(|c| c.addresses.values().cloned()).collect()).unwrap_or_default()
 }
 
 async fn plan_payment(state: &AppState, from: Kind, to: String, amount: String) -> Res<SendPlan> {
     state.touch();
     let template = guard(&state.session).as_ref().ok_or_else(|| Failure::new("locked"))?.template(from)?;
-    let own: Vec<Template> = { let (a, b, c) = state.templates()?; vec![a, b, c] };
+    let own = state.own_templates()?;
     let destination = parse_destination(&to)?;
-    let amount = if amount.trim() == "all" { Amount::All } else { Amount::Sats(parse_coins(&amount).ok_or_else(|| Failure::new("invalid_amount"))?) };
+    let amount = parse_amount(&amount)?;
     let sources = state.sources.clone();
     let mut flags = Flags::default();
     let chain = current_chain(&sources, &mut flags).await?;
@@ -800,7 +1235,10 @@ async fn plan_payment(state: &AppState, from: Kind, to: String, amount: String) 
     if own.iter().any(|t| t.address == destination.address && !shown(t.kind, &chain)) {
         return Err(Failure::new("destination_not_ready"));
     }
+    // Paying one of its own pq2 addresses creates a pq2 output: lock time H4T.
+    let creates_pq2 = own_pq2(state).contains(&destination.address);
     let account = account_for(template, &chain, None)?;
+    let view_from_address = account.template.address.clone();
     let coins = flags.take(sources.coins(&account.template.address).await)?;
     // The wallet's own payments that are, or may be, on their way, looked up again first.
     let at = now();
@@ -814,7 +1252,7 @@ async fn plan_payment(state: &AppState, from: Kind, to: String, amount: String) 
     let pending = pending_everywhere(&sources, &coins, &own, &account.template.address, &mut flags).await?;
     let earlier = earlier_payments(&sent, &kind_name(from), &coins.spendable, &pending);
     let went_out = earlier.spent || surfaced(&sent);
-    let plan = wallet::plan_spend(&account, &earlier.usable, &earlier.required, &destination, amount, chain.lock_time())?;
+    let plan = wallet::plan_spend(&account, &earlier.usable, &earlier.required, &destination, amount, chain.lock_time_for(creates_pq2))?;
     let mut id = [0u8; 16];
     getrandom::fill(&mut id).map_err(|_| Failure::new("internal"))?;
     let view = SendPlan {
@@ -838,11 +1276,156 @@ async fn plan_payment(state: &AppState, from: Kind, to: String, amount: String) 
         unrecorded: earlier.unrecorded,
         one_source: flags.one_source,
         sources_disagree: flags.disagree,
+        pq2: None,
     };
     let caution = went_out || earlier.elsewhere || earlier.unrecorded;
-    *guard(&state.pending) =
-        Some(PendingSend { id: view.id.clone(), created: Instant::now(), kind: from, path: account.path, destination, plan, caution, sources: flags });
+    *guard(&state.pending) = Some(PendingSend {
+        id: view.id.clone(), created: Instant::now(), kind: from, path: account.path, destination, plan, caution, sources: flags,
+        creates_pq2, pq2: None, plan_address: view_from_address,
+    });
     Ok(view)
+}
+
+/// Plans a payment from one pq2 address: all of its coins together, through the SLH-DSA leaf unless the
+/// user asks for the ML-DSA-44 leaf and the node reports it still works, the change to a fresh address on
+/// the change chain (or no change, at its gap limit), nLockTime H4T. `rebuilt_from`: the payment through
+/// the ML-DSA-44 leaf this one replaces.
+async fn plan_pq2_payment(state: &AppState, address: String, to: String, amount: String, wanted: Option<Path>, rebuilt_from: Option<String>) -> Res<SendPlan> {
+    state.touch();
+    let book = state.book()?;
+    let (chain_index, index) = book.find(&address).ok_or_else(|| Failure::new("address_not_ready"))?;
+    let destination = parse_destination(&to)?;
+    let amount = parse_amount(&amount)?;
+    let sources = state.sources.clone();
+    let mut flags = Flags::default();
+    let chain = current_chain(&sources, &mut flags).await?;
+    if !chain.pq2_allowed {
+        return Err(Failure::new("address_not_ready"));
+    }
+    let own = state.own_templates()?;
+    if own.iter().any(|t| t.address == destination.address && !shown(t.kind, &chain)) {
+        return Err(Failure::new("destination_not_ready"));
+    }
+    let template = state.pq2_template(chain_index, index)?;
+    let path = chain.pq2_path(wanted);
+    let account = Account::new(template, path).ok_or_else(|| Failure::new("address_not_ready"))?;
+    let coins = flags.take(sources.coins(&account.template.address).await)?;
+    note_used(state, chain_index, index, &address, &coins);
+    let at = now();
+    let sent = refresh_sent(state, |s| {
+        matches!(s.status.as_str(), "mempool" | "unknown") || (s.status == "confirmed" && !s.proven()) || (refused(s) && recent(s, at))
+    }, &mut flags).await;
+    if sent.iter().any(|s| s.status == "submitting") {
+        return Err(Failure::new("sending"));
+    }
+    let pending = pending_everywhere(&sources, &coins, &own, &account.template.address, &mut flags).await?;
+    let name = account_name(Kind::Pq2, Some(&address));
+    let earlier = earlier_payments(&sent, &name, &coins.spendable, &pending);
+    let went_out = earlier.spent || surfaced(&sent);
+    // Several coins on one address go together: one spend reveals the leaf all of them are locked to.
+    let required = earlier.usable.clone();
+    let change_index = state.book()?.chains[CHANGE_CHAIN as usize].next();
+    let change = match change_index {
+        Some(i) => Some(state.pq2_template(CHANGE_CHAIN, i)?),
+        None => None,
+    };
+    let plan = wallet::plan_spend_to(&account, &earlier.usable, &required, &destination, amount, chain.lock_time_for(true), change.as_ref().map(|t| &t.script_pubkey))
+        .map_err(|e| if e == PlanError::NeedsChange { Failure::new("pq2_change_limit") } else { e.into() })?;
+    let change_used = plan.change > 0;
+    let mut id = [0u8; 16];
+    getrandom::fill(&mut id).map_err(|_| Failure::new("internal"))?;
+    let view = SendPlan {
+        id: hex::encode(id),
+        from: Kind::Pq2,
+        signature: account.path,
+        to: destination.address.clone(),
+        send: plan.send,
+        fee: plan.fee,
+        change: plan.change,
+        inputs: plan.coins.len(),
+        vsize: plan.sizes.vsize,
+        size: plan.sizes.size,
+        fee_rate: FEE_RATE,
+        left: plan.left,
+        truncated: coins.truncated,
+        to_self: own.iter().any(|t| t.address == destination.address),
+        replaces: earlier.replaces.len(),
+        went_out,
+        unclear_elsewhere: earlier.elsewhere,
+        unrecorded: earlier.unrecorded,
+        one_source: flags.one_source,
+        sources_disagree: flags.disagree,
+        pq2: Some(Pq2PlanView {
+            address: address.clone(),
+            mldsa44_allowed: chain.pq2_mldsa44_allowed(),
+            mldsa44_reason: match chain.mldsa_disabled {
+                Some(false) => None,
+                Some(true) => Some("disabled"),
+                None => Some("unknown"),
+            },
+            witness_bytes: witness_bytes(path),
+            several_coins: plan.coins.len() > 1,
+            change_address: change.filter(|_| change_used).map(|t| t.address),
+            change_blocked: change_index.is_none(),
+            rebuilt_from,
+        }),
+    };
+    let caution = went_out || earlier.elsewhere || earlier.unrecorded;
+    *guard(&state.pending) = Some(PendingSend {
+        id: view.id.clone(), created: Instant::now(), kind: Kind::Pq2, path: account.path, destination, plan, caution, sources: flags,
+        creates_pq2: true,
+        pq2: Some(Pq2Pending { chain: chain_index, index, change: change_index.filter(|_| change_used), wanted }),
+        plan_address: address,
+    });
+    Ok(view)
+}
+
+/// The serialized witness of one input through a leaf: count, then each element with its length.
+fn witness_bytes(path: Path) -> usize {
+    let element = |n: usize| if n < 0xfd { 1 + n } else { 3 + n };
+    let (chunks, leaf): (&[usize], usize) = match path {
+        Path::Schnorr => (&[64], 34),
+        Path::Mldsa44 => (&MLDSA44_SIGNATURE_CHUNKS, 1322),
+        Path::Slhdsa128s => (&SLHDSA128S_SIGNATURE_CHUNKS, 34),
+    };
+    1 + chunks.iter().map(|&n| element(n)).sum::<usize>() + element(leaf) + element(33)
+}
+
+/// A rebuild through the SLH-DSA leaf of a recorded pq2 payment through the ML-DSA-44 leaf that can no
+/// longer go through: the node reports ML-DSA-44 checks in 0xe2 leaves off (or that is unknown), and the
+/// payment was refused or has left the mempool. The same coins (all of the address's), the same
+/// destination and amount (everything, when the higher fee no longer leaves the amount), a new fee and a
+/// new signature; it goes through the review and the system dialog like any payment, and once it is
+/// proven the old one is marked replaced.
+#[tauri::command]
+pub async fn plan_rebuild(state: State<'_, AppState>, txid: String) -> Res<SendPlan> {
+    rebuild_plan(&state, &txid).await
+}
+
+async fn rebuild_plan(state: &AppState, txid: &str) -> Res<SendPlan> {
+    let sent: Vec<Sent> = store::load(&state.sent_path());
+    let old = sent.iter().find(|s| s.txid == txid).cloned().ok_or_else(|| Failure::new("no_plan"))?;
+    let chain = current_chain(&state.sources, &mut Flags::default()).await?;
+    if !needs_rebuild(&old, &chain) {
+        return Err(Failure::new("no_rebuild"));
+    }
+    let amount = format_coins(old.send);
+    match plan_pq2_payment(state, old.address.clone(), old.to.clone(), amount, Some(Path::Slhdsa128s), Some(old.txid.clone())).await {
+        Err(f) if f.code == "insufficient" || f.code == "pq2_change_limit" => {
+            plan_pq2_payment(state, old.address.clone(), old.to.clone(), "all".into(), Some(Path::Slhdsa128s), Some(old.txid.clone())).await
+        }
+        other => other,
+    }
+}
+
+/// A recorded pq2 payment through the ML-DSA-44 leaf that cannot go through now: refused, or no longer
+/// in the mempool, while the node reports ML-DSA-44 checks in 0xe2 leaves off or that state is unknown.
+fn needs_rebuild(s: &Sent, chain: &Chain) -> bool {
+    s.from == "pq2" && s.signature == "mldsa44" && matches!(s.status.as_str(), "unknown" | "rejected" | "failed") && !chain.pq2_mldsa44_allowed()
+}
+
+fn format_coins(sats: u64) -> String {
+    format!("{}.{:08}", sats / 100_000_000, sats % 100_000_000)
 }
 
 #[derive(Serialize)]
@@ -850,6 +1433,10 @@ pub struct SendResult {
     result: BroadcastResult,
     txid: String,
     sign_ms: f64,
+    /// The payment went through the ML-DSA-44 leaf and the node now reports that leaf disabled (or the
+    /// state unknown): rebuilt through the SLH-DSA leaf, this plan waits for review and confirmation. When
+    /// the state flipped before broadcasting, the old transaction was dropped unsent (`txid` is empty).
+    rebuilt: Option<SendPlan>,
 }
 
 /// Signs and broadcasts the plan the interface showed, if its coins are still unspent, the chain's rules
@@ -857,15 +1444,27 @@ pub struct SendResult {
 /// recorded before the API sees it, so that no answer of the API can make the wallet forget it.
 #[tauri::command]
 pub async fn confirm_send(app: AppHandle, state: State<'_, AppState>, id: String, locale: Option<String>) -> Res<SendResult> {
+    send_plan(&state, &id, locale.as_deref(), |dialog| crate::confirm::ask(&app, dialog)).await
+}
+
+async fn send_plan<F: Future<Output = bool>>(
+    state: &AppState,
+    id: &str,
+    locale: Option<&str>,
+    ask: impl FnOnce(crate::confirm::Dialog) -> F,
+) -> Res<SendResult> {
     state.touch();
     let generation = state.generation();
     let mut pending = guard(&state.pending).take().ok_or_else(|| Failure::new("no_plan"))?;
     if pending.id != id || pending.created.elapsed() > PLAN_LIFETIME {
         return Err(Failure::new("no_plan"));
     }
-    let (account, coins, spending) = recheck_payment(&state, &mut pending).await?;
+    let (account, coins, spending) = match recheck_payment(state, &mut pending).await {
+        Err(f) if f.code == "mldsa44_disabled" => return rebuild_unsent(state, &pending).await,
+        other => other?,
+    };
     let dialog = crate::confirm::payment(
-        state.dialog_locale(locale.as_deref()),
+        state.dialog_locale(locale),
         pending.plan.send,
         &pending.destination.address,
         pending.plan.fee,
@@ -873,7 +1472,7 @@ pub async fn confirm_send(app: AppHandle, state: State<'_, AppState>, id: String
         pending.caution,
         pending.sources,
     );
-    if !crate::confirm::ask(&app, dialog).await {
+    if !ask(dialog).await {
         return Err(Failure::new("cancelled"));
     }
     if state.generation() != generation {
@@ -889,13 +1488,32 @@ pub async fn confirm_send(app: AppHandle, state: State<'_, AppState>, id: String
         if state.generation() != generation {
             return Err(Failure::new("locked"));
         }
-        wallet::sign_plan(&pending.plan, &account, &session.keys)?
+        match pending.pq2 {
+            Some(p) => wallet::sign_pq2_plan(&pending.plan, &account, &session.keys.pq2(p.chain, p.index)?)?,
+            None => wallet::sign_plan(&pending.plan, &account, &session.keys)?,
+        }
     };
     let sign_ms = started.elapsed().as_secs_f64() * 1000.0;
+    // Through the ML-DSA-44 leaf, the node's state is read again just before broadcasting: once ML-DSA-44
+    // checks in 0xe2 leaves are off (or that is unknown) the transaction cannot go through. It is dropped
+    // unsent and rebuilt through the SLH-DSA leaf.
+    if pending.pq2.is_some() && pending.path == Path::Mldsa44 {
+        let still = current_chain(&state.sources, &mut Flags::default()).await.is_ok_and(|c| c.pq2_allowed && c.pq2_mldsa44_allowed());
+        if !still {
+            return rebuild_unsent(state, &pending).await;
+        }
+    }
+    // The change address is handed out before the payment is recorded: it is never given to another.
+    if let Some(Pq2Pending { change: Some(index), .. }) = pending.pq2 {
+        let address = state.pq2_template(CHANGE_CHAIN, index)?.address;
+        if !state.edit_book(|b| b.chains[CHANGE_CHAIN as usize].issue(index, &address))? {
+            return Err(Failure::new("coins_changed"));
+        }
+    }
     let record = signed_record(&pending, &signed, sign_ms);
     // Recorded before the API sees it. Not sent at all when that fails, when the wallet was locked or
     // removed meanwhile, or when another of its payments on the way spends one of the same coins.
-    record_payment(&state, &pending, &coins, &spending, generation, record)?;
+    record_payment(state, &pending, &coins, &spending, generation, record)?;
     let result = state.sources.broadcast(&signed.hex, &signed.txid).await.value;
     // What the API answered; a refusal is kept too, and looked up again later (activity), because only
     // the network can say whether the transaction went out.
@@ -905,7 +1523,7 @@ pub async fn confirm_send(app: AppHandle, state: State<'_, AppState>, id: String
         BroadcastResult::Rejected { reason } => ("rejected", reason.clone()),
         BroadcastResult::Failed { error } => ("failed", error.clone()),
     };
-    let _ = edit_sent(&state, |sent| {
+    let _ = edit_sent(state, |sent| {
         if let Some(s) = sent.iter_mut().find(|s| s.txid == signed.txid) {
             s.status = status.into();
             s.reason = reason;
@@ -913,7 +1531,35 @@ pub async fn confirm_send(app: AppHandle, state: State<'_, AppState>, id: String
         }
         mark_replaced(sent);
     });
-    Ok(SendResult { result, txid: signed.txid, sign_ms })
+    // A refused payment through the ML-DSA-44 leaf: whether to rebuild it is decided from the node's state,
+    // not from the words of the refusal.
+    let mut rebuilt = None;
+    if pending.pq2.is_some() && pending.path == Path::Mldsa44 && matches!(result, BroadcastResult::Rejected { .. } | BroadcastResult::Failed { .. }) {
+        let recorded: Vec<Sent> = store::load(&state.sent_path());
+        let chain = current_chain(&state.sources, &mut Flags::default()).await;
+        let flipped = match &chain {
+            Ok(c) => recorded.iter().any(|s| s.txid == signed.txid && needs_rebuild(s, c)),
+            // No answer: unknown, and unknown means the SLH-DSA leaf.
+            Err(_) => true,
+        };
+        if flipped {
+            rebuilt = rebuild_plan(state, &signed.txid).await.ok();
+        }
+    }
+    Ok(SendResult { result, txid: signed.txid, sign_ms, rebuilt })
+}
+
+/// The payment through the ML-DSA-44 leaf was not recorded or sent; the same payment through the SLH-DSA
+/// leaf, planned anew, waits for review.
+async fn rebuild_unsent(state: &AppState, pending: &PendingSend) -> Res<SendResult> {
+    let p = pending.pq2.ok_or_else(|| Failure::new("chain_changed"))?;
+    let address = state.pq2_template(p.chain, p.index)?.address;
+    let to = pending.destination.address.clone();
+    let mut plan = plan_pq2_payment(state, address.clone(), to.clone(), format_coins(pending.plan.send), Some(Path::Slhdsa128s), Some(String::new())).await;
+    if matches!(&plan, Err(f) if f.code == "insufficient" || f.code == "pq2_change_limit") {
+        plan = plan_pq2_payment(state, address, to, "all".into(), Some(Path::Slhdsa128s), Some(String::new())).await;
+    }
+    Ok(SendResult { result: BroadcastResult::Unknown, txid: String::new(), sign_ms: 0.0, rebuilt: Some(plan?) })
 }
 
 fn signed_record(pending: &PendingSend, signed: &wallet::Signed, sign_ms: f64) -> Sent {
@@ -921,13 +1567,17 @@ fn signed_record(pending: &PendingSend, signed: &wallet::Signed, sign_ms: f64) -
         txid: signed.txid.clone(),
         created: now(),
         from: kind_name(pending.kind),
+        address: match pending.pq2 {
+            Some(_) => pending.plan_address.clone(),
+            None => String::new(),
+        },
         to: pending.destination.address.clone(),
         send: pending.plan.send,
         fee: pending.plan.fee,
         change: pending.plan.change,
         vsize: signed.sizes.vsize,
         size: signed.sizes.size,
-        signature: if pending.path == Path::Schnorr { "schnorr".into() } else { "mldsa44".into() },
+        signature: kind_name_path(pending.path),
         inputs: pending.plan.coins.len(),
         sign_ms,
         status: "submitting".into(),
@@ -940,12 +1590,44 @@ fn signed_record(pending: &PendingSend, signed: &wallet::Signed, sign_ms: f64) -
     }
 }
 
+/// A leaf's signature as the record names it.
+fn kind_name_path(path: Path) -> String {
+    serde_json::to_value(path).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_default()
+}
+
 async fn recheck_payment(state: &AppState, pending: &mut PendingSend) -> Res<(Account, Coins, PendingCoins)> {
     let mut flags = pending.sources;
     let chain = current_chain(&state.sources, &mut flags).await?;
-    let template = guard(&state.session).as_ref().ok_or_else(|| Failure::new("locked"))?.template(pending.kind)?;
-    let account = account_for(template, &chain, None)?;
-    if account.path != pending.path || chain.lock_time() != pending.plan.lock_time {
+    let account = match pending.pq2 {
+        Some(p) => {
+            if !chain.pq2_allowed {
+                return Err(Failure::new("chain_changed"));
+            }
+            // Through the ML-DSA-44 leaf only while the node reports it on; otherwise rebuilt (send_plan).
+            if pending.path == Path::Mldsa44 && !chain.pq2_mldsa44_allowed() {
+                return Err(Failure::new("mldsa44_disabled"));
+            }
+            if chain.pq2_path(p.wanted) != pending.path {
+                return Err(Failure::new("chain_changed"));
+            }
+            // The change address is still the next one to hand out.
+            if let Some(index) = p.change {
+                if state.book()?.chains[CHANGE_CHAIN as usize].next() != Some(index) {
+                    return Err(Failure::new("coins_changed"));
+                }
+            }
+            Account::new(state.pq2_template(p.chain, p.index)?, pending.path).ok_or_else(|| Failure::new("address_not_ready"))?
+        }
+        None => {
+            let template = guard(&state.session).as_ref().ok_or_else(|| Failure::new("locked"))?.template(pending.kind)?;
+            let account = account_for(template, &chain, None)?;
+            if account.path != pending.path {
+                return Err(Failure::new("chain_changed"));
+            }
+            account
+        }
+    };
+    if chain.lock_time_for(pending.creates_pq2) != pending.plan.lock_time {
         return Err(Failure::new("chain_changed"));
     }
     let coins = flags.take(state.sources.coins(&account.template.address).await)?;
@@ -953,20 +1635,35 @@ async fn recheck_payment(state: &AppState, pending: &mut PendingSend) -> Res<(Ac
     if !pending.plan.coins.iter().all(|c| unspent.get(&c.outpoint()) == Some(&c.sats)) {
         return Err(Failure::new("coins_changed"));
     }
+    // From a pq2 address, every coin of it goes: one that came since the review means a new review.
+    if pending.pq2.is_some() && coins.spendable.len() != pending.plan.coins.len() && pending.plan.left == 0 {
+        let planned: HashSet<String> = pending.plan.coins.iter().map(Coin::outpoint).collect();
+        if coins.spendable.iter().any(|c| !planned.contains(&c.outpoint())) {
+            return Err(Failure::new("coins_changed"));
+        }
+    }
     let at = now();
     let sent = refresh_sent(state, |s| {
         matches!(s.status.as_str(), "mempool" | "unknown") || (s.status == "confirmed" && !s.proven()) || (refused(s) && recent(s, at))
     }, &mut flags).await;
-    let own: Vec<Template> = { let (a, b, c) = state.templates()?; vec![a, b, c] };
+    let own = state.own_templates()?;
     let spending = pending_everywhere(&state.sources, &coins, &own, &account.template.address, &mut flags).await?;
-    let earlier = earlier_payments(&sent, &kind_name(pending.kind), &coins.spendable, &spending);
+    let earlier = earlier_payments(&sent, &pending_account(pending), &coins.spendable, &spending);
     pending.sources = flags;
     pending.caution = earlier.spent || earlier.elsewhere || earlier.unrecorded || surfaced(&sent);
     Ok((account, coins, spending))
 }
 
+/// The account a pending payment spends from, as the record names it.
+fn pending_account(pending: &PendingSend) -> String {
+    match pending.pq2 {
+        Some(_) => account_name(Kind::Pq2, Some(&pending.plan_address)),
+        None => kind_name(pending.kind),
+    }
+}
+
 fn record_payment(state: &AppState, pending: &PendingSend, coins: &Coins, spending: &PendingCoins, generation: u64, record: Sent) -> Res<()> {
-    let account_name = kind_name(pending.kind);
+    let account_name = pending_account(pending);
     edit_sent(state, |sent| {
         if state.generation() != generation {
             return Err(Failure::new("locked"));
@@ -1230,7 +1927,7 @@ fn earlier_payments(sent: &[Sent], account: &str, spendable: &[Coin], pending: &
             // A proven payment spends one of its coins: it cannot go through.
             continue;
         }
-        if s.from != account || s.outpoints.is_empty() {
+        if account_of(s) != account || s.outpoints.is_empty() {
             e.elsewhere = true;
             continue;
         }
@@ -1403,6 +2100,7 @@ async fn run_drill<F: std::future::Future<Output = bool>>(
         id: String::new(), created: Instant::now(), kind: Kind::Mixed, path, destination, plan,
         // The drill dialog does not authorize paying in addition to an earlier uncertain payment.
         caution: false, sources: flags,
+        creates_pq2: false, pq2: None, plan_address: account.template.address.clone(),
     };
     if state.generation() != generation {
         return Err(Failure::new("locked"));
@@ -1591,7 +2289,7 @@ mod tests {
                 tauri::async_runtime::block_on(reveal_secret(&state, password.into(), Some("en"), |_| std::future::ready(confirmed)))
             };
             assert_eq!(reveal("correct horse", true).unwrap_err().code, "locked");
-            state.open_session(&secret, state.generation()).unwrap();
+            state.open_session(&secret, state.generation(), false).unwrap();
             let wrong = tauri::async_runtime::block_on(reveal_secret(&state, "wrong password".into(), Some("en"), |_| async {
                 panic!("a wrong password must not open a dialog")
             }));
@@ -1601,7 +2299,7 @@ mod tests {
             let locked = tauri::async_runtime::block_on(reveal_secret(&state, "correct horse".into(), Some("en"), |_| {
                 // Even unlocking again while the dialog is open cannot revive its earlier permission.
                 state.lock();
-                state.open_session(&secret, state.generation()).unwrap();
+                state.open_session(&secret, state.generation(), false).unwrap();
                 std::future::ready(true)
             }));
             assert_eq!(locked.unwrap_err().code, "locked");
@@ -1623,7 +2321,7 @@ mod tests {
             panic!("a locked wallet must not open a dialog")
         }));
         assert_eq!(locked.unwrap_err().code, "locked");
-        state.open_session(&secret, state.generation()).unwrap();
+        state.open_session(&secret, state.generation(), false).unwrap();
         let wrong = tauri::async_runtime::block_on(remove_wallet(&state, "wrong password".into(), Some("en"), |_| async {
             panic!("a wrong password must not open a dialog")
         }));
@@ -1634,7 +2332,7 @@ mod tests {
         assert_eq!(std::fs::read(state.sent_path()).unwrap(), b"[]");
         let relocked = tauri::async_runtime::block_on(remove_wallet(&state, "correct horse".into(), Some("en"), |_| {
             state.lock();
-            state.open_session(&secret, state.generation()).unwrap();
+            state.open_session(&secret, state.generation(), false).unwrap();
             std::future::ready(true)
         }));
         assert_eq!(relocked.unwrap_err().code, "locked");
@@ -1661,7 +2359,7 @@ mod tests {
             panic!("a locked wallet must not open a dialog")
         }));
         assert_eq!(locked.unwrap_err().code, "locked");
-        state.open_session(&secret, state.generation()).unwrap();
+        state.open_session(&secret, state.generation(), false).unwrap();
         let wrong = tauri::async_runtime::block_on(change_wallet_password(&state, "wrong password".into(), "battery staple".into(), Some("en"), |_| async {
             panic!("a wrong password must not open a dialog")
         }));
@@ -1670,7 +2368,7 @@ mod tests {
         assert_eq!(std::fs::read(state.vault_path()).unwrap(), original);
         let relocked = tauri::async_runtime::block_on(change_wallet_password(&state, "correct horse".into(), "battery staple".into(), Some("en"), |_| {
             state.lock();
-            state.open_session(&secret, state.generation()).unwrap();
+            state.open_session(&secret, state.generation(), false).unwrap();
             std::future::ready(true)
         }));
         assert_eq!(relocked.unwrap_err().code, "locked");
@@ -1704,7 +2402,7 @@ mod tests {
                 Secret::new_bip39().unwrap()
             };
             vault::create(&state.vault_path(), "correct horse", &secret).unwrap();
-            state.open_session(&secret, state.generation()).unwrap();
+            state.open_session(&secret, state.generation(), false).unwrap();
             std::fs::write(state.sent_path(), b"[]").unwrap();
             let original = std::fs::read(state.vault_path()).unwrap();
             let (recovery_answer, recovery_wait) = oneshot::channel();
@@ -1733,7 +2431,7 @@ mod tests {
                 assert!(wakes.0.load(Ordering::SeqCst) > 0, "locking must wake each request without a dialog answer");
             }
             // Reopening the wallet does not revive any of the earlier requests.
-            state.open_session(&secret, state.generation()).unwrap();
+            state.open_session(&secret, state.generation(), false).unwrap();
             for result in [
                 recovery.as_mut().poll(&mut Context::from_waker(&recovery_waker)).map(|r| r.map(|_| ())),
                 delete.as_mut().poll(&mut Context::from_waker(&delete_waker)),
@@ -1764,7 +2462,7 @@ mod tests {
                 std::fs::remove_file(state.sent_path()).unwrap();
             }
             let original = std::fs::read(state.vault_path()).unwrap();
-            state.open_session(&secret, state.generation()).unwrap();
+            state.open_session(&secret, state.generation(), false).unwrap();
             let unlocked = tauri::async_runtime::block_on(forget_locked_wallet(&state, Some("en"), |_| async {
                 panic!("an unlocked wallet must not open a removal dialog")
             }));
@@ -1814,13 +2512,13 @@ mod tests {
                 assert!(request.as_mut().poll(&mut Context::from_waker(waker)).is_pending());
             }
             if scenario == "idle" {
-                state.open_session(&secret, state.generation()).unwrap();
+                state.open_session(&secret, state.generation(), false).unwrap();
             }
             if scenario == "answer" {
                 answers.remove(0).send(true).unwrap();
             }
             state.lock();
-            state.open_session(&secret, state.generation()).unwrap();
+            state.open_session(&secret, state.generation(), false).unwrap();
             for ((request, waker), wakes) in requests.iter_mut().zip(&wakers).zip(&wakes) {
                 assert!(wakes.0.load(Ordering::SeqCst) > 0, "locking must wake every forget request");
                 match request.as_mut().poll(&mut Context::from_waker(waker)) {
@@ -1847,7 +2545,7 @@ mod tests {
             let original = std::fs::read(state.vault_path()).unwrap();
             let result = tauri::async_runtime::block_on(forget_locked_wallet(&state, Some("en"), |_| async {
                 if change != "lock" {
-                    state.open_session(&secret, state.generation()).unwrap();
+                    state.open_session(&secret, state.generation(), false).unwrap();
                 }
                 if change != "unlock" {
                     state.lock();
@@ -1885,7 +2583,7 @@ mod tests {
                 if lock_again {
                     state.lock();
                 } else {
-                    state.open_session(&secret, state.generation()).unwrap();
+                    state.open_session(&secret, state.generation(), false).unwrap();
                 }
                 drop(vault_ops);
                 assert_eq!(request.join().unwrap().unwrap_err().code, if lock_again { "cancelled" } else { "unlocked" });
@@ -1914,7 +2612,7 @@ mod tests {
                 }
             };
             if !forgotten {
-                state.open_session(&secret, state.generation()).unwrap();
+                state.open_session(&secret, state.generation(), false).unwrap();
             }
             let generation = state.generation();
             assert_eq!(remove().unwrap_err().code, "io");
@@ -1999,7 +2697,7 @@ mod tests {
         let state = test_state("remove-password-changed");
         let secret = Secret::new_bip39().unwrap();
         vault::create(&state.vault_path(), "correct horse", &secret).unwrap();
-        state.open_session(&secret, state.generation()).unwrap();
+        state.open_session(&secret, state.generation(), false).unwrap();
         std::fs::write(state.sent_path(), b"[]").unwrap();
         let result = tauri::async_runtime::block_on(remove_wallet(&state, "correct horse".into(), Some("en"), |_| {
             vault::change_password(&state.vault_path(), "correct horse", "battery staple").unwrap();
@@ -2034,7 +2732,7 @@ mod tests {
                 let result = if forgotten {
                     tauri::async_runtime::block_on(forget_locked_wallet(&state, Some("en"), |_| std::future::ready(true)))
                 } else {
-                    state.open_session(&secret, state.generation()).unwrap();
+                    state.open_session(&secret, state.generation(), false).unwrap();
                     tauri::async_runtime::block_on(remove_wallet(&state, "correct horse".into(), Some("en"), |_| std::future::ready(true)))
                 };
                 assert_eq!(result.unwrap_err().code, "io");
@@ -2154,7 +2852,7 @@ mod tests {
             for outcome in ["allowed", "rejected", "failed", "cancelled", "locked", "conflict", "mempool", "submitting", "io"] {
                 let mut state = test_state("drill-record");
                 let secret = Secret::new_bip39().unwrap();
-                state.open_session(&secret, state.generation()).unwrap();
+                state.open_session(&secret, state.generation(), false).unwrap();
                 let destination = state.templates().unwrap().2.address;
                 let replies = vec![
                     response(200, &chain_state(40_000, true).to_string()),
@@ -2274,6 +2972,7 @@ mod tests {
             outpoints: vec![format!("{}:0", txid.to_string().repeat(64))],
             doubted: false,
             lookup_mark: 0,
+            address: String::new(),
         }
     }
 
@@ -2425,6 +3124,7 @@ mod tests {
         let mut pending = PendingSend {
             id: "retry".into(), created: Instant::now(), kind: Kind::Schnorr, path: Path::Schnorr,
             destination, plan, caution: true, sources: Flags::default(),
+            creates_pq2: false, pq2: None, plan_address: account.template.address.clone(),
         };
         let record_for = |p: &PendingSend| Sent {
             outpoints: p.plan.coins.iter().map(Coin::outpoint).collect(),
@@ -2593,7 +3293,7 @@ mod tests {
 
         for status in ["unknown", "rejected"] {
             let mut state = test_state("unrecorded-retry");
-            state.open_session(&Secret::new_bip39().unwrap(), state.generation()).unwrap();
+            state.open_session(&Secret::new_bip39().unwrap(), state.generation(), true).unwrap();
             store::save(&state.sent_path(), &vec![paid('1', status, "schnorr", &['a', 'b'])]).unwrap();
             let mut a = utxo('a', 0, 50_000);
             a["spent_in_mempool"] = serde_json::json!(true);
@@ -2647,7 +3347,7 @@ mod tests {
         for unnamed in [false, true] {
             for reverse in [false, true] {
                 let mut state = test_state("covered-pending-spender");
-                state.open_session(&Secret::new_bip39().unwrap(), state.generation()).unwrap();
+                state.open_session(&Secret::new_bip39().unwrap(), state.generation(), true).unwrap();
                 // P proves that a is spent, replacing R on {a, d}; B may still spend d.
                 let sent = vec![
                     Sent { confirmations: REQUIRED_BLOCKS, proof_verified: true, ..paid('1', "confirmed", "schnorr", &['a']) },
@@ -2734,7 +3434,7 @@ mod tests {
         use crate::sources::tests::coins;
 
         let state = test_state("pending-spenders");
-        state.open_session(&Secret::new_bip39().unwrap(), state.generation()).unwrap();
+        state.open_session(&Secret::new_bip39().unwrap(), state.generation(), true).unwrap();
         let (a, b, c) = state.templates().unwrap();
         let own = [a, b, c];
         let replies: Vec<_> = [('b', '2'), ('c', '3')].iter().map(|&(coin, txid)| {
@@ -2798,7 +3498,7 @@ mod tests {
 
         for unnamed in [false, true] {
             let mut state = test_state("proven-pending-input");
-            state.open_session(&Secret::new_bip39().unwrap(), state.generation()).unwrap();
+            state.open_session(&Secret::new_bip39().unwrap(), state.generation(), true).unwrap();
             store::save(&state.sent_path(), &vec![
                 Sent { confirmations: REQUIRED_BLOCKS, proof_verified: true, ..paid('1', "confirmed", "mixed", &['a']) },
                 paid('2', "replaced", "mixed", &['a', 'd']),
@@ -2848,7 +3548,7 @@ mod tests {
         use crate::sources::tests::coins;
 
         let mut state = test_state("legacy-doubt");
-        state.open_session(&Secret::new_bip39().unwrap(), state.generation()).unwrap();
+        state.open_session(&Secret::new_bip39().unwrap(), state.generation(), true).unwrap();
         let mut old = serde_json::to_value(vec![paid('1', "unknown", "schnorr", &['a']), paid('2', "rejected", "schnorr", &['b'])]).unwrap();
         for s in old.as_array_mut().unwrap() { s.as_object_mut().unwrap().remove("doubted"); }
         store::write_atomic(&state.sent_path(), &serde_json::to_vec(&old).unwrap()).unwrap();
@@ -3338,7 +4038,7 @@ mod tests {
         use crate::sources::tests::coins;
 
         let mut state = test_state("one-source-note");
-        state.open_session(&Secret::new_bip39().unwrap(), state.generation()).unwrap();
+        state.open_session(&Secret::new_bip39().unwrap(), state.generation(), true).unwrap();
         let mut replies = Vec::new();
         for _ in 0..2 {
             replies.extend([
@@ -3378,7 +4078,7 @@ mod tests {
         use crate::sources::tests::coins;
 
         let mut state = test_state("risk-ended");
-        state.open_session(&Secret::new_bip39().unwrap(), state.generation()).unwrap();
+        state.open_session(&Secret::new_bip39().unwrap(), state.generation(), true).unwrap();
         store::save(&state.sent_path(), &vec![paid('1', "unknown", "schnorr", &['a'])]).unwrap();
         let mut replies = Vec::new();
         for round in 0..2 {
@@ -3421,7 +4121,7 @@ mod tests {
 
         for during_dialog in [false, true] {
             let mut state = test_state("risk-appeared");
-            state.open_session(&Secret::new_bip39().unwrap(), state.generation()).unwrap();
+            state.open_session(&Secret::new_bip39().unwrap(), state.generation(), true).unwrap();
             let mut replies = Vec::new();
             for round in 0..2 {
                 replies.extend([

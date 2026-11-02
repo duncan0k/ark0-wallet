@@ -416,6 +416,49 @@ pub(crate) mod tests {
         (api, server)
     }
 
+    /// A fake API that answers every request from `answer(method and path, body)` until the returned flag
+    /// is set: for tests that care what the wallet asks, not in which order.
+    pub(crate) fn routed(answer: impl Fn(&str, &str) -> String + Send + 'static) -> (Api, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let api = loopback(&listener);
+        listener.set_nonblocking(true).unwrap();
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let stopped = stop.clone();
+        thread::spawn(move || {
+            while !stopped.load(Ordering::SeqCst) {
+                let mut socket = match listener.accept() {
+                    Ok((socket, _)) => socket,
+                    Err(_) => {
+                        thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+                };
+                socket.set_nonblocking(false).unwrap();
+                socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    if socket.read_exact(&mut byte).is_err() {
+                        break;
+                    }
+                    request.push(byte[0]);
+                }
+                let request = String::from_utf8_lossy(&request).to_string();
+                let length = request.lines().find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().unwrap_or(0))
+                }).unwrap_or(0);
+                let mut body = vec![0; length];
+                let _ = socket.read_exact(&mut body);
+                let first = request.lines().next().unwrap_or("").to_string();
+                let reply = answer(&first, &String::from_utf8_lossy(&body));
+                let _ = socket.write_all(reply.as_bytes());
+            }
+        });
+        (api, stop)
+    }
+
     #[test]
     fn the_production_client_refuses_http_before_connecting() {
         let (local, listener) = idle();

@@ -329,8 +329,6 @@ pub struct Keys {
 
 /// The two key pairs of one pq2 output (both wipe their secrets).
 pub struct Pq2Keys {
-    pub chain: u32,
-    pub index: u32,
     mldsa44: mldsa::KeyPair,
     slhdsa128s: slhdsa::KeyPair,
 }
@@ -340,10 +338,12 @@ impl Pq2Keys {
         Template::pq2(&self.mldsa44.public, &self.slhdsa128s.public)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn mldsa44_public_key(&self) -> &[u8; mldsa::PUBLIC_KEY_LEN] {
         &self.mldsa44.public
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn slhdsa128s_public_key(&self) -> &[u8; slhdsa::PUBLIC_KEY_LEN] {
         &self.slhdsa128s.public
     }
@@ -383,8 +383,6 @@ impl Pq2Keys {
     #[cfg(test)]
     pub(crate) fn from_seeds(mldsa44_seed: &[u8; 32], slhdsa128s_seed: &[u8; 48]) -> Pq2Keys {
         Pq2Keys {
-            chain: 0,
-            index: 0,
             mldsa44: mldsa::keypair_from_seed(mldsa44_seed).unwrap(),
             slhdsa128s: slhdsa::keypair_from_seed(slhdsa128s_seed).unwrap(),
         }
@@ -433,7 +431,7 @@ impl Keys {
         let network = network_id(ARK0_CHALLENGE);
         let mldsa44 = mldsa::keypair_from_seed(&pq2_mldsa44_seed(seed, &network, chain, index)).map_err(|_| KeyError::Mldsa44)?;
         let slhdsa128s = slhdsa::keypair_from_seed(&pq2_slhdsa128s_seed(seed, &network, chain, index)).map_err(|_| KeyError::Slhdsa128s)?;
-        Ok(Pq2Keys { chain, index, mldsa44, slhdsa128s })
+        Ok(Pq2Keys { mldsa44, slhdsa128s })
     }
 
     /// The key of a template's Schnorr leaf (the post-quantum template has none and is never asked).

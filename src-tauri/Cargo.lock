@@ -98,6 +98,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "ark0-wallet"
+version = "0.1.2"
+dependencies = [
+ "aes-gcm",
+ "argon2",
+ "bech32",
+ "bip39",
+ "cc",
+ "getrandom 0.4.3",
+ "hex",
+ "hkdf",
+ "hmac",
+ "qrcode",
+ "reqwest",
+ "rustls",
+ "secp256k1",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-dialog",
+ "tauri-plugin-opener",
+ "tokio",
+ "webpki-roots",
+ "windows-sys 0.61.2",
+ "zeroize",
+]
+
+[[package]]
 name = "arrayvec"
 version = "0.7.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -588,36 +618,6 @@ dependencies = [
  "block-buffer 0.12.1",
  "crypto-common 0.2.2",
  "inout",
-]
-
-[[package]]
-name = "ark0-wallet"
-version = "0.1.2"
-dependencies = [
- "aes-gcm",
- "argon2",
- "bech32",
- "bip39",
- "cc",
- "getrandom 0.4.3",
- "hex",
- "hkdf",
- "hmac",
- "qrcode",
- "reqwest",
- "rustls",
- "secp256k1",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "tauri",
- "tauri-build",
- "tauri-plugin-dialog",
- "tauri-plugin-opener",
- "tokio",
- "webpki-roots",
- "windows-sys 0.61.2",
- "zeroize",
 ]
 
 [[package]]

@@ -5,6 +5,7 @@ mod confirm;
 mod keys;
 mod mldsa;
 mod p2mr;
+mod pq2;
 mod proof;
 mod slhdsa;
 mod sources;
@@ -148,6 +149,9 @@ pub fn run() {
             app::overview,
             app::plan_send,
             app::confirm_send,
+            app::pq2_new_address,
+            app::pq2_scan,
+            app::plan_rebuild,
             app::activity,
             app::drill_check,
             app::settings_get,
