@@ -1030,7 +1030,7 @@ async fn overview_of(state: &AppState) -> Res<Overview> {
     Ok(Overview { chain: Some(chain), problem: None, accounts, pq2, fetched: now() })
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct NewAddress {
     address: String,
     index: u32,
@@ -1064,7 +1064,7 @@ async fn new_pq2_address(state: &AppState) -> Res<NewAddress> {
     Ok(NewAddress { address: template.address, index })
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct ScanResult {
     /// Addresses with something paid to them, found on both chains.
     found: usize,
@@ -1121,7 +1121,7 @@ async fn scan_pq2(state: &AppState, wider: bool) -> Res<ScanResult> {
 }
 
 /// What the review shows of a payment from a pq2 address.
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct Pq2PlanView {
     address: String,
     /// The ML-DSA-44 leaf may be chosen: the node reports ML-DSA-44 checks in 0xe2 leaves still on.
@@ -1140,7 +1140,7 @@ pub struct Pq2PlanView {
     rebuilt_from: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct SendPlan {
     id: String,
     from: Kind,
@@ -2050,14 +2050,31 @@ const SUBMIT_TIMEOUT_SECS: u64 = 120;
 /// Lookups of one refresh stop starting after this long: a review or the activity list waits on them.
 const LOOKUP_BUDGET: Duration = Duration::from_secs(15);
 
+/// A recorded payment, and whether it can be rebuilt through the SLH-DSA leaf now (`plan_rebuild`).
+#[derive(Serialize)]
+pub struct ActivityItem {
+    #[serde(flatten)]
+    sent: Sent,
+    rebuild: bool,
+}
+
 /// The transactions this wallet sent, their states looked up again where they may have changed.
 #[tauri::command]
-pub async fn activity(state: State<'_, AppState>) -> Res<Vec<Sent>> {
+pub async fn activity(state: State<'_, AppState>) -> Res<Vec<ActivityItem>> {
+    activity_of(&state).await
+}
+
+async fn activity_of(state: &AppState) -> Res<Vec<ActivityItem>> {
     if !state.unlocked() {
         return Err(Failure::new("locked"));
     }
     let at = now();
-    Ok(refresh_sent(&state, |s| !s.proven() && (!settled(s) || recent(s, at)), &mut Flags::default()).await)
+    let sent = refresh_sent(state, |s| !s.proven() && (!settled(s) || recent(s, at)), &mut Flags::default()).await;
+    // Only when there is a pq2 payment through the ML-DSA-44 leaf that did not go through is the node's
+    // state read for it.
+    let candidate = |s: &Sent| s.from == "pq2" && s.signature == "mldsa44" && matches!(s.status.as_str(), "unknown" | "rejected" | "failed");
+    let chain = if sent.iter().any(candidate) { current_chain(&state.sources, &mut Flags::default()).await.ok() } else { None };
+    Ok(sent.into_iter().map(|s| ActivityItem { rebuild: chain.as_ref().is_some_and(|c| needs_rebuild(&s, c)), sent: s }).collect())
 }
 
 #[derive(Serialize)]
@@ -2169,13 +2186,19 @@ pub fn app_info(state: State<'_, AppState>) -> AppInfo {
         (Template::mldsa44(&pk), Path::Mldsa44),
         (Template::mixed(&xonly, &pk), Path::Schnorr),
         (Template::mixed(&xonly, &pk), Path::Mldsa44),
+        (Template::pq2(&pk, &xonly), Path::Slhdsa128s),
+        (Template::pq2(&pk, &xonly), Path::Mldsa44),
     ]
     .into_iter()
     .map(|(t, path)| {
         let kind = t.kind;
         let a = Account::new(t, path).expect("each has the leaf");
         let s = wallet::measure(&a, std::slice::from_ref(&coin), &out, 0);
-        let signature_bytes = if path == Path::Schnorr { 64 } else { MLDSA44_SIGNATURE_CHUNKS.iter().sum() };
+        let signature_bytes = match path {
+            Path::Schnorr => 64,
+            Path::Mldsa44 => MLDSA44_SIGNATURE_CHUNKS.iter().sum(),
+            Path::Slhdsa128s => SLHDSA128S_SIGNATURE_CHUNKS.iter().sum(),
+        };
         InputCost { kind, signature: path, signature_bytes, tx_vsize: s.vsize, tx_size: s.size }
     })
     .collect();
@@ -2223,7 +2246,7 @@ pub fn open_page(app: AppHandle, state: State<'_, AppState>, page: String, value
     use tauri_plugin_opener::OpenerExt;
     let value = value.unwrap_or_default();
     let recorded = || store::load::<Vec<Sent>>(&state.sent_path()).iter().any(|s| s.txid == value);
-    let own = || state.templates().is_ok_and(|(a, b, c)| [a, b, c].iter().any(|t| t.address == value));
+    let own = || state.templates().is_ok_and(|(a, b, c)| [a, b, c].iter().any(|t| t.address == value)) || own_pq2(&state).contains(&value);
     let url = page_url(&page, &value, recorded, own).ok_or_else(|| Failure::new("invalid_page"))?;
     app.opener().open_url(url, None::<&str>).map_err(|_| Failure::new("io"))
 }
@@ -4769,5 +4792,432 @@ mod tests {
         );
         assert_eq!(url("address", "tb1zsomeoneelse"), None);
         assert_eq!(url("settings", ""), None);
+    }
+}
+
+#[cfg(test)]
+mod pq2_tests {
+    use super::*;
+    use crate::api::tests::{response, routed};
+    use crate::chain::tests::{m4_state, state as m3_state};
+    use crate::chain::H4T;
+    use serde_json::{json, Value};
+    use std::sync::atomic::AtomicBool;
+
+    /// What both fake APIs answer, changed by the test as it goes.
+    #[derive(Clone, Default)]
+    struct Net {
+        state: Arc<Mutex<Value>>,
+        /// Unspent outputs by address, as /api/utxos lists them.
+        utxos: Arc<Mutex<HashMap<String, Vec<Value>>>>,
+        /// Payments on their way, by address.
+        incoming: Arc<Mutex<HashMap<String, Vec<Value>>>>,
+        /// The broadcast answer: (HTTP status, body); the default accepts.
+        refuse: Arc<Mutex<Option<String>>>,
+        /// Run when a broadcast arrives (the node's state may change with it).
+        on_broadcast: Arc<Mutex<Option<Value>>>,
+        broadcasts: Arc<Mutex<Vec<String>>>,
+    }
+
+    struct Wallet {
+        state: AppState,
+        net: Net,
+        dir: PathBuf,
+        stops: Vec<Arc<AtomicBool>>,
+    }
+
+    impl Drop for Wallet {
+        fn drop(&mut self) {
+            for s in &self.stops {
+                s.store(true, Ordering::SeqCst);
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn answer(net: &Net, first: &str, body: &str) -> String {
+        let path = first.split(' ').nth(1).unwrap_or("");
+        if path == "/api/state" {
+            return response(200, &guard(&net.state).to_string());
+        }
+        if let Some(address) = path.strip_prefix("/api/utxos?address=") {
+            let utxos = guard(&net.utxos).get(address).cloned().unwrap_or_default();
+            let incoming = guard(&net.incoming).get(address).cloned().unwrap_or_default();
+            return response(200, &json!({"utxos": utxos, "unconfirmed": incoming, "unconfirmed_complete": true, "truncated": false}).to_string());
+        }
+        if path.starts_with("/api/tx?") {
+            return response(200, r#"{"status":"unknown"}"#);
+        }
+        if path.starts_with("/api/proof?") {
+            return response(404, r#"{"error":"not_confirmed"}"#);
+        }
+        if path == "/api/broadcast" {
+            let hex: Value = serde_json::from_str(body).unwrap();
+            let hex = hex["hex"].as_str().unwrap().to_string();
+            guard(&net.broadcasts).push(hex.clone());
+            if let Some(next) = guard(&net.on_broadcast).take() {
+                *guard(&net.state) = next;
+            }
+            if let Some(reason) = guard(&net.refuse).clone() {
+                return response(422, &json!({"error": "rejected", "reason": reason}).to_string());
+            }
+            let bytes = hex::decode(&hex).unwrap();
+            // The txid of a segwit transaction: hash of the serialization without marker, flag and witness.
+            let txid = txid_of(&bytes);
+            return response(200, &json!({"txid": txid}).to_string());
+        }
+        response(404, "{}")
+    }
+
+    /// The txid of a signed transaction the wallet built (its inputs have empty scriptSigs, and every
+    /// input of a pq2 spend has a witness).
+    fn txid_of(signed: &[u8]) -> String {
+        let tx = decode(signed);
+        crate::tx::display_hex(&tx.txid())
+    }
+
+    /// Enough of BIP-144 to read back what the wallet broadcast.
+    fn decode(b: &[u8]) -> crate::tx::Transaction {
+        use crate::tx::{OutPoint, Transaction, TxIn, TxOut};
+        let mut at = 0;
+        let mut take = |n: usize| { let s = &b[at..at + n]; at += n; s.to_vec() };
+        fn compact(take: &mut dyn FnMut(usize) -> Vec<u8>) -> usize {
+            let first = take(1)[0];
+            match first {
+                0xfd => u16::from_le_bytes(take(2).try_into().unwrap()) as usize,
+                0xfe => u32::from_le_bytes(take(4).try_into().unwrap()) as usize,
+                n => n as usize,
+            }
+        }
+        let version = u32::from_le_bytes(take(4).try_into().unwrap());
+        let mut n = compact(&mut take);
+        let segwit = n == 0;
+        if segwit {
+            take(1);
+            n = compact(&mut take);
+        }
+        let mut inputs = Vec::new();
+        for _ in 0..n {
+            let txid: [u8; 32] = take(32).try_into().unwrap();
+            let vout = u32::from_le_bytes(take(4).try_into().unwrap());
+            let script = compact(&mut take);
+            take(script);
+            let sequence = u32::from_le_bytes(take(4).try_into().unwrap());
+            inputs.push(TxIn { prevout: OutPoint { txid, vout }, sequence, witness: vec![] });
+        }
+        let mut outputs = Vec::new();
+        for _ in 0..compact(&mut take) {
+            let sats = u64::from_le_bytes(take(8).try_into().unwrap());
+            let len = compact(&mut take);
+            outputs.push(TxOut { sats, script_pubkey: take(len) });
+        }
+        if segwit {
+            for input in &mut inputs {
+                for _ in 0..compact(&mut take) {
+                    let len = compact(&mut take);
+                    input.witness.push(take(len));
+                }
+            }
+        }
+        let lock_time = u32::from_le_bytes(take(4).try_into().unwrap());
+        Transaction { version, inputs, outputs, lock_time }
+    }
+
+    fn wallet(label: &str, secret: Secret, made_here: bool, chain: Value) -> Wallet {
+        let mut nonce = [0; 8];
+        getrandom::fill(&mut nonce).unwrap();
+        let dir = std::env::temp_dir().join(format!("pqw-pq2-{label}-{}", hex::encode(nonce)));
+        let mut state = AppState::new(dir.clone()).unwrap();
+        let net = Net::default();
+        *guard(&net.state) = chain;
+        let (a, stop_a) = { let n = net.clone(); routed(move |first, body| answer(&n, first, body)) };
+        let (b, stop_b) = { let n = net.clone(); routed(move |first, body| answer(&n, first, body)) };
+        state.sources = Arc::new(Sources::new(a, b));
+        state.open_session(&secret, state.generation(), made_here).unwrap();
+        Wallet { state, net, dir, stops: vec![stop_a, stop_b] }
+    }
+
+    fn words(byte: u8) -> Secret {
+        Secret::Bip39 { entropy: crate::keys::SecretBytes(Zeroizing::new([byte; 32])) }
+    }
+
+    fn utxo(txid: char, vout: u32, sats: u64, height: u32) -> Value {
+        json!({"txid": txid.to_string().repeat(64), "vout": vout, "sats": sats, "height": height, "spent_in_mempool": false})
+    }
+
+    fn block<T>(f: impl Future<Output = T>) -> T {
+        tauri::async_runtime::block_on(f)
+    }
+
+    fn pq2_address(w: &Wallet, chain: u32, index: u32) -> String {
+        w.state.pq2_template(chain, index).unwrap().address
+    }
+
+    #[test]
+    fn pq2_addresses_wait_for_h4t_plus_six_are_issued_once_and_stop_at_the_gap_limit() {
+        let w = wallet("issue", words(0x11), true, m4_state(H4T + 5, false));
+        // H4T + 5: why not yet, and no address.
+        assert_eq!(block(new_pq2_address(&w.state)).unwrap_err().code, "pq2_waiting");
+        let o = block(overview_of(&w.state)).unwrap();
+        let p = o.pq2.unwrap();
+        assert_eq!((p.blocked, p.allowed, p.opens_at), (Some("waiting"), false, H4T + 6));
+        assert!(p.addresses.is_empty());
+        // H4T + 6: index 0, then 1; never the same one twice.
+        *guard(&w.net.state) = m4_state(H4T + 6, false);
+        let first = block(new_pq2_address(&w.state)).unwrap();
+        assert_eq!((first.index, first.address.clone()), (0, pq2_address(&w, 0, 0)));
+        let second = block(new_pq2_address(&w.state)).unwrap();
+        assert_eq!(second.index, 1);
+        assert_ne!(first.address, second.address);
+        for i in 2..GAP_LIMIT {
+            assert_eq!(block(new_pq2_address(&w.state)).unwrap().index, i);
+        }
+        // Twenty handed out, none paid: no more.
+        assert_eq!(block(new_pq2_address(&w.state)).unwrap_err().code, "pq2_gap_limit");
+        assert_eq!(block(overview_of(&w.state)).unwrap().pq2.unwrap().blocked, Some("gap_limit"));
+        // A payment seen on its way to index 3 makes it used, and the wallet records it.
+        guard(&w.net.incoming).insert(pq2_address(&w, 0, 3), vec![json!({"txid": "ab".repeat(32), "vout": 0, "sats": 5_000})]);
+        let p = block(overview_of(&w.state)).unwrap().pq2.unwrap();
+        assert_eq!(p.blocked, None);
+        assert_eq!(p.addresses.len(), 1);
+        assert_eq!(p.addresses[0].coins[0].status, Pq2Status::Pending);
+        assert!(w.state.book().unwrap().chains[0].used.contains(&3));
+        guard(&w.net.incoming).clear();
+        // Used stays used once the payment is gone from the API's view.
+        assert_eq!(block(new_pq2_address(&w.state)).unwrap().index, GAP_LIMIT);
+        // A reorganization back below H4T + 6 pauses issuance.
+        *guard(&w.net.state) = m4_state(H4T + 3, false);
+        assert_eq!(block(new_pq2_address(&w.state)).unwrap_err().code, "pq2_waiting");
+        // Unknown state: no address.
+        let mut unknown = m4_state(H4T + 50, false);
+        unknown["tripwire"]["lattice"]["mldsa_disabled_next_block"] = json!(null);
+        *guard(&w.net.state) = unknown;
+        assert_eq!(block(new_pq2_address(&w.state)).unwrap_err().code, "pq2_unknown_state");
+        // A node without the M4 rules: nothing about pq2 at all.
+        *guard(&w.net.state) = m3_state(H4T + 50, false);
+        assert!(block(overview_of(&w.state)).unwrap().pq2.is_none());
+        assert_eq!(block(new_pq2_address(&w.state)).unwrap_err().code, "address_not_ready");
+    }
+
+    #[test]
+    fn a_backup_code_wallet_gets_no_pq2_and_is_told_why() {
+        let code = "ark0w1-000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f-630dcd29";
+        let w = wallet("legacy", Secret::from_backup_code(code).unwrap(), false, m4_state(H4T + 10, false));
+        let p = block(overview_of(&w.state)).unwrap().pq2.unwrap();
+        assert_eq!((p.blocked, p.allowed), (Some("legacy"), false));
+        assert_eq!(block(new_pq2_address(&w.state)).unwrap_err().code, "pq2_legacy");
+        assert_eq!(block(scan_pq2(&w.state, false)).unwrap_err().code, "pq2_unavailable");
+        assert!(!w.state.pq2_path().exists());
+    }
+
+    #[test]
+    fn a_restored_wallet_scans_both_chains_and_never_hands_out_a_scanned_address() {
+        let w = wallet("scan", words(0x22), false, m4_state(H4T + 10, false));
+        assert_eq!(block(new_pq2_address(&w.state)).unwrap_err().code, "pq2_scan_needed");
+        assert_eq!(block(overview_of(&w.state)).unwrap().pq2.unwrap().blocked, Some("scan_needed"));
+        // Another copy of the wallet was paid at receiving index 2 and change index 0.
+        guard(&w.net.utxos).insert(pq2_address(&w, 0, 2), vec![utxo('a', 0, 10_000, H4T + 1)]);
+        guard(&w.net.utxos).insert(pq2_address(&w, 1, 0), vec![utxo('b', 1, 20_000, H4T + 2)]);
+        let r = block(scan_pq2(&w.state, false)).unwrap();
+        assert_eq!(r.found, 2);
+        // Stopped after 20 empty in a row; everything up to the highest seen plus 20 is issued.
+        assert_eq!((r.scanned, r.issued), ([23, 21], [23, 21]));
+        assert_eq!(block(new_pq2_address(&w.state)).unwrap().index, 23);
+        let p = block(overview_of(&w.state)).unwrap().pq2.unwrap();
+        assert_eq!(p.addresses.len(), 2);
+        assert_eq!(p.spendable, 30_000);
+        // Coins beyond the scanned range need the wider scan.
+        guard(&w.net.utxos).insert(pq2_address(&w, 0, 60), vec![utxo('c', 0, 7_000, H4T + 3)]);
+        let r = block(scan_pq2(&w.state, true)).unwrap();
+        assert_eq!(r.found, 1);
+        assert_eq!(r.issued[0], 81);
+        assert!(r.scanned[0] >= 123 && r.scanned[1] >= 121);
+        assert_eq!(block(new_pq2_address(&w.state)).unwrap().index, 81);
+    }
+
+    /// A wallet with one pq2 receiving address holding two coins, at H4T + 10.
+    fn funded(label: &str) -> (Wallet, String) {
+        let w = wallet(label, words(0x33), true, m4_state(H4T + 10, false));
+        let address = block(new_pq2_address(&w.state)).unwrap().address;
+        guard(&w.net.utxos).insert(address.clone(), vec![utxo('d', 0, 150_000, H4T + 7), utxo('e', 2, 60_000, H4T - 3)]);
+        (w, address)
+    }
+
+    fn elsewhere() -> String {
+        Template::schnorr(&[9u8; 32]).address
+    }
+
+    #[test]
+    fn pq2_coins_show_their_status_and_spends_take_all_of_them_through_slh_by_default() {
+        let (w, address) = funded("status");
+        guard(&w.net.incoming).insert(address.clone(), vec![json!({"txid": "f0".repeat(32), "vout": 1, "sats": 1_000})]);
+        let p = block(overview_of(&w.state)).unwrap().pq2.unwrap();
+        let statuses: Vec<(u64, Pq2Status)> = p.addresses[0].coins.iter().map(|c| (c.sats, c.status)).collect();
+        assert_eq!(statuses, vec![(150_000, Pq2Status::Protected), (60_000, Pq2Status::Unprotected), (1_000, Pq2Status::Pending)]);
+        // A reorganization that confirms the first coin lower: recomputed from what the API says now.
+        guard(&w.net.utxos).insert(address.clone(), vec![utxo('d', 0, 150_000, H4T - 1), utxo('e', 2, 60_000, H4T - 3)]);
+        let p = block(overview_of(&w.state)).unwrap().pq2.unwrap();
+        assert_eq!(p.addresses[0].coins[0].status, Pq2Status::Unprotected);
+        guard(&w.net.incoming).clear();
+        // The default leaf, both coins, change to the change chain, H4T as lock time.
+        let view = block(plan_pq2_payment(&w.state, address.clone(), elsewhere(), "0.001".into(), None, None)).unwrap();
+        assert_eq!((view.signature, view.inputs), (Path::Slhdsa128s, 2));
+        let p = view.pq2.as_ref().unwrap();
+        assert!(p.several_coins && p.mldsa44_allowed);
+        assert_eq!(p.witness_bytes, 7_972);
+        assert_eq!(p.change_address.as_deref(), Some(pq2_address(&w, 1, 0).as_str()));
+        let pending = guard(&w.state.pending).take().unwrap();
+        assert_eq!(pending.plan.lock_time, H4T);
+        assert_eq!(pending.plan.outputs[1].1, w.state.pq2_template(1, 0).unwrap().script_pubkey);
+        // The ML-DSA-44 leaf when asked and allowed: 3,795 bytes of witness.
+        let view = block(plan_pq2_payment(&w.state, address.clone(), elsewhere(), "0.001".into(), Some(Path::Mldsa44), None)).unwrap();
+        assert_eq!((view.signature, view.pq2.as_ref().unwrap().witness_bytes), (Path::Mldsa44, 3_795));
+        // Not offered once the node reports it off, nor while that is unknown.
+        for flag in [json!(true), json!(null)] {
+            let mut s = m4_state(H4T + 10, false);
+            s["tripwire"]["lattice"]["mldsa_disabled_next_block"] = flag.clone();
+            *guard(&w.net.state) = s;
+            let result = block(plan_pq2_payment(&w.state, address.clone(), elsewhere(), "0.001".into(), Some(Path::Mldsa44), None));
+            if flag.is_null() {
+                // Unknown state: no pq2 at all (no new output may be made), so no plan either.
+                assert_eq!(result.err().unwrap().code, "address_not_ready");
+            } else {
+                let view = result.unwrap();
+                assert_eq!(view.signature, Path::Slhdsa128s);
+                let p = view.pq2.unwrap();
+                assert_eq!((p.mldsa44_allowed, p.mldsa44_reason), (false, Some("disabled")));
+            }
+        }
+    }
+
+    #[test]
+    fn at_the_change_chains_limit_only_a_payment_without_change_goes() {
+        let (w, address) = funded("change-limit");
+        w.state.edit_book(|b| {
+            for i in 0..GAP_LIMIT {
+                b.chains[1].issue(i, &format!("tb1zchange{i}"));
+            }
+        }).unwrap();
+        let err = block(plan_pq2_payment(&w.state, address.clone(), elsewhere(), "0.001".into(), None, None)).unwrap_err();
+        assert_eq!(err.code, "pq2_change_limit");
+        let view = block(plan_pq2_payment(&w.state, address, elsewhere(), "all".into(), None, None)).unwrap();
+        assert_eq!(view.change, 0);
+        let p = view.pq2.unwrap();
+        assert!(p.change_blocked && p.change_address.is_none());
+    }
+
+    #[test]
+    fn other_payments_keep_their_lock_time_unless_they_pay_a_pq2_address_of_the_wallet() {
+        let (w, pq2) = funded("lock-time");
+        let mldsa44 = w.state.templates().unwrap().1.address;
+        guard(&w.net.utxos).insert(mldsa44, vec![utxo('9', 0, 500_000, 9_000)]);
+        block(plan_payment(&w.state, Kind::Mldsa44, elsewhere(), "0.001".into())).unwrap();
+        assert_eq!(guard(&w.state.pending).take().unwrap().plan.lock_time, crate::chain::TRIPWIRE_HEIGHT);
+        block(plan_payment(&w.state, Kind::Mldsa44, pq2, "0.001".into())).unwrap();
+        let pending = guard(&w.state.pending).take().unwrap();
+        assert!(pending.creates_pq2);
+        assert_eq!(pending.plan.lock_time, H4T);
+        // Before H4T + 6 the wallet does not pay its own pq2 address at all.
+        *guard(&w.net.state) = m4_state(H4T + 5, false);
+        let own = pq2_address(&w, 0, 0);
+        assert_eq!(block(plan_payment(&w.state, Kind::Mldsa44, own, "0.001".into())).unwrap_err().code, "destination_not_ready");
+    }
+
+    #[test]
+    fn a_flip_before_broadcasting_drops_the_ml_dsa_spend_and_rebuilds_it_through_slh() {
+        let (w, address) = funded("flip");
+        let view = block(plan_pq2_payment(&w.state, address.clone(), elsewhere(), "0.001".into(), Some(Path::Mldsa44), None)).unwrap();
+        assert_eq!(view.signature, Path::Mldsa44);
+        // The tripwire is spent while the system dialog is open: the state flips before broadcasting.
+        let net = w.net.clone();
+        let result = block(send_plan(&w.state, &view.id, Some("en"), move |_| {
+            *guard(&net.state) = m4_state(H4T + 11, true);
+            std::future::ready(true)
+        })).unwrap();
+        // Nothing went out and nothing was recorded; the change address was not handed out.
+        assert!(guard(&w.net.broadcasts).is_empty());
+        assert!(store::load::<Vec<Sent>>(&w.state.sent_path()).is_empty());
+        assert_eq!(w.state.book().unwrap().chains[1].issued, 0);
+        assert!(result.txid.is_empty());
+        let rebuilt = result.rebuilt.unwrap();
+        assert_eq!((rebuilt.signature, rebuilt.inputs), (Path::Slhdsa128s, 2));
+        assert!(rebuilt.fee > view.fee);
+        // The rebuild goes through the system dialog like any payment, then out.
+        let sent = block(send_plan(&w.state, &rebuilt.id, Some("en"), |_| std::future::ready(true))).unwrap();
+        assert!(matches!(sent.result, BroadcastResult::Sent { .. }));
+        let broadcasts = guard(&w.net.broadcasts).clone();
+        // Sent to both APIs, the same transaction.
+        assert_eq!(broadcasts.len(), 2);
+        assert_eq!(broadcasts[0], broadcasts[1]);
+        let tx = decode(&hex::decode(&broadcasts[0]).unwrap());
+        assert_eq!(tx.lock_time, H4T);
+        assert!(tx.inputs.iter().all(|i| i.sequence == crate::tx::SEQUENCE));
+        // Each input through SLH1: sixteen pieces, the leaf, and the control block e3 <S1's hash>.
+        let leaf = w.state.pq2_template(0, 0).unwrap().slhdsa128s_leaf.unwrap();
+        for input in &tx.inputs {
+            assert_eq!(input.witness.len(), 18);
+            assert_eq!((&input.witness[16], &input.witness[17]), (&leaf.script, &leaf.control_block));
+        }
+        let record = &store::load::<Vec<Sent>>(&w.state.sent_path())[0];
+        assert_eq!((record.from.as_str(), record.address.as_str(), record.signature.as_str(), record.status.as_str()), ("pq2", address.as_str(), "slhdsa128s", "mempool"));
+        assert_eq!(w.state.book().unwrap().chains[1].handed_out.iter().copied().collect::<Vec<_>>(), vec![0]);
+    }
+
+    #[test]
+    fn a_refused_ml_dsa_spend_is_rebuilt_when_the_state_says_so_whatever_the_refusal_says() {
+        for flips in [false, true] {
+            let (w, address) = funded(if flips { "refused-flip" } else { "refused-same" });
+            let view = block(plan_pq2_payment(&w.state, address.clone(), elsewhere(), "0.001".into(), Some(Path::Mldsa44), None)).unwrap();
+            // The same refusal text either way: the decision goes by the node's state.
+            *guard(&w.net.refuse) = Some("mempool-script-verify-flag-failed (ML-DSA-44 signature checks are disabled in this leaf)".into());
+            if flips {
+                *guard(&w.net.on_broadcast) = Some(m4_state(H4T + 11, true));
+            }
+            let result = block(send_plan(&w.state, &view.id, Some("en"), |_| std::future::ready(true))).unwrap();
+            assert!(matches!(result.result, BroadcastResult::Rejected { .. }));
+            let records: Vec<Sent> = store::load(&w.state.sent_path());
+            assert_eq!((records[0].status.as_str(), records[0].signature.as_str()), ("rejected", "mldsa44"));
+            if flips {
+                let rebuilt = result.rebuilt.unwrap();
+                assert_eq!(rebuilt.signature, Path::Slhdsa128s);
+                assert_eq!(rebuilt.pq2.as_ref().unwrap().rebuilt_from.as_deref(), Some(result.txid.as_str()));
+                // It spends the refused payment's coins, so the two can never both go through.
+                assert_eq!(rebuilt.replaces, 1);
+                let pending = guard(&w.state.pending).take().unwrap();
+                assert!(records[0].outpoints.iter().all(|o| pending.plan.coins.iter().any(|c| &c.outpoint() == o)));
+            } else {
+                assert!(result.rebuilt.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn an_ml_dsa_spend_that_left_the_mempool_is_offered_a_rebuild_while_the_state_says_so() {
+        let (w, address) = funded("left");
+        let view = block(plan_pq2_payment(&w.state, address.clone(), elsewhere(), "0.001".into(), Some(Path::Mldsa44), None)).unwrap();
+        let sent = block(send_plan(&w.state, &view.id, Some("en"), |_| std::future::ready(true))).unwrap();
+        assert!(sent.rebuilt.is_none());
+        // The node no longer has it (the API's /api/tx says unknown): "unknown" after the next lookup.
+        let items = block(activity_of(&w.state)).unwrap();
+        assert_eq!(items[0].sent.status, "unknown");
+        assert!(!items[0].rebuild);
+        assert_eq!(block(rebuild_plan(&w.state, &sent.txid)).unwrap_err().code, "no_rebuild");
+        *guard(&w.net.state) = m4_state(H4T + 12, true);
+        let items = block(activity_of(&w.state)).unwrap();
+        assert!(items[0].rebuild);
+        let rebuilt = block(rebuild_plan(&w.state, &sent.txid)).unwrap();
+        assert_eq!((rebuilt.signature, rebuilt.replaces), (Path::Slhdsa128s, 1));
+        assert_eq!(rebuilt.send, 100_000);
+    }
+
+    #[test]
+    fn the_book_goes_with_the_wallet() {
+        let (w, _) = funded("removal");
+        assert!(w.state.pq2_path().exists());
+        let state = &w.state;
+        state.lock();
+        // A vault that is gone leaves an orphaned record and book behind; creating removes both.
+        remove_orphaned_record(state).unwrap();
+        assert!(!state.pq2_path().exists());
     }
 }
