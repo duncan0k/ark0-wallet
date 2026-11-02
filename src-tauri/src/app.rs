@@ -5088,7 +5088,8 @@ mod pq2_tests {
         assert_eq!((view.signature, view.pq2.as_ref().unwrap().witness_bytes), (Path::Mldsa44, 3_795));
         // Not offered once the node reports it off, nor while that is unknown.
         for flag in [json!(true), json!(null)] {
-            let mut s = m4_state(H4T + 10, false);
+            // Disabled: a tripwire reported missing, and the flag that follows from it.
+            let mut s = m4_state(H4T + 10, flag == json!(true));
             s["tripwire"]["lattice"]["mldsa_disabled_next_block"] = flag.clone();
             *guard(&w.net.state) = s;
             let result = block(plan_pq2_payment(&w.state, address.clone(), elsewhere(), "0.001".into(), Some(Path::Mldsa44), None));
@@ -5180,6 +5181,23 @@ mod pq2_tests {
         let record = &store::load::<Vec<Sent>>(&w.state.sent_path())[0];
         assert_eq!((record.from.as_str(), record.address.as_str(), record.signature.as_str(), record.status.as_str()), ("pq2", address.as_str(), "slhdsa128s", "mempool"));
         assert_eq!(w.state.book().unwrap().chains[1].handed_out.iter().copied().collect::<Vec<_>>(), vec![0]);
+    }
+
+    #[test]
+    fn a_stale_snapshot_before_broadcasting_counts_as_unknown_and_rebuilds_through_slh() {
+        let (w, address) = funded("stale");
+        let view = block(plan_pq2_payment(&w.state, address, elsewhere(), "0.001".into(), Some(Path::Mldsa44), None)).unwrap();
+        assert_eq!(view.signature, Path::Mldsa44);
+        // The node moves on, the API keeps answering the old "not disabled" snapshot.
+        let net = w.net.clone();
+        let result = block(send_plan(&w.state, &view.id, Some("en"), move |_| {
+            let mut stale = m4_state(H4T + 12, false);
+            stale["tripwire"]["tip_height"] = json!(H4T + 10);
+            *guard(&net.state) = stale;
+            std::future::ready(true)
+        })).unwrap();
+        assert!(guard(&w.net.broadcasts).is_empty());
+        assert_eq!(result.rebuilt.unwrap().signature, Path::Slhdsa128s);
     }
 
     #[test]

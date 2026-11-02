@@ -7,7 +7,8 @@
 //! the two leaves a spend can use. These are the web wallet's rules (chain.ts, p2mr-ts).
 //!
 //! pq2 (M4) waits six blocks past H4T, the height of the lattice tripwire rules (leaf version 0xe2), and
-//! until the lattice tripwire state is known; a node that does not report those rules at all is on Ark-0
+//! until the lattice tripwire state is known: read at the current tip, about Ark-0's three tripwires, with a
+//! flag that agrees with them; a node that does not report those rules at all is on Ark-0
 //! still, it just offers no pq2. Unknown state never opens anything: no pq2 address, no ML-DSA-44 leaf.
 use crate::keys::ARK0_CHALLENGE;
 use crate::p2mr::{Path, LATTICE_TRIPWIRED_LEAF_VERSION, TRIPWIRED_LEAF_VERSION};
@@ -31,6 +32,8 @@ pub const TRIPWIRE_HEIGHT: u32 = 30_000;
 /// reports other heights is not describing Ark-0.
 pub const SLHDSA128S_HEIGHT: u32 = 32_000;
 pub const H4T: u32 = 55_000;
+/// The transaction that made Ark-0's three lattice tripwires (outputs 0, 1 and 2).
+pub const LATTICE_TRIPWIRE_TXID: &str = "aac5a1fef01545c338de92bceda520684a49682f2ec546900a4dbe99eba8827c";
 
 /// M2: from this height every block carries an ML-DSA-44 signature by this key.
 pub const PQBLOCK_HEIGHT: u32 = 20_000;
@@ -221,9 +224,12 @@ fn optional_buried(deployments: &Value, name: &str, pinned: u32) -> Result<Optio
     }
 }
 
-/// The lattice tripwire state, gettripwireinfo's `lattice` object, when every field is of its type:
-/// (height, ML-DSA-44 disabled from the next block, the tripwires). None otherwise: it is then unknown.
-fn lattice_state(v: &Value) -> Option<(u32, bool, Vec<LatticeTripwire>)> {
+/// The lattice tripwire state, gettripwireinfo's `lattice` object read at `read_at`, when every field
+/// is of its type, the tripwires are exactly Ark-0's three, and the flag is what the node computes from
+/// them: false while the rules are not active in the next block (read_at + 1 < height), else true exactly
+/// when any tripwire is missing. (height, ML-DSA-44 disabled from the next block, the tripwires); None
+/// otherwise: it is then unknown.
+fn lattice_state(v: &Value, read_at: u32) -> Option<(u32, bool, Vec<LatticeTripwire>)> {
     if v.get("leaf_version")?.as_str()? != format!("{LATTICE_TRIPWIRED_LEAF_VERSION:x}") {
         return None;
     }
@@ -254,7 +260,17 @@ fn lattice_state(v: &Value) -> Option<(u32, bool, Vec<LatticeTripwire>)> {
         };
         tripwires.push(LatticeTripwire { outpoint: outpoint.to_string(), unspent, key_sha256, label });
     }
-    Some((height(v.get("height")?)?, v.get("mldsa_disabled_next_block")?.as_bool()?, tripwires))
+    let ark0: HashSet<String> = (0..3).map(|vout| format!("{LATTICE_TRIPWIRE_TXID}:{vout}")).collect();
+    if seen.len() != ark0.len() || !seen.iter().all(|o| ark0.contains(*o)) {
+        return None;
+    }
+    let height = height(v.get("height")?)?;
+    let disabled = v.get("mldsa_disabled_next_block")?.as_bool()?;
+    let expected = read_at.saturating_add(1) >= height && tripwires.iter().any(|t| !t.unspent);
+    if disabled != expected {
+        return None;
+    }
+    Some((height, disabled, tripwires))
 }
 
 /// The chain the API's /api/state describes, when it is Ark-0 with P2MR active.
@@ -288,13 +304,14 @@ pub fn check(state: &Value) -> Result<Chain, ChainProblem> {
     // The lattice state is read in the same snapshot as the M3 state (gettripwireinfo): it counts only at a
     // tip the node has reached, for H4T and leaf version 0xe2, and only when the node runs those rules.
     let tripwire = state.get("tripwire");
+    // Only a snapshot of the current tip counts: an older one may predate a spent tripwire.
     let read_at = tripwire
         .filter(|t| t.get("tip_hash").and_then(Value::as_str).is_some_and(is_hex64))
         .and_then(|t| t.get("tip_height"))
         .and_then(height)
-        .filter(|at| *at <= tip);
+        .filter(|at| *at == tip);
     let lattice = match (lattice_height, read_at) {
-        (Some(h4t), Some(at)) => tripwire.and_then(|t| t.get("lattice")).and_then(lattice_state).filter(|(h, _, _)| *h == h4t).map(|l| (at, l)),
+        (Some(h4t), Some(at)) => tripwire.and_then(|t| t.get("lattice")).and_then(|l| lattice_state(l, at)).filter(|(h, _, _)| *h == h4t).map(|l| (at, l)),
         _ => None,
     };
     let lattice_tip = lattice.as_ref().map(|(at, _)| *at);
@@ -411,13 +428,66 @@ pub(crate) mod tests {
         s["tripwire"]["lattice"] = json!({
             "height": H4T, "leaf_version": "e2",
             "tripwires": [
-                {"outpoint": format!("{}:0", "c1".repeat(32)), "state": "unspent", "key_sha256": "591dae318a0fdde81a590eab8c8581e07657d2c30b97cf31d87bafe636c92805", "label": "NUMS ML-DSA-44"},
-                {"outpoint": format!("{}:1", "c2".repeat(32)), "state": if mldsa_disabled { "missing" } else { "unspent" }, "label": "destroyed key"},
-                {"outpoint": format!("{}:2", "c3".repeat(32)), "state": "unspent"}
+                {"outpoint": format!("{LATTICE_TRIPWIRE_TXID}:0"), "state": "unspent", "key_sha256": "591dae318a0fdde81a590eab8c8581e07657d2c30b97cf31d87bafe636c92805", "label": "NUMS ML-DSA-44"},
+                {"outpoint": format!("{LATTICE_TRIPWIRE_TXID}:1"), "state": if mldsa_disabled { "missing" } else { "unspent" }, "label": "destroyed key"},
+                {"outpoint": format!("{LATTICE_TRIPWIRE_TXID}:2"), "state": "unspent"}
             ],
             "mldsa_disabled_next_block": mldsa_disabled
         });
         s
+    }
+
+    #[test]
+    fn a_lattice_state_that_contradicts_itself_or_names_other_tripwires_is_unknown() {
+        // A missing tripwire beside "not disabled", and the reverse.
+        let mut s = m4_state(H4T + 100, false);
+        s["tripwire"]["lattice"]["tripwires"][0]["state"] = json!("missing");
+        assert_eq!(check(&s).unwrap().mldsa_disabled, None);
+        let mut s = m4_state(H4T + 100, false);
+        s["tripwire"]["lattice"]["mldsa_disabled_next_block"] = json!(true);
+        assert_eq!(check(&s).unwrap().mldsa_disabled, None);
+        // Any outpoints other than Ark-0's three: one too few, one too many, one changed, one twice.
+        let wire = |o: String| json!({"outpoint": o, "state": "unspent"});
+        for list in [
+            json!([wire(format!("{LATTICE_TRIPWIRE_TXID}:0")), wire(format!("{LATTICE_TRIPWIRE_TXID}:1"))]),
+            json!([wire(format!("{LATTICE_TRIPWIRE_TXID}:0")), wire(format!("{LATTICE_TRIPWIRE_TXID}:1")), wire(format!("{LATTICE_TRIPWIRE_TXID}:2")), wire(format!("{LATTICE_TRIPWIRE_TXID}:3"))]),
+            json!([wire(format!("{LATTICE_TRIPWIRE_TXID}:0")), wire(format!("{LATTICE_TRIPWIRE_TXID}:1")), wire(format!("{}:2", "ab".repeat(32)))]),
+            json!([wire(format!("{LATTICE_TRIPWIRE_TXID}:0")), wire(format!("{LATTICE_TRIPWIRE_TXID}:1")), wire(format!("{LATTICE_TRIPWIRE_TXID}:1"))]),
+        ] {
+            let mut s = m4_state(H4T + 100, false);
+            s["tripwire"]["lattice"]["tripwires"] = list.clone();
+            let c = check(&s).unwrap();
+            assert_eq!((c.mldsa_disabled, c.pq2_allowed), (None, false), "{list}");
+            assert!(!c.pq2_mldsa44_allowed());
+        }
+        // Before the rules are active in the next block, the node says "not disabled" whatever the outputs.
+        let mut s = m4_state(H4T - 2, false);
+        s["tripwire"]["lattice"]["tripwires"][1]["state"] = json!("missing");
+        assert_eq!(check(&s).unwrap().mldsa_disabled, Some(false));
+        let mut s = m4_state(H4T - 2, false);
+        s["tripwire"]["lattice"]["mldsa_disabled_next_block"] = json!(true);
+        assert_eq!(check(&s).unwrap().mldsa_disabled, None);
+        // From the block before H4T on, the flag must follow the outputs.
+        let mut s = m4_state(H4T - 1, false);
+        s["tripwire"]["lattice"]["tripwires"][1]["state"] = json!("missing");
+        assert_eq!(check(&s).unwrap().mldsa_disabled, None);
+        assert_eq!(check(&m4_state(H4T - 1, true)).unwrap().mldsa_disabled, Some(true));
+    }
+
+    #[test]
+    fn a_lattice_state_read_below_the_tip_is_unknown() {
+        // Read at 55,006 while the node is at 60,000: an old "not disabled" says nothing about now.
+        let mut s = m4_state(60_000, false);
+        s["tripwire"]["tip_height"] = json!(H4T + 6);
+        let c = check(&s).unwrap();
+        assert_eq!((c.lattice_tip, c.mldsa_disabled, c.pq2_allowed), (None, None, false));
+        assert!(!c.pq2_mldsa44_allowed());
+        assert_eq!(c.pq2_path(Some(Path::Mldsa44)), Path::Slhdsa128s);
+        // One block behind is behind too.
+        let mut s = m4_state(60_000, false);
+        s["tripwire"]["tip_height"] = json!(59_999);
+        assert_eq!(check(&s).unwrap().mldsa_disabled, None);
+        assert_eq!(check(&m4_state(60_000, false)).unwrap().mldsa_disabled, Some(false));
     }
 
     #[test]
