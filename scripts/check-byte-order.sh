@@ -15,7 +15,7 @@ out="$here/src-tauri/target/byte-order-check"
 mkdir -p "$out"
 src=("$csrc/pqw_slhdsa128s.c" "$csrc/slhdsa-c/slh_dsa.c" "$csrc/slhdsa-c/slh_sha2.c" "$csrc/slhdsa-c/sha2_256.c" "$csrc/slhdsa-c/sha2_512.c" "$csrc/test/slh_kat.c")
 nomacros=(-U__BYTE_ORDER__ -U__ORDER_LITTLE_ENDIAN__ -U__ORDER_BIG_ENDIAN__ -Wno-builtin-macro-redefined)
-msvc=(-D_MSC_VER=1940 -D_M_X64=100 -D__forceinline=__inline)
+msvc=(-D_MSC_VER=1940 -D_M_X64=100 -D__forceinline=__inline '-D__declspec(x)=__attribute__((x))')
 header=(-include "$csrc/pqw_slh_byteorder.h")
 build() { cc -O2 -w -I "$csrc" -I "$csrc/slhdsa-c" "$@" "${src[@]}" -o "$out/kat" 2>"$out/build.log"; }
 fail=0
