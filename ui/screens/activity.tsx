@@ -56,7 +56,7 @@ export function Activity({ info, version }: { info: AppInfo | null; version: num
         ))}
       </ul>
       {error && <Notice tone="bad">{error}</Notice>}
-      {plan && <ReviewDialog plan={plan} all={false} onClose={() => setPlan(null)}
+      {plan && <ReviewDialog key={plan.id} plan={plan} all={false} onClose={() => setPlan(null)}
         onSent={(r) => { setPlan(r.rebuilt ?? null); setAgain((n) => n + 1); }} />}
     </div>
   );

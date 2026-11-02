@@ -31,7 +31,7 @@ export type Pq2Status = 'protected' | 'pending' | 'unprotected';
 export type Pq2Blocked = 'legacy' | 'waiting' | 'unknown_state' | 'scan_needed' | 'gap_limit';
 
 export interface Pq2Coin { txid: string; vout: number; sats: number; height: number | null; status: Pq2Status; spending: boolean }
-export interface Pq2Address { chain: number; index: number; address: string; spendable: number; pending: number; incoming: number; coins: Pq2Coin[]; complete: boolean }
+export interface Pq2Address { chain: number; index: number; address: string; mldsa44_fits: boolean; spendable: number; pending: number; incoming: number; coins: Pq2Coin[]; complete: boolean }
 export interface Pq2View {
   blocked: Pq2Blocked | null;
   allowed: boolean;
@@ -53,9 +53,11 @@ export interface Pq2View {
 export interface Pq2PlanView {
   address: string;
   mldsa44_allowed: boolean;
-  mldsa44_reason: 'disabled' | 'unknown' | null;
+  mldsa44_reason: 'disabled' | 'unknown' | 'too_many_coins' | null;
   witness_bytes: number;
   several_coins: boolean;
+  staying_coins: number;
+  staying_sats: number;
   change_address: string | null;
   change_blocked: boolean;
   /** The txid of the payment this one rebuilds ('' when that one was never sent). */

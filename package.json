@@ -6,6 +6,7 @@
   "scripts": {
     "build:ui": "node scripts/build-ui.mjs",
     "typecheck": "tsc -p tsconfig.json",
+    "test:ui": "node tests/ui/flow.mjs",
     "tauri": "tauri"
   },
   "dependencies": {

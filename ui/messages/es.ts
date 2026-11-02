@@ -166,6 +166,8 @@ export const es: Messages = {
     mldsaDisabled: 'No se ofrece: el nodo informa de que las comprobaciones ML-DSA-44 en direcciones pq2 quedan desactivadas desde el próximo bloque.',
     mldsaUnknown: 'No se ofrece: no se puede leer el estado del nodo para las comprobaciones ML-DSA-44 en direcciones pq2.',
     witness: '{n} bytes de datos de firma por moneda',
+    staying: '{n} monedas de esta dirección ({amount}) se quedan en ella; envía de nuevo para moverlas.',
+    mldsaTooMany: 'No se ofrece para esta dirección: con ML-DSA-44 todas sus monedas deben ir juntas, y no caben en un pago. SLH-DSA puede pagar con una parte de ellas.',
     severalCoins: 'Las {n} monedas de esta dirección se gastan juntas. Usa una dirección pq2 nueva para cada pago que recibas, para que un pago no tenga que mover monedas que llegaron por separado.',
     changeTo: 'El cambio va a una dirección pq2 nueva de este monedero.',
     changeBlocked: '20 direcciones de cambio de pagos anteriores aún no aparecen en la red, así que este pago solo puede ir sin cambio: elige «Todo», o espera a que los pagos anteriores estén en un bloque.',
@@ -394,6 +396,9 @@ export const es: Messages = {
     pq2_gap_limit: 'Ya se mostraron 20 direcciones pq2 sin pagos; usa primero una de ellas',
     pq2_change_limit: 'Este pago necesitaría cambio, y ahora no se puede usar una dirección de cambio nueva: elige «Todo», o espera a que los pagos anteriores estén en un bloque',
     no_rebuild: 'Este pago no se puede rehacer ahora',
+    rebuild_original_went_out: 'El pago original salió al final (está confirmado o espera un bloque), así que no se paga de nuevo',
+    rebuild_inputs_spent: 'Las monedas del pago original ya no están, así que no se paga de nuevo con otras monedas',
+    rebuild_no_common_input: 'Esto no gastaría ninguna moneda del pago original, así que ambos podrían salir; se detuvo',
     internal: 'Error interno',
   },
 };

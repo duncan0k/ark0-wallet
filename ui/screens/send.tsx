@@ -57,7 +57,9 @@ export function Send({ data, info, onSent, onActivity, preferred }: {
   const source = usable.find((a) => a.key === from) ?? usable[0]!;
   const pq2 = source.kind === 'pq2' ? data.pq2 : null;
   // The ML-DSA-44 leaf only when the node reports it on; otherwise the SLH-DSA leaf, the default.
-  const chosen: Path | undefined = pq2 ? (leaf === 'mldsa44' && pq2.mldsa44_allowed ? 'mldsa44' : 'slhdsa128s') : undefined;
+  // Through ML-DSA-44 every coin of the address goes at once; when they do not fit, that leaf is not offered.
+  const fits = pq2?.addresses.find((a) => a.address === source.address)?.mldsa44_fits ?? false;
+  const chosen: Path | undefined = pq2 ? (leaf === 'mldsa44' && pq2.mldsa44_allowed && fits ? 'mldsa44' : 'slhdsa128s') : undefined;
 
   const review = async (e: Event) => {
     e.preventDefault();
@@ -110,7 +112,7 @@ export function Send({ data, info, onSent, onActivity, preferred }: {
               ))}
             </div>
           </Field>
-          {pq2 && <LeafChoice leaf={chosen ?? 'slhdsa128s'} onLeaf={setLeaf} mldsa44Allowed={pq2.mldsa44_allowed} mldsaDisabled={pq2.mldsa_disabled} info={info} />}
+          {pq2 && <LeafChoice leaf={chosen ?? 'slhdsa128s'} onLeaf={setLeaf} mldsa44Allowed={pq2.mldsa44_allowed && fits} fits={fits} mldsaDisabled={pq2.mldsa_disabled} info={info} />}
           {pq2?.change_blocked && <Notice tone="info">{m().pq2.changeBlocked}</Notice>}
           <Field label={m().send.to} id="to">
             <div class="input-wrap">
@@ -134,7 +136,7 @@ export function Send({ data, info, onSent, onActivity, preferred }: {
         </form>
         <Summary source={source} info={info} path={chosen} />
       </div>
-      {plan && <ReviewDialog plan={plan} all={all} onClose={() => setPlan(null)}
+      {plan && <ReviewDialog key={plan.id} plan={plan} all={all} onClose={() => setPlan(null)}
         onSent={(r) => { if (r.rebuilt) { setPlan(r.rebuilt); onSent(); } else { setPlan(null); setResult(r); onSent(); } }} />}
     </div>
   );
@@ -144,10 +146,11 @@ export function Send({ data, info, onSent, onActivity, preferred }: {
  * The leaf a pq2 payment goes through: SLH-DSA by default; ML-DSA-44 only when chosen and while the node
  * reports it on, and otherwise shown disabled with the reason. Each with its size per coin.
  */
-function LeafChoice({ leaf, onLeaf, mldsa44Allowed, mldsaDisabled, info }: {
+function LeafChoice({ leaf, onLeaf, mldsa44Allowed, fits, mldsaDisabled, info }: {
   leaf: Path;
   onLeaf: (p: Path) => void;
   mldsa44Allowed: boolean;
+  fits: boolean;
   mldsaDisabled: boolean | null;
   info: AppInfo | null;
 }) {
@@ -162,7 +165,7 @@ function LeafChoice({ leaf, onLeaf, mldsa44Allowed, mldsaDisabled, info }: {
         </button>
         <button type="button" role="radio" aria-checked={leaf === 'mldsa44'} disabled={!mldsa44Allowed} class={`source${leaf === 'mldsa44' ? ' selected' : ''}`} onClick={() => onLeaf('mldsa44')}>
           <span class="source-title">{p.leafMldsa}</span>
-          <span class="muted small">{mldsa44Allowed ? fill(p.leafMldsaHint, { n: bytes('mldsa44') }) : mldsaDisabled ? p.mldsaDisabled : p.mldsaUnknown}</span>
+          <span class="muted small">{mldsa44Allowed ? fill(p.leafMldsaHint, { n: bytes('mldsa44') }) : mldsaDisabled ? p.mldsaDisabled : mldsaDisabled === false && !fits ? p.mldsaTooMany : p.mldsaUnknown}</span>
         </button>
       </div>
     </Field>
@@ -208,12 +211,15 @@ export function ReviewDialog({ plan, all, onClose, onSent }: { plan: SendPlan; a
     setBusy(true);
     setError(null);
     try {
-      onSent(await core.confirmSend(plan.id, locale()));
+      const result = await core.confirmSend(plan.id, locale());
+      // The parent may show another plan (a rebuild) in its place: this one is no longer busy.
+      setBusy(false);
+      onSent(result);
     } catch (err) {
+      setBusy(false);
       // Cancelling the system dialog drops the plan; the form stays as it was, for another review.
       if (codeOf(err) === 'cancelled') onClose();
       else setError(errorText(codeOf(err)));
-      setBusy(false);
     }
   };
   return (
@@ -237,10 +243,11 @@ export function ReviewDialog({ plan, all, onClose, onSent }: { plan: SendPlan; a
       </dl>
       {plan.pq2?.rebuilt_from === '' && <Notice tone="warn">{m().pq2.rebuiltBefore}</Notice>}
       {plan.pq2?.rebuilt_from && <Notice tone="warn">{m().pq2.rebuiltRefused}</Notice>}
-      {plan.pq2?.several_coins && <Notice tone="info">{fill(m().pq2.severalCoins, { n: plan.inputs })}</Notice>}
+      {plan.pq2?.several_coins && plan.signature === 'mldsa44' && <Notice tone="info">{fill(m().pq2.severalCoins, { n: plan.inputs })}</Notice>}
+      {plan.pq2 && plan.pq2.staying_coins > 0 && <Notice tone="info">{fill(m().pq2.staying, { n: plan.pq2.staying_coins, amount: withUnit(plan.pq2.staying_sats) })}</Notice>}
       {plan.pq2?.change_address && <Notice tone="info">{m().pq2.changeTo}</Notice>}
       {plan.pq2 && plan.signature !== 'mldsa44' && !plan.pq2.mldsa44_allowed && (
-        <p class="faint small">{plan.pq2.mldsa44_reason === 'disabled' ? m().pq2.mldsaDisabled : m().pq2.mldsaUnknown}</p>
+        <p class="faint small">{plan.pq2.mldsa44_reason === 'disabled' ? m().pq2.mldsaDisabled : plan.pq2.mldsa44_reason === 'too_many_coins' ? m().pq2.mldsaTooMany : m().pq2.mldsaUnknown}</p>
       )}
       {plan.to_self && <Notice tone="info">{s.toSelf}</Notice>}
       {plan.left > 0 && <Notice tone="warn">{fill(s.leftOut, { n: plan.left })}</Notice>}

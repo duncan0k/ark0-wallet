@@ -164,6 +164,8 @@ export const en = {
     mldsaDisabled: 'Not offered: the node reports ML-DSA-44 checks in pq2 addresses off from the next block.',
     mldsaUnknown: 'Not offered: the node’s state for ML-DSA-44 checks in pq2 addresses cannot be read.',
     witness: '{n} bytes of signature data per coin',
+    staying: '{n} coins of this address ({amount}) stay on it; send again to move them.',
+    mldsaTooMany: 'Not offered for this address: through ML-DSA-44 all of its coins must go together, and they do not fit in one payment. SLH-DSA can pay with part of them.',
     severalCoins: 'All {n} coins of this address are spent together. Use a new pq2 address for each payment you receive, so that a payment does not have to move coins that came separately.',
     changeTo: 'The change goes to a new pq2 address of this wallet.',
     changeBlocked: '20 change addresses of earlier payments have not been seen on the network yet, so this payment can only go without change: choose “All”, or wait until earlier payments are in a block.',
@@ -392,6 +394,9 @@ export const en = {
     pq2_gap_limit: '20 pq2 addresses shown so far have not been paid; use one of them first',
     pq2_change_limit: 'This payment would need change, and no new change address can be used right now: choose “All”, or wait until earlier payments are in a block',
     no_rebuild: 'This payment cannot be rebuilt now',
+    rebuild_original_went_out: 'The original payment has gone out after all (it is confirmed or waiting for a block), so it is not paid again',
+    rebuild_inputs_spent: 'The coins of the original payment are no longer there, so it is not paid again from other coins',
+    rebuild_no_common_input: 'This would not spend any coin of the original payment, so both could go through; it was stopped',
     internal: 'Internal error',
   },
 };

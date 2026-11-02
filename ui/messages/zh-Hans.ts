@@ -166,6 +166,8 @@ export const zhHans: Messages = {
     mldsaDisabled: '不提供：节点报告从下一个区块起，pq2 地址中的 ML-DSA-44 检查已关闭。',
     mldsaUnknown: '不提供：读不到节点关于 pq2 地址中 ML-DSA-44 检查的状态。',
     witness: '每个币 {n} 字节签名数据',
+    staying: '这个地址还有 {n} 个币（{amount}）留在上面；再发一次即可转走。',
+    mldsaTooMany: '这个地址不提供：走 ML-DSA-44 时它的所有币必须一起花，而一笔付款装不下。SLH-DSA 可以只用其中一部分付款。',
     severalCoins: '这个地址的 {n} 个币会一起花掉。请每次收款都用新的 pq2 地址，这样一笔付款就不必动用分别到账的币。',
     changeTo: '找零转到这个钱包的一个新 pq2 地址。',
     changeBlocked: '之前付款的 20 个找零地址还没在网络上出现，所以这笔付款只能不带找零：请选择「全部」，或等之前的付款进块。',
@@ -394,6 +396,9 @@ export const zhHans: Messages = {
     pq2_gap_limit: '已显示的 pq2 地址中有 20 个还没收到付款，请先用其中一个',
     pq2_change_limit: '这笔付款需要找零，但现在不能使用新的找零地址：请选择「全部」，或等之前的付款进块',
     no_rebuild: '这笔付款现在无法重新生成',
+    rebuild_original_went_out: '原来那笔付款最终已经发出（已确认或在等待进块），所以不再重复付款',
+    rebuild_inputs_spent: '原来那笔付款的币已经不在了，所以不改用别的币重新付款',
+    rebuild_no_common_input: '这笔付款不会花原来那笔的任何一个币，两笔可能都成功，已停止',
     internal: '内部错误',
   },
 };
