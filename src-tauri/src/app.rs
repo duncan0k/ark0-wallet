@@ -1178,9 +1178,27 @@ async fn scan_pq2(state: &AppState, wider: bool) -> Res<ScanResult> {
     })
 }
 
+/// Blocks below the last checked tip that a check asks about again: a reorganization of up to this many
+/// blocks may have replaced them.
+const HISTORY_OVERLAP: u32 = 6;
+
+/// Address history from `from` on. When the answer's tip is below `from` (a reorganization lowered it),
+/// asks once more from six blocks below that tip and uses that answer; one still below its `from` is no
+/// answer.
+async fn history_since(sources: &Sources, addresses: &[String], from: u32, flags: &mut Flags) -> Option<crate::api::History> {
+    let first = flags.take(sources.history(addresses, from).await).ok()?;
+    if first.tip_height >= from {
+        return Some(first);
+    }
+    let again = first.tip_height.saturating_sub(HISTORY_OVERLAP);
+    let second = flags.take(sources.history(addresses, again).await).ok()?;
+    (second.tip_height >= again).then_some(second)
+}
+
 /// Asks the site whether any reserved address received something in the blocks since the last check
-/// (`history_tip`); one that did becomes used, and its coins are looked up like the others'. False when the
-/// site could not answer: the tip of the last check stays where it was.
+/// (`history_tip`, less six blocks for a reorganization); one that did becomes used, and its coins are
+/// looked up like the others'. False when the site could not answer: the tip of the last check stays where
+/// it was.
 async fn check_reserved(state: &AppState, sources: &Sources, flags: &mut Flags) -> bool {
     let Ok(book) = state.book() else { return true };
     let reserved: Vec<(u32, u32, String)> = book
@@ -1192,11 +1210,11 @@ async fn check_reserved(state: &AppState, sources: &Sources, flags: &mut Flags) 
     if reserved.is_empty() {
         return true;
     }
-    let from = book.history_tip.unwrap_or(0);
+    let from = book.history_tip.unwrap_or(0).saturating_sub(HISTORY_OVERLAP);
     let mut tip = u32::MAX;
     for part in reserved.chunks(crate::api::MAX_HISTORY_ADDRESSES) {
         let addresses: Vec<String> = part.iter().map(|(_, _, a)| a.clone()).collect();
-        let Ok(history) = flags.take(sources.history(&addresses, from).await) else { return false };
+        let Some(history) = history_since(sources, &addresses, from, flags).await else { return false };
         tip = tip.min(history.tip_height);
         for ((c, i, a), used) in part.iter().zip(history.used) {
             // Only an address the wallet's own keys give at that index.
@@ -5001,6 +5019,8 @@ mod pq2_tests {
         history_fails: Arc<Mutex<Option<(u16, String)>>>,
         /// The `from` of every history request.
         history_from: Arc<Mutex<Vec<u32>>>,
+        /// Tips the history answers give, one per request, before falling back to the state's `blocks`.
+        history_tips: Arc<Mutex<std::collections::VecDeque<u32>>>,
     }
 
     struct Wallet {
@@ -5047,11 +5067,12 @@ mod pq2_tests {
                 }
             }
             guard(&net.history_from).push(from);
-            let tip = guard(&net.state)["blocks"].as_u64().unwrap();
+            let tip = guard(&net.history_tips).pop_front().map_or_else(|| guard(&net.state)["blocks"].as_u64().unwrap(), u64::from);
             let history = guard(&net.history).clone();
             let entries: Vec<Value> = addresses.iter()
                 .map(|a| json!({"address": a, "used": history.get(a).is_some_and(|h| u64::from(*h) >= u64::from(from) && u64::from(*h) <= tip)}))
                 .collect();
+            // Above the tip nothing is used (the site's answer after its tip went below `from`).
             return response(200, &json!({"tip_height": tip, "tip_hash": "ab".repeat(32), "from": from, "addresses": entries}).to_string());
         }
         if path.starts_with("/api/proof?") {
@@ -5290,8 +5311,8 @@ mod pq2_tests {
         guard(&w.net.utxos).insert(address.clone(), vec![utxo('c', 1, 12_000, H4T + 105)]);
         guard(&w.net.history_from).clear();
         let p = block(overview_of(&w.state)).unwrap().pq2.unwrap();
-        // One cheap check from the last tip, for the reserved addresses of both chains (39 left: 2 requests).
-        assert_eq!(*guard(&w.net.history_from), vec![H4T + 100, H4T + 100, H4T + 100, H4T + 100]);
+        // One cheap check from six blocks below the last tip, for the reserved addresses of both chains.
+        assert_eq!(*guard(&w.net.history_from), vec![H4T + 94, H4T + 94, H4T + 94, H4T + 94]);
         assert!(p.addresses.iter().any(|a| a.index == 0 && a.spendable == 12_000));
         let book = w.state.book().unwrap();
         assert!(book.chains[0].used.contains(&0));
@@ -5299,7 +5320,54 @@ mod pq2_tests {
         // The next refresh asks from the new tip only.
         guard(&w.net.history_from).clear();
         block(overview_of(&w.state)).unwrap();
-        assert!(guard(&w.net.history_from).iter().all(|f| *f == H4T + 110));
+        assert!(guard(&w.net.history_from).iter().all(|f| *f == H4T + 104));
+    }
+
+    #[test]
+    fn a_payment_in_blocks_a_reorganization_replaced_is_seen() {
+        let w = wallet("reorg", words(0x59), false, m4_state(H4T + 100, false));
+        block(scan_pq2(&w.state, false)).unwrap();
+        assert_eq!(w.state.book().unwrap().history_tip, Some(H4T + 100));
+        // The last six blocks are replaced by a chain of the same height whose block H4T + 97 pays reserved
+        // index 4: asking from the last tip would miss it.
+        let address = pq2_address(&w, 0, 4);
+        guard(&w.net.history).insert(address.clone(), H4T + 97);
+        guard(&w.net.utxos).insert(address, vec![utxo('e', 0, 7_000, H4T + 97)]);
+        guard(&w.net.history_from).clear();
+        let p = block(overview_of(&w.state)).unwrap().pq2.unwrap();
+        assert!(guard(&w.net.history_from).iter().all(|f| *f == H4T + 94));
+        assert!(p.complete && p.addresses.iter().any(|a| a.index == 4 && a.spendable == 7_000));
+        assert!(w.state.book().unwrap().chains[0].used.contains(&4));
+    }
+
+    #[test]
+    fn a_tip_below_from_is_asked_again_from_below_it() {
+        let w = wallet("tip-lower", words(0x5a), false, m4_state(H4T + 100, false));
+        block(scan_pq2(&w.state, false)).unwrap();
+        // A reorganization took the tip down to H4T + 90; the new chain pays reserved index 7 at H4T + 88.
+        *guard(&w.net.state) = m4_state(H4T + 90, false);
+        let address = pq2_address(&w, 0, 7);
+        guard(&w.net.history).insert(address.clone(), H4T + 88);
+        guard(&w.net.utxos).insert(address, vec![utxo('f', 0, 3_000, H4T + 88)]);
+        guard(&w.net.history_from).clear();
+        let p = block(overview_of(&w.state)).unwrap().pq2.unwrap();
+        // Asked from H4T + 94, answered with tip H4T + 90 and nothing used; asked again from H4T + 84.
+        // Two requests per question (one to each API), for each of the two groups of reserved addresses.
+        let asked = guard(&w.net.history_from).clone();
+        assert_eq!(asked, [H4T + 94, H4T + 94, H4T + 84, H4T + 84].repeat(2));
+        assert!(p.complete && p.addresses.iter().any(|a| a.index == 7 && a.spendable == 3_000));
+        assert_eq!(w.state.book().unwrap().history_tip, Some(H4T + 90));
+        // The second answer still below its `from`: the check is not answered, and nothing moves.
+        let w = wallet("tip-lower-twice", words(0x5b), false, m4_state(H4T + 100, false));
+        block(scan_pq2(&w.state, false)).unwrap();
+        guard(&w.net.history).insert(pq2_address(&w, 0, 7), H4T + 50);
+        // Asked from H4T + 94: tip H4T + 90; asked again from H4T + 84: tip H4T + 60, still below.
+        guard(&w.net.history_tips).extend([H4T + 90, H4T + 90, H4T + 60, H4T + 60]);
+        let p = block(overview_of(&w.state)).unwrap().pq2.unwrap();
+        assert!(!p.complete);
+        let book = w.state.book().unwrap();
+        assert!(!book.chains[0].used.contains(&7));
+        assert_eq!(book.history_tip, Some(H4T + 100));
     }
 
     #[test]

@@ -63,7 +63,8 @@ pub struct Coins {
 }
 
 /// The site's answer about addresses' history: whether any output was paid to each of them in a block from
-/// `from` to `tip_height` (confirmed payments only; mempool payments are in /api/utxos).
+/// `from` to `tip_height` (confirmed payments only; mempool payments are in /api/utxos). A `tip_height`
+/// below `from` (the site's tip went down in a reorganization) comes with nothing used.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct History {
     pub tip_height: u32,
@@ -225,7 +226,7 @@ fn history_from(status: u16, body: &Value, addresses: &[String], from: u32) -> R
     let tip_height = object.get("tip_height").and_then(u32_of).ok_or(ApiError::Malformed)?;
     object.get("tip_hash").and_then(Value::as_str).filter(|h| is_txid(h)).ok_or(ApiError::Malformed)?;
     let answered_from = object.get("from").and_then(u32_of).ok_or(ApiError::Malformed)?;
-    if answered_from != from || from > tip_height {
+    if answered_from != from {
         return Err(ApiError::Malformed);
     }
     let entries = object.get("addresses").and_then(Value::as_array).ok_or(ApiError::Malformed)?;
@@ -239,6 +240,11 @@ fn history_from(status: u16, body: &Value, addresses: &[String], from: u32) -> R
             return Err(ApiError::Malformed);
         }
         used.push(entry.get("used").and_then(Value::as_bool).ok_or(ApiError::Malformed)?);
+    }
+    // A tip below `from` (after a reorganization lowered it) is answered with nothing used; the caller
+    // asks again from below that tip. Anything used there is not an answer the site gives.
+    if tip_height < from && used.iter().any(|u| *u) {
+        return Err(ApiError::Malformed);
     }
     Ok(History { tip_height, from, used })
 }
@@ -599,7 +605,7 @@ pub(crate) mod tests {
             ("no tip hash", Box::new(|v| { v.as_object_mut().unwrap().remove("tip_hash"); })),
             ("a bad tip hash", Box::new(|v| v["tip_hash"] = json!("xyz"))),
             ("another from", Box::new(|v| v["from"] = json!(0))),
-            ("from above the tip", Box::new(|v| v["tip_height"] = json!(54_999))),
+            ("used above a tip below from", Box::new(|v| v["tip_height"] = json!(54_999))),
             ("not an object", Box::new(|v| *v = json!([]))),
         ];
         for (what, edit) in broken {
@@ -608,6 +614,11 @@ pub(crate) mod tests {
             assert_eq!(history_from(200, &v, &asked, 55_000), Err(ApiError::Malformed), "{what}");
         }
         assert_eq!(history_from(404, &good, &asked, 55_000), Err(ApiError::Malformed));
+        // A tip below `from` with nothing used is an answer: the caller asks again from below it.
+        let mut lower = good.clone();
+        lower["tip_height"] = json!(54_000);
+        lower["addresses"][0]["used"] = json!(false);
+        assert_eq!(history_from(200, &lower, &asked, 55_000), Ok(History { tip_height: 54_000, from: 55_000, used: vec![false, false] }));
         // Over HTTP: the query, and "try later" and refusals as errors.
         let body = good.to_string();
         let (api, server) = serve(vec![
