@@ -328,6 +328,8 @@ export const zhHans: Messages = {
       mldsa44_hedged_signing: 'ML-DSA-44 随机化签名',
       schnorr_bip340_vector: 'Schnorr BIP-340（标准向量）',
       schnorr_verify: 'Schnorr 验签',
+      slhdsa128s_keygen_vector: 'SLH-DSA 密钥生成（测试向量）',
+      slhdsa128s_deterministic_signature_vector: 'SLH-DSA 签名（测试向量）',
       os_randomness: '系统随机数',
     },
     timings: {
@@ -336,6 +338,7 @@ export const zhHans: Messages = {
       mldsa44_verify: 'ML-DSA-44 验签',
       schnorr_sign: 'Schnorr 签名',
       schnorr_verify: 'Schnorr 验签',
+      slhdsa128s_sign: 'SLH-DSA 签名',
     },
     recoveryWarning: '确认周围没有人和摄像头。谁拿到这些词，谁就能动用钱包里的币。',
   },

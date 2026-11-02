@@ -328,6 +328,8 @@ export const zhHant: Messages = {
       mldsa44_hedged_signing: 'ML-DSA-44 隨機化簽章',
       schnorr_bip340_vector: 'Schnorr BIP-340（標準向量）',
       schnorr_verify: 'Schnorr 驗章',
+      slhdsa128s_keygen_vector: 'SLH-DSA 金鑰產生（測試向量）',
+      slhdsa128s_deterministic_signature_vector: 'SLH-DSA 簽章（測試向量）',
       os_randomness: '系統亂數',
     },
     timings: {
@@ -336,6 +338,7 @@ export const zhHant: Messages = {
       mldsa44_verify: 'ML-DSA-44 驗章',
       schnorr_sign: 'Schnorr 簽章',
       schnorr_verify: 'Schnorr 驗章',
+      slhdsa128s_sign: 'SLH-DSA 簽章',
     },
     recoveryWarning: '確認周圍沒有人和攝影機。誰拿到這些詞，誰就能動用錢包裡的幣。',
   },

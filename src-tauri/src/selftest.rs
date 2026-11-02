@@ -157,6 +157,28 @@ pub fn run() -> Report {
         }
     }
 
+    // --- SLH-DSA-SHA2-128s: known answers of another implementation, not a round trip ---
+    let slh_keys_ok = crate::slhdsa::KAT_KEYS.iter().all(|(seed, public)| {
+        let seed: [u8; crate::slhdsa::SEED_LEN] = hex::decode(seed).ok().and_then(|s| s.try_into().ok()).unwrap_or([0; crate::slhdsa::SEED_LEN]);
+        crate::slhdsa::keypair_from_seed(&seed).is_ok_and(|p| hex::encode(p.public) == *public)
+    });
+    check(&mut checks, "slhdsa128s_keygen_vector", slh_keys_ok, format!("three public keys {}", ok_word(slh_keys_ok)));
+    let seed: [u8; crate::slhdsa::SEED_LEN] = hex::decode(crate::slhdsa::KAT_KEYS[1].0).ok().and_then(|s| s.try_into().ok()).unwrap_or([0; crate::slhdsa::SEED_LEN]);
+    let kat_message = hex::decode(crate::slhdsa::KAT_MESSAGE).unwrap_or_default();
+    match crate::slhdsa::keypair_from_seed(&seed) {
+        Err(e) => check(&mut checks, "slhdsa128s_deterministic_signature_vector", false, format!("{e:?}")),
+        Ok(kp) => match crate::slhdsa::sign_known_answer(&kat_message, crate::p2mr::SLHDSA128S_CONTEXT, &kp.secret) {
+            Err(e) => check(&mut checks, "slhdsa128s_deterministic_signature_vector", false, format!("{e:?}")),
+            Ok(sig) => {
+                let same = sha256_hex(&sig[..]) == crate::slhdsa::KAT_SIGNATURE_SHA256;
+                check(&mut checks, "slhdsa128s_deterministic_signature_vector", same, "byte-identical to @noble/post-quantum 0.7.1".to_string());
+                timings.push(measure("slhdsa128s_sign", 3, || {
+                    let _ = crate::slhdsa::sign(&kat_message, crate::p2mr::SLHDSA128S_CONTEXT, &kp.secret);
+                }));
+            }
+        },
+    }
+
     // --- the operating system's random generator, as mldsa-native sees it ---
     let (mut a, mut b) = ([0u8; 32], [0u8; 32]);
     let ra = mldsa::pqw_randombytes(a.as_mut_ptr(), a.len());

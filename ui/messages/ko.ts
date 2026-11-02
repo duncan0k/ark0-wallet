@@ -328,6 +328,8 @@ export const ko: Messages = {
       mldsa44_hedged_signing: 'ML-DSA-44 무작위화 서명',
       schnorr_bip340_vector: 'Schnorr BIP-340(테스트 벡터)',
       schnorr_verify: 'Schnorr 서명 검증',
+      slhdsa128s_keygen_vector: 'SLH-DSA 키 생성(테스트 벡터)',
+      slhdsa128s_deterministic_signature_vector: 'SLH-DSA 서명(테스트 벡터)',
       os_randomness: '시스템 난수',
     },
     timings: {
@@ -336,6 +338,7 @@ export const ko: Messages = {
       mldsa44_verify: 'ML-DSA-44 서명 검증',
       schnorr_sign: 'Schnorr 서명',
       schnorr_verify: 'Schnorr 서명 검증',
+      slhdsa128s_sign: 'SLH-DSA 서명',
     },
     recoveryWarning: '주변에 사람이나 카메라가 없는지 확인하세요. 이 단어만 있으면 누구나 지갑의 코인을 옮길 수 있습니다.',
   },

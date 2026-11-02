@@ -328,6 +328,8 @@ export const ru: Messages = {
       mldsa44_hedged_signing: 'Рандомизированная подпись ML-DSA-44',
       schnorr_bip340_vector: 'Schnorr BIP-340 (тестовый вектор)',
       schnorr_verify: 'Проверка подписи Schnorr',
+      slhdsa128s_keygen_vector: 'Генерация ключей SLH-DSA (тестовый вектор)',
+      slhdsa128s_deterministic_signature_vector: 'Подпись SLH-DSA (тестовый вектор)',
       os_randomness: 'Системные случайные числа',
     },
     timings: {
@@ -336,6 +338,7 @@ export const ru: Messages = {
       mldsa44_verify: 'Проверка подписи ML-DSA-44',
       schnorr_sign: 'Подпись Schnorr',
       schnorr_verify: 'Проверка подписи Schnorr',
+      slhdsa128s_sign: 'Подпись SLH-DSA',
     },
     recoveryWarning: 'Убедитесь, что экран не видят ни люди, ни камеры. У кого окажутся эти слова, тот сможет распоряжаться монетами кошелька.',
   },

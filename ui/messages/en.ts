@@ -326,6 +326,8 @@ export const en = {
       mldsa44_hedged_signing: 'ML-DSA-44 hedged signing',
       schnorr_bip340_vector: 'Schnorr BIP-340 (test vector)',
       schnorr_verify: 'Schnorr verification',
+      slhdsa128s_keygen_vector: 'SLH-DSA key generation (test vector)',
+      slhdsa128s_deterministic_signature_vector: 'SLH-DSA signature (test vector)',
       os_randomness: 'System randomness',
     },
     timings: {
@@ -334,6 +336,7 @@ export const en = {
       mldsa44_verify: 'ML-DSA-44 verification',
       schnorr_sign: 'Schnorr signing',
       schnorr_verify: 'Schnorr verification',
+      slhdsa128s_sign: 'SLH-DSA signing',
     },
     recoveryWarning: 'Make sure nobody and no camera can see your screen. Whoever has these words can move the wallet’s coins.',
   },

@@ -328,6 +328,8 @@ export const es: Messages = {
       mldsa44_hedged_signing: 'Firma aleatorizada ML-DSA-44',
       schnorr_bip340_vector: 'Schnorr BIP-340 (vector de prueba)',
       schnorr_verify: 'Verificación Schnorr',
+      slhdsa128s_keygen_vector: 'Generación de claves SLH-DSA (vector de prueba)',
+      slhdsa128s_deterministic_signature_vector: 'Firma SLH-DSA (vector de prueba)',
       os_randomness: 'Números aleatorios del sistema',
     },
     timings: {
@@ -336,6 +338,7 @@ export const es: Messages = {
       mldsa44_verify: 'Verificación ML-DSA-44',
       schnorr_sign: 'Firma Schnorr',
       schnorr_verify: 'Verificación Schnorr',
+      slhdsa128s_sign: 'Firma SLH-DSA',
     },
     recoveryWarning: 'Asegúrate de que ninguna persona ni cámara pueda ver tu pantalla. Quien tenga estas palabras puede mover las monedas de la billetera.',
   },

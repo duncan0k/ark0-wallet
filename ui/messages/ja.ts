@@ -328,6 +328,8 @@ export const ja: Messages = {
       mldsa44_hedged_signing: 'ML-DSA-44 ランダム化署名',
       schnorr_bip340_vector: 'Schnorr BIP-340（テストベクター）',
       schnorr_verify: 'Schnorr 署名検証',
+      slhdsa128s_keygen_vector: 'SLH-DSA 鍵生成（テストベクター）',
+      slhdsa128s_deterministic_signature_vector: 'SLH-DSA 署名（テストベクター）',
       os_randomness: 'システムの乱数',
     },
     timings: {
@@ -336,6 +338,7 @@ export const ja: Messages = {
       mldsa44_verify: 'ML-DSA-44 署名検証',
       schnorr_sign: 'Schnorr 署名',
       schnorr_verify: 'Schnorr 署名検証',
+      slhdsa128s_sign: 'SLH-DSA 署名',
     },
     recoveryWarning: '周りに人やカメラがないことを確かめてください。これらの単語を手に入れた人は誰でも、ウォレットのコインを動かせます。',
   },

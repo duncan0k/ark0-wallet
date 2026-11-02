@@ -363,7 +363,7 @@ impl Pq2Keys {
 
     #[cfg(test)]
     pub(crate) fn sign_slhdsa128s_deterministic(&self, message: &[u8; 32]) -> Box<[u8; slhdsa::SIGNATURE_LEN]> {
-        let signature = slhdsa::sign_deterministic(message, SLHDSA128S_CONTEXT, &self.slhdsa128s.secret).expect("signs");
+        let signature = slhdsa::sign_known_answer(message, SLHDSA128S_CONTEXT, &self.slhdsa128s.secret).expect("signs");
         checked_slh(&self.slhdsa128s, message, signature).expect("verifies")
     }
 

@@ -58,3 +58,15 @@ never reads a signature whose length has not been checked. `build.rs` compiles t
 plain C with the compiler's defaults, optimized in every profile.
 
 `scripts/check-vendor.sh` also fetches that commit of slhdsa-c and compares every vendored file with it.
+
+### Byte order
+
+slhdsa-c chooses its byte swaps with `#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__`. MSVC defines neither
+macro, so both read as 0 and a little-endian Windows build would take the big-endian branch. `build.rs`
+force-includes `pqw_slh_byteorder.h` before every slhdsa-c file (`/FI` with MSVC, `-include` otherwise),
+leaving the vendored files as they are: it checks the compiler's three macros, defines them for MSVC's
+little-endian targets, refuses any other compiler that defines none, and compares the result with the
+target's byte order from Cargo. `scripts/check-byte-order.sh` builds the library in those macro
+environments and runs `test/slh_kat.c` (known answers of an independent implementation); the Rust tests and
+the app's self-test check the same answers. mldsa-native needs no such header: its `src/sys.h` knows MSVC's
+targets, and without a known byte order it uses portable byte-wise code.

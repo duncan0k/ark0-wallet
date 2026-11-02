@@ -85,13 +85,6 @@ pub fn sign(message: &[u8], context: &[u8], secret: &SecretKey) -> Result<Box<[u
     result
 }
 
-/// The deterministic variant (opt_rand = PK.seed). Used only to reproduce test vectors byte for byte; the
-/// wallet signs with `sign`.
-#[cfg(test)]
-pub fn sign_deterministic(message: &[u8], context: &[u8], secret: &SecretKey) -> Result<Box<[u8; SIGNATURE_LEN]>, Error> {
-    sign_with(message, context, secret, None)
-}
-
 /// With a given opt_rand, to reproduce a hedged test vector.
 #[cfg(test)]
 pub fn sign_with_randomness(message: &[u8], context: &[u8], secret: &SecretKey, randomness: &[u8; RANDOMNESS_LEN]) -> Result<Box<[u8; SIGNATURE_LEN]>, Error> {
@@ -108,9 +101,50 @@ pub fn verify(signature: &[u8; SIGNATURE_LEN], message: &[u8], context: &[u8], p
     rc == 0
 }
 
+/// Known answers from an independent implementation (p2mr-ts with @noble/post-quantum 0.7.1, its M4
+/// vectors): seed, public key; and for the first, a message and the SHA-256 of its deterministic signature
+/// with OP_CHECKSLHDSA128S's context. A build with the wrong byte order gets every one of them wrong.
+pub const KAT_KEYS: [(&str, &str); 3] = [
+    (
+        "d1a914a61630a183ff238cd37b4b8f8d44685573cde337c04a3e57ca1090f2412403aff2966abd00377cc0a1791b5163",
+        "2403aff2966abd00377cc0a1791b5163532756d0b79b4d1c24be1b3830cfa535",
+    ),
+    (
+        "02d8ae9f631f168961bee809f50a64e37c6c3bd0f222dc289946b6bd5a2246678a01c204fb7af8f5fc9da3a8f9c62a6d",
+        "8a01c204fb7af8f5fc9da3a8f9c62a6d7c89185b287f18e53e93c2e7b7ec3c17",
+    ),
+    (
+        "f8160ee5a953c43d28b3be4a85475bcf00cd040d2300be4272d1733e9b6c900388d1801ea9c2caf67fd6e4198dd19eba",
+        "88d1801ea9c2caf67fd6e4198dd19eba18220f7064dea4afcd39085cc59bd1d2",
+    ),
+];
+/// Key B (the second above) signs this message deterministically; the signature's SHA-256.
+pub const KAT_MESSAGE: &str = "2ff4487eee01ffc57e04b3f20f5cc0887523a609c218f823af7057cc46577d1f";
+pub const KAT_SIGNATURE_SHA256: &str = "f46d95ecffe77ea332b7b56ba67036677b24e4a962ea5b837cd5d99a02ce4bc9";
+
+/// The deterministic variant, for the known-answer checks (the self-test and the tests); the wallet signs
+/// with `sign`.
+pub fn sign_known_answer(message: &[u8], context: &[u8], secret: &SecretKey) -> Result<Box<[u8; SIGNATURE_LEN]>, Error> {
+    sign_with(message, context, secret, None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
+
+    #[test]
+    fn known_answers_of_an_independent_implementation() {
+        for (seed, public) in KAT_KEYS {
+            let pair = keypair_from_seed(&hex::decode(seed).unwrap().try_into().unwrap()).unwrap();
+            assert_eq!(hex::encode(pair.public), public);
+        }
+        let pair = keypair_from_seed(&hex::decode(KAT_KEYS[1].0).unwrap().try_into().unwrap()).unwrap();
+        let message = hex::decode(KAT_MESSAGE).unwrap();
+        let sig = sign_known_answer(&message, b"P2MR/SLHDSA128S/EXP0", &pair.secret).unwrap();
+        assert_eq!(hex::encode(Sha256::digest(&sig[..])), KAT_SIGNATURE_SHA256);
+        assert!(verify(&sig, &message, b"P2MR/SLHDSA128S/EXP0", &pair.public));
+    }
     const SLHDSA128S_CONTEXT: &[u8] = b"P2MR/SLHDSA128S/EXP0";
 
     #[test]
@@ -137,8 +171,8 @@ mod tests {
         assert!(!verify(&sig, &message, &[0u8; 256], &pair.public));
         // The deterministic variant is reproducible.
         assert_eq!(
-            sign_deterministic(&message, SLHDSA128S_CONTEXT, &pair.secret).unwrap()[..],
-            sign_deterministic(&message, SLHDSA128S_CONTEXT, &pair.secret).unwrap()[..]
+            sign_known_answer(&message, SLHDSA128S_CONTEXT, &pair.secret).unwrap()[..],
+            sign_known_answer(&message, SLHDSA128S_CONTEXT, &pair.secret).unwrap()[..]
         );
     }
 }
