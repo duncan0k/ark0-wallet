@@ -177,6 +177,19 @@ struct PendingSend {
     pq2: Option<Pq2Pending>,
     /// The address the payment spends from.
     plan_address: String,
+    /// The payment this one rebuilds through the SLH-DSA leaf.
+    rebuild: Option<Rebuild>,
+}
+
+/// A rebuild is bound to the payment it replaces: it spends at least one of that payment's inputs, so
+/// that the two can never both confirm, and it is not made once that payment is confirmed or in the
+/// mempool.
+#[derive(Clone, Debug)]
+struct Rebuild {
+    /// The original's txid; empty when it was dropped before it was sent.
+    txid: String,
+    /// The original's inputs, as "txid:vout".
+    inputs: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -814,6 +827,8 @@ pub struct Pq2AddressView {
     chain: u32,
     index: u32,
     address: String,
+    /// All its coins fit in one payment through the ML-DSA-44 leaf (which must spend them together).
+    mldsa44_fits: bool,
     spendable: u64,
     pending: u64,
     incoming: u64,
@@ -971,9 +986,12 @@ async fn pq2_overview(state: &AppState, chain: &Chain, sources: &Sources, flags:
             view.pending += sum(&coins.pending);
             view.incoming += incoming;
             if !list.is_empty() {
+                let template = state.pq2_template(c as u32, index).ok();
+                let fits = template.as_ref().is_some_and(|t| mldsa44_fits(t, &coins.spendable, &Destination { address: t.address.clone(), script_pubkey: t.script_pubkey.clone(), dust: 330 }));
                 view.addresses.push(Pq2AddressView {
                     chain: c as u32,
                     index,
+                    mldsa44_fits: fits,
                     address,
                     spendable: sum(&coins.spendable),
                     pending: sum(&coins.pending),
@@ -1130,12 +1148,16 @@ pub struct Pq2PlanView {
     address: String,
     /// The ML-DSA-44 leaf may be chosen: the node reports ML-DSA-44 checks in 0xe2 leaves still on.
     mldsa44_allowed: bool,
-    /// Why not, when not: "disabled" (the node reports them off from the next block) or "unknown".
+    /// Why not, when not: "disabled" (the node reports them off from the next block), "unknown", or
+    /// "too_many_coins" (all the address's coins, which that leaf must spend together, do not fit).
     mldsa44_reason: Option<&'static str>,
     /// Bytes of witness per input through the leaf taken (design section 8.1: 7,972 or 3,795).
     witness_bytes: usize,
-    /// The address holds several coins, all spent together.
+    /// The payment spends several coins of the address.
     several_coins: bool,
+    /// Coins of the address this payment leaves on it, and their total: send again to move them.
+    staying_coins: usize,
+    staying_sats: u64,
     /// The change address, on the change chain.
     change_address: Option<String>,
     /// The change chain is at the gap limit: the payment can only go without change.
@@ -1285,7 +1307,7 @@ async fn plan_payment(state: &AppState, from: Kind, to: String, amount: String) 
     let caution = went_out || earlier.elsewhere || earlier.unrecorded;
     *guard(&state.pending) = Some(PendingSend {
         id: view.id.clone(), created: Instant::now(), kind: from, path: account.path, destination, plan, caution, sources: flags,
-        creates_pq2, pq2: None, plan_address: view_from_address,
+        creates_pq2, pq2: None, plan_address: view_from_address, rebuild: None,
     });
     Ok(view)
 }
@@ -1294,7 +1316,7 @@ async fn plan_payment(state: &AppState, from: Kind, to: String, amount: String) 
 /// user asks for the ML-DSA-44 leaf and the node reports it still works, the change to a fresh address on
 /// the change chain (or no change, at its gap limit), nLockTime H4T. `rebuilt_from`: the payment through
 /// the ML-DSA-44 leaf this one replaces.
-async fn plan_pq2_payment(state: &AppState, address: String, to: String, amount: String, wanted: Option<Path>, rebuilt_from: Option<String>) -> Res<SendPlan> {
+async fn plan_pq2_payment(state: &AppState, address: String, to: String, amount: String, wanted: Option<Path>, rebuild: Option<Rebuild>) -> Res<SendPlan> {
     state.touch();
     let book = state.book()?;
     let (chain_index, index) = book.find(&address).ok_or_else(|| Failure::new("address_not_ready"))?;
@@ -1313,9 +1335,7 @@ async fn plan_pq2_payment(state: &AppState, address: String, to: String, amount:
         return Err(Failure::new("destination_not_ready"));
     }
     let template = state.pq2_template(chain_index, index)?;
-    let path = chain.pq2_path(wanted);
-    let account = Account::new(template, path).ok_or_else(|| Failure::new("address_not_ready"))?;
-    let coins = flags.take(sources.coins(&account.template.address).await)?;
+    let coins = flags.take(sources.coins(&template.address).await)?;
     note_used(state, chain_index, index, &address, &coins);
     let at = now();
     let sent = refresh_sent(state, |s| {
@@ -1324,24 +1344,54 @@ async fn plan_pq2_payment(state: &AppState, address: String, to: String, amount:
     if sent.iter().any(|s| s.status == "submitting") {
         return Err(Failure::new("sending"));
     }
-    let pending = pending_everywhere(&sources, &coins, &own, &account.template.address, &mut flags).await?;
+    // A rebuild is decided again from the original's state as the refresh found it.
+    if let Some(r) = &rebuild {
+        if sent.iter().any(|s| s.txid == r.txid && original_went_out(s)) {
+            return Err(Failure::new("rebuild_original_went_out"));
+        }
+    }
+    let pending = pending_everywhere(&sources, &coins, &own, &template.address, &mut flags).await?;
     let name = account_name(Kind::Pq2, Some(&address));
     let earlier = earlier_payments(&sent, &name, &coins.spendable, &pending);
     let went_out = earlier.spent || surfaced(&sent);
-    // Several coins on one address go together: one spend reveals the leaf all of them are locked to.
-    let required = earlier.usable.clone();
     let change_index = state.book()?.chains[CHANGE_CHAIN as usize].next().filter(|_| chain.pq2_allowed);
     let change = match change_index {
         Some(i) => Some(state.pq2_template(CHANGE_CHAIN, i)?),
         None => None,
     };
+    // Through the ML-DSA-44 leaf every usable coin of the address goes at once: the spend shows the key all
+    // of them are locked to. When they do not fit in one transaction, that leaf is not offered here.
+    let mldsa44_fits = mldsa44_fits(&template, &earlier.usable, &destination);
+    let path = if mldsa44_fits { chain.pq2_path(wanted) } else { Path::Slhdsa128s };
+    let account = Account::new(template, path).ok_or_else(|| Failure::new("address_not_ready"))?;
+    // Through the SLH-DSA leaf, the fewest coins that pay (largest first), or as many as fit for "all";
+    // the coins earlier payments require, and for a rebuild the original's coins, go first.
+    let mut required = if path == Path::Mldsa44 { earlier.usable.clone() } else { earlier.required.clone() };
+    if let Some(r) = &rebuild {
+        let original: Vec<Coin> = earlier.usable.iter().filter(|c| r.inputs.contains(&c.outpoint())).cloned().collect();
+        if original.is_empty() {
+            return Err(Failure::new("rebuild_inputs_spent"));
+        }
+        for c in original {
+            if !required.contains(&c) {
+                required.push(c);
+            }
+        }
+    }
     // nLockTime H4T when the payment creates a pq2 output: its change, or one of the wallet's own pq2
     // addresses as destination. The lock time does not change the sizes, so it is set once planned.
     let to_own_pq2 = own_pq2(state).contains(&destination.address);
     let mut plan = wallet::plan_spend_to(&account, &earlier.usable, &required, &destination, amount, chain.lock_time(), change.as_ref().map(|t| &t.script_pubkey))
         .map_err(|e| if e == PlanError::NeedsChange { Failure::new("pq2_change_limit") } else { e.into() })?;
+    if let Some(r) = &rebuild {
+        if !plan.coins.iter().any(|c| r.inputs.contains(&c.outpoint())) {
+            return Err(Failure::new("rebuild_no_common_input"));
+        }
+    }
     let change_used = plan.change > 0;
     let creates_pq2 = change_used || to_own_pq2;
+    let planned: HashSet<String> = plan.coins.iter().map(Coin::outpoint).collect();
+    let staying: Vec<&Coin> = earlier.usable.iter().filter(|c| !planned.contains(&c.outpoint())).collect();
     if creates_pq2 && !chain.pq2_allowed {
         return Err(Failure::new("destination_not_ready"));
     }
@@ -1371,17 +1421,20 @@ async fn plan_pq2_payment(state: &AppState, address: String, to: String, amount:
         sources_disagree: flags.disagree,
         pq2: Some(Pq2PlanView {
             address: address.clone(),
-            mldsa44_allowed: chain.pq2_mldsa44_allowed(),
+            mldsa44_allowed: chain.pq2_mldsa44_allowed() && mldsa44_fits,
             mldsa44_reason: match chain.mldsa_disabled {
-                Some(false) => None,
+                Some(false) if mldsa44_fits => None,
+                Some(false) => Some("too_many_coins"),
                 Some(true) => Some("disabled"),
                 None => Some("unknown"),
             },
+            staying_coins: staying.len(),
+            staying_sats: staying.iter().map(|c| c.sats).sum(),
             witness_bytes: witness_bytes(path),
             several_coins: plan.coins.len() > 1,
             change_address: change.filter(|_| change_used).map(|t| t.address),
             change_blocked: change_index.is_none(),
-            rebuilt_from,
+            rebuilt_from: rebuild.as_ref().map(|r| r.txid.clone()),
         }),
     };
     let caution = went_out || earlier.elsewhere || earlier.unrecorded;
@@ -1390,8 +1443,23 @@ async fn plan_pq2_payment(state: &AppState, address: String, to: String, amount:
         creates_pq2,
         pq2: Some(Pq2Pending { chain: chain_index, index, change: change_index.filter(|_| change_used), wanted }),
         plan_address: address,
+        rebuild,
     });
     Ok(view)
+}
+
+/// Whether every usable coin of a pq2 address fits in one transaction through the ML-DSA-44 leaf, with a
+/// destination and a change output.
+fn mldsa44_fits(template: &Template, usable: &[Coin], destination: &Destination) -> bool {
+    let Some(account) = Account::new(template.clone(), Path::Mldsa44) else { return false };
+    let outputs = [(0, destination.script_pubkey.clone()), (0, template.script_pubkey.clone())];
+    usable.is_empty() || wallet::measure(&account, usable, &outputs, 0).size <= wallet::MAX_TX_BYTES
+}
+
+/// The original of a rebuild has gone out after all, or is on its way: confirmed, in the mempool, or
+/// replaced by a proven payment.
+fn original_went_out(s: &Sent) -> bool {
+    matches!(s.status.as_str(), "confirmed" | "mempool" | "replaced")
 }
 
 /// The serialized witness of one input through a leaf: count, then each element with its length.
@@ -1424,9 +1492,10 @@ async fn rebuild_plan(state: &AppState, txid: &str) -> Res<SendPlan> {
         return Err(Failure::new("no_rebuild"));
     }
     let amount = format_coins(old.send);
-    match plan_pq2_payment(state, old.address.clone(), old.to.clone(), amount, Some(Path::Slhdsa128s), Some(old.txid.clone())).await {
+    let rebuild = Rebuild { txid: old.txid.clone(), inputs: old.outpoints.clone() };
+    match plan_pq2_payment(state, old.address.clone(), old.to.clone(), amount, Some(Path::Slhdsa128s), Some(rebuild.clone())).await {
         Err(f) if f.code == "insufficient" || f.code == "pq2_change_limit" => {
-            plan_pq2_payment(state, old.address.clone(), old.to.clone(), "all".into(), Some(Path::Slhdsa128s), Some(old.txid.clone())).await
+            plan_pq2_payment(state, old.address.clone(), old.to.clone(), "all".into(), Some(Path::Slhdsa128s), Some(rebuild)).await
         }
         other => other,
     }
@@ -1442,7 +1511,7 @@ fn format_coins(sats: u64) -> String {
     format!("{}.{:08}", sats / 100_000_000, sats % 100_000_000)
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct SendResult {
     result: BroadcastResult,
     txid: String,
@@ -1517,6 +1586,30 @@ async fn send_plan<F: Future<Output = bool>>(
             return rebuild_unsent(state, &pending).await;
         }
     }
+    // A rebuild, right before it goes out: it still spends one of the original's inputs, and the original
+    // has not gone out meanwhile (looked up again now; no answer, no broadcast).
+    if let Some(r) = &pending.rebuild {
+        if !pending.plan.coins.iter().any(|c| r.inputs.contains(&c.outpoint())) {
+            return Err(Failure::new("rebuild_no_common_input"));
+        }
+        if !r.txid.is_empty() {
+            let status = state.sources.tx_status(&r.txid).await.value?;
+            if matches!(status, TxStatus::Confirmed { .. } | TxStatus::Mempool) {
+                let _ = edit_sent(state, |sent| {
+                    if let Some(s) = sent.iter_mut().find(|s| s.txid == r.txid) {
+                        let (st, n) = match status {
+                            TxStatus::Confirmed { confirmations } => ("confirmed", confirmations.min(REQUIRED_BLOCKS - 1)),
+                            _ => ("mempool", 0),
+                        };
+                        s.status = st.into();
+                        s.confirmations = n;
+                    }
+                    mark_replaced(sent);
+                });
+                return Err(Failure::new("rebuild_original_went_out"));
+            }
+        }
+    }
     // The change address is handed out before the payment is recorded: it is never given to another.
     if let Some(Pq2Pending { change: Some(index), .. }) = pending.pq2 {
         let address = state.pq2_template(CHANGE_CHAIN, index)?.address;
@@ -1569,9 +1662,10 @@ async fn rebuild_unsent(state: &AppState, pending: &PendingSend) -> Res<SendResu
     let p = pending.pq2.ok_or_else(|| Failure::new("chain_changed"))?;
     let address = state.pq2_template(p.chain, p.index)?.address;
     let to = pending.destination.address.clone();
-    let mut plan = plan_pq2_payment(state, address.clone(), to.clone(), format_coins(pending.plan.send), Some(Path::Slhdsa128s), Some(String::new())).await;
+    let rebuild = Rebuild { txid: String::new(), inputs: pending.plan.coins.iter().map(Coin::outpoint).collect() };
+    let mut plan = plan_pq2_payment(state, address.clone(), to.clone(), format_coins(pending.plan.send), Some(Path::Slhdsa128s), Some(rebuild.clone())).await;
     if matches!(&plan, Err(f) if f.code == "insufficient" || f.code == "pq2_change_limit") {
-        plan = plan_pq2_payment(state, address, to, "all".into(), Some(Path::Slhdsa128s), Some(String::new())).await;
+        plan = plan_pq2_payment(state, address, to, "all".into(), Some(Path::Slhdsa128s), Some(rebuild)).await;
     }
     Ok(SendResult { result: BroadcastResult::Unknown, txid: String::new(), sign_ms: 0.0, rebuilt: Some(plan?) })
 }
@@ -1649,8 +1743,9 @@ async fn recheck_payment(state: &AppState, pending: &mut PendingSend) -> Res<(Ac
     if !pending.plan.coins.iter().all(|c| unspent.get(&c.outpoint()) == Some(&c.sats)) {
         return Err(Failure::new("coins_changed"));
     }
-    // From a pq2 address, every coin of it goes: one that came since the review means a new review.
-    if pending.pq2.is_some() && coins.spendable.len() != pending.plan.coins.len() && pending.plan.left == 0 {
+    // Through the ML-DSA-44 leaf every coin of the address goes: one that came since the review means a new
+    // review.
+    if pending.pq2.is_some() && pending.path == Path::Mldsa44 && coins.spendable.len() != pending.plan.coins.len() && pending.plan.left == 0 {
         let planned: HashSet<String> = pending.plan.coins.iter().map(Coin::outpoint).collect();
         if coins.spendable.iter().any(|c| !planned.contains(&c.outpoint())) {
             return Err(Failure::new("coins_changed"));
@@ -2131,7 +2226,7 @@ async fn run_drill<F: std::future::Future<Output = bool>>(
         id: String::new(), created: Instant::now(), kind: Kind::Mixed, path, destination, plan,
         // The drill dialog does not authorize paying in addition to an earlier uncertain payment.
         caution: false, sources: flags,
-        creates_pq2: false, pq2: None, plan_address: account.template.address.clone(),
+        creates_pq2: false, pq2: None, plan_address: account.template.address.clone(), rebuild: None,
     };
     if state.generation() != generation {
         return Err(Failure::new("locked"));
@@ -3161,7 +3256,7 @@ mod tests {
         let mut pending = PendingSend {
             id: "retry".into(), created: Instant::now(), kind: Kind::Schnorr, path: Path::Schnorr,
             destination, plan, caution: true, sources: Flags::default(),
-            creates_pq2: false, pq2: None, plan_address: account.template.address.clone(),
+            creates_pq2: false, pq2: None, plan_address: account.template.address.clone(), rebuild: None,
         };
         let record_for = |p: &PendingSend| Sent {
             outpoints: p.plan.coins.iter().map(Coin::outpoint).collect(),
@@ -4831,6 +4926,8 @@ mod pq2_tests {
         /// Run when a broadcast arrives (the node's state may change with it).
         on_broadcast: Arc<Mutex<Option<Value>>>,
         broadcasts: Arc<Mutex<Vec<String>>>,
+        /// /api/tx answers by txid; unknown otherwise.
+        txs: Arc<Mutex<HashMap<String, Value>>>,
     }
 
     struct Wallet {
@@ -4859,8 +4956,9 @@ mod pq2_tests {
             let incoming = guard(&net.incoming).get(address).cloned().unwrap_or_default();
             return response(200, &json!({"utxos": utxos, "unconfirmed": incoming, "unconfirmed_complete": true, "truncated": false}).to_string());
         }
-        if path.starts_with("/api/tx?") {
-            return response(200, r#"{"status":"unknown"}"#);
+        if let Some(txid) = path.strip_prefix("/api/tx?txid=") {
+            let answer = guard(&net.txs).get(txid).cloned().unwrap_or(json!({"status": "unknown"}));
+            return response(200, &answer.to_string());
         }
         if path.starts_with("/api/proof?") {
             return response(404, r#"{"error":"not_confirmed"}"#);
@@ -5073,11 +5171,13 @@ mod pq2_tests {
         let p = block(overview_of(&w.state)).unwrap().pq2.unwrap();
         assert_eq!(p.addresses[0].coins[0].status, Pq2Status::Unprotected);
         guard(&w.net.incoming).clear();
-        // The default leaf, both coins, change to the change chain, H4T as lock time.
+        // The default leaf, the larger coin alone (the other stays), change to the change chain, H4T as
+        // lock time.
         let view = block(plan_pq2_payment(&w.state, address.clone(), elsewhere(), "0.001".into(), None, None)).unwrap();
-        assert_eq!((view.signature, view.inputs), (Path::Slhdsa128s, 2));
+        assert_eq!((view.signature, view.inputs), (Path::Slhdsa128s, 1));
         let p = view.pq2.as_ref().unwrap();
-        assert!(p.several_coins && p.mldsa44_allowed);
+        assert!(!p.several_coins && p.mldsa44_allowed);
+        assert_eq!((p.staying_coins, p.staying_sats), (1, 60_000));
         assert_eq!(p.witness_bytes, 7_972);
         assert_eq!(p.change_address.as_deref(), Some(pq2_address(&w, 1, 0).as_str()));
         let pending = guard(&w.state.pending).take().unwrap();
@@ -5245,6 +5345,99 @@ mod pq2_tests {
         let rebuilt = block(rebuild_plan(&w.state, &sent.txid)).unwrap();
         assert_eq!((rebuilt.signature, rebuilt.replaces), (Path::Slhdsa128s, 1));
         assert_eq!(rebuilt.send, 100_000);
+    }
+
+    /// A pq2 address with one large coin and `dust` small ones.
+    fn dusted(label: &str, dust: u32) -> (Wallet, String) {
+        let w = wallet(label, words(0x44), true, m4_state(H4T + 10, false));
+        let address = block(new_pq2_address(&w.state)).unwrap().address;
+        let mut utxos = vec![utxo('9', 0, 500_000, H4T + 7)];
+        utxos.extend((0..dust).map(|i| utxo('8', i + 1, 1_000, H4T + 8)));
+        guard(&w.net.utxos).insert(address.clone(), utxos);
+        (w, address)
+    }
+
+    #[test]
+    fn small_coins_do_not_lock_an_address_through_the_slh_leaf() {
+        for dust in [13u32, 30] {
+            let (w, address) = dusted(&format!("dust-{dust}"), dust);
+            // A fixed amount: the fewest coins that pay it, largest first.
+            let view = block(plan_pq2_payment(&w.state, address.clone(), elsewhere(), "0.001".into(), None, None)).unwrap();
+            assert_eq!((view.signature, view.inputs), (Path::Slhdsa128s, 1), "{dust}");
+            let p = view.pq2.as_ref().unwrap();
+            assert_eq!((p.staying_coins, p.staying_sats), (dust as usize, u64::from(dust) * 1_000));
+            assert!(!p.several_coins);
+            // "All": as many as fit, largest first; the rest stays for another payment.
+            let view = block(plan_pq2_payment(&w.state, address.clone(), elsewhere(), "all".into(), None, None)).unwrap();
+            assert!(view.size <= wallet::MAX_TX_BYTES && view.inputs >= 10 && view.inputs < dust as usize + 1, "{dust}: {}", view.inputs);
+            assert_eq!(view.left, dust as usize + 1 - view.inputs);
+            let pending = guard(&w.state.pending).take().unwrap();
+            assert_eq!(pending.plan.coins[0].sats, 500_000);
+            let p = view.pq2.unwrap();
+            assert_eq!(p.staying_coins, dust as usize + 1 - view.inputs);
+            // The ML-DSA-44 leaf takes every coin or none: 14 coins fit, 31 do not.
+            let view = block(plan_pq2_payment(&w.state, address.clone(), elsewhere(), "0.001".into(), Some(Path::Mldsa44), None)).unwrap();
+            if dust == 13 {
+                assert_eq!((view.signature, view.inputs), (Path::Mldsa44, 14));
+            } else {
+                assert_eq!(view.signature, Path::Slhdsa128s);
+                let p = view.pq2.unwrap();
+                assert_eq!((p.mldsa44_allowed, p.mldsa44_reason), (false, Some("too_many_coins")));
+            }
+            let fits = block(overview_of(&w.state)).unwrap().pq2.unwrap().addresses[0].mldsa44_fits;
+            assert_eq!(fits, dust == 13);
+        }
+    }
+
+    /// An ML-DSA-44 payment from the funded address that got no clear answer, spending coin d:0.
+    fn unclear_mldsa_payment(w: &Wallet, address: &str) -> Sent {
+        let old = Sent {
+            txid: "77".repeat(32), created: now(), from: "pq2".into(), address: address.into(), to: elsewhere(),
+            send: 100_000, fee: 4_000, change: 0, vsize: 1_000, size: 4_000, signature: "mldsa44".into(), inputs: 1,
+            sign_ms: 1.0, status: "unknown".into(), confirmations: 0, proof_verified: false, reason: String::new(),
+            outpoints: vec![format!("{}:0", "d".repeat(64))], doubted: true, lookup_mark: 0,
+        };
+        store::save(&w.state.sent_path(), &vec![old.clone()]).unwrap();
+        old
+    }
+
+    #[test]
+    fn a_rebuild_is_bound_to_the_payment_it_replaces() {
+        let (w, address) = funded("bound");
+        let old = unclear_mldsa_payment(&w, &address);
+        *guard(&w.net.state) = m4_state(H4T + 12, true);
+        // The original was confirmed in the block that spent a tripwire; new coins reached the address.
+        guard(&w.net.txs).insert(old.txid.clone(), json!({"status": "confirmed", "confirmations": 2}));
+        guard(&w.net.utxos).insert(address.clone(), vec![utxo('5', 0, 400_000, H4T + 11)]);
+        assert_eq!(block(rebuild_plan(&w.state, &old.txid)).unwrap_err().code, "rebuild_original_went_out");
+        assert_eq!(store::load::<Vec<Sent>>(&w.state.sent_path())[0].status, "confirmed");
+        // Still unclear, but its coin is gone and only a new coin is there: no rebuild from other coins.
+        let (w, address) = funded("bound-spent");
+        let old = unclear_mldsa_payment(&w, &address);
+        *guard(&w.net.state) = m4_state(H4T + 12, true);
+        guard(&w.net.utxos).insert(address.clone(), vec![utxo('5', 0, 400_000, H4T + 11)]);
+        assert_eq!(block(rebuild_plan(&w.state, &old.txid)).unwrap_err().code, "rebuild_inputs_spent");
+    }
+
+    #[test]
+    fn a_rebuild_is_not_sent_once_its_original_turns_up() {
+        let (w, address) = funded("bound-late");
+        let old = unclear_mldsa_payment(&w, &address);
+        *guard(&w.net.state) = m4_state(H4T + 12, true);
+        let plan = block(rebuild_plan(&w.state, &old.txid)).unwrap();
+        // The rebuild spends the original's coin d:0.
+        assert!(guard(&w.state.pending).as_ref().unwrap().plan.coins.iter().any(|c| c.outpoint() == old.outpoints[0]));
+        // While the dialog is open the original turns up in the mempool after all.
+        let net = w.net.clone();
+        let txid = old.txid.clone();
+        let err = block(send_plan(&w.state, &plan.id, Some("en"), move |_| {
+            guard(&net.txs).insert(txid, json!({"status": "mempool"}));
+            std::future::ready(true)
+        })).unwrap_err();
+        assert_eq!(err.code, "rebuild_original_went_out");
+        assert!(guard(&w.net.broadcasts).is_empty());
+        let records: Vec<Sent> = store::load(&w.state.sent_path());
+        assert_eq!((records.len(), records[0].status.as_str()), (1, "mempool"));
     }
 
     #[test]
