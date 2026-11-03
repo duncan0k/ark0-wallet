@@ -9,7 +9,7 @@ use crate::api::{ApiError, BroadcastResult, CheckResult, Coin, Coins, TxStatus};
 use crate::chain::{Chain, ChainProblem, Pq2Status};
 use crate::keys::{looks_like_backup_code, word_list, KeyError, Keys, Secret, CHANGE_CHAIN, RECEIVE_CHAIN};
 use crate::p2mr::{parse_destination, Destination, DestinationError, Kind, Path, Template, MLDSA44_SIGNATURE_CHUNKS, SLHDSA128S_SIGNATURE_CHUNKS};
-use crate::pq2::{Book, GAP_LIMIT, WIDER_SCAN};
+use crate::pq2::{Book, Version, GAP_LIMIT, WIDER_SCAN};
 use crate::proof::REQUIRED_BLOCKS;
 use crate::sources::{Flags, Sources, StateError};
 use crate::store::{self, Sent, Settings};
@@ -183,15 +183,79 @@ struct PendingSend {
     rebuild: Option<Rebuild>,
 }
 
-/// A rebuild is bound to the payment it replaces: it spends at least one of that payment's inputs, so
-/// that the two can never both confirm, and it is not made once that payment is confirmed or in the
-/// mempool.
+/// A rebuild is bound to the lineage of the payment it replaces (the original and every version made
+/// from it, kept in the book): it spends at least one input of every version that could still confirm,
+/// so that no two can both confirm, and it is not made once any version is confirmed or in the mempool.
 #[derive(Clone, Debug)]
 struct Rebuild {
-    /// The original's txid; empty when it was dropped before it was sent.
-    txid: String,
-    /// The original's inputs, as "txid:vout".
-    inputs: Vec<String>,
+    /// The original asked to be rebuilt, with its inputs; its txid is empty when it was dropped before it
+    /// was sent (then nothing else of it can confirm, and the rebuild is bound to nothing).
+    root: Version,
+    /// Every version of the lineage, the original included, as the book had it when planning.
+    versions: Vec<Version>,
+}
+
+impl Rebuild {
+    /// The rebuild of a recorded payment, with its lineage from the book.
+    fn of(book: &Book, original: &Sent) -> Rebuild {
+        let root = Version { txid: original.txid.clone(), inputs: original.outpoints.clone() };
+        let versions = book.lineage_of(&original.txid).map_or_else(|| vec![root.clone()], |l| l.versions.clone());
+        Rebuild { root, versions }
+    }
+
+    /// The rebuild of a payment dropped before it was sent.
+    fn unsent() -> Rebuild {
+        Rebuild { root: Version { txid: String::new(), inputs: Vec::new() }, versions: Vec::new() }
+    }
+
+    fn bound(&self) -> bool {
+        !self.root.txid.is_empty()
+    }
+}
+
+/// How the versions of a lineage stand, by the wallet's records and the address's coins now.
+enum LineageState {
+    /// A version is confirmed or in the mempool: no more rebuilds.
+    WentOut,
+    /// The versions that could still confirm: not replaced by a proven payment, never-sent, or with an
+    /// input that is gone (spent by a confirmed transaction that is not this version).
+    Live(Vec<Version>),
+}
+
+fn lineage_state(versions: &[Version], sent: &[Sent], coins: &Coins) -> LineageState {
+    let present: HashSet<String> = coins.spendable.iter().chain(&coins.pending).map(Coin::outpoint).collect();
+    let mut live = Vec::new();
+    for v in versions {
+        let Some(record) = sent.iter().find(|s| s.txid == v.txid) else { continue };
+        if original_went_out(record) && record.status != "replaced" {
+            return LineageState::WentOut;
+        }
+        if record.status == "replaced" || !v.inputs.iter().all(|o| present.contains(o)) {
+            continue;
+        }
+        live.push(v.clone());
+    }
+    LineageState::Live(live)
+}
+
+/// Coins among `usable` that give a conflict with every live version: for each version not yet covered,
+/// the usable input that covers most of the others still uncovered (the larger first among equals). None
+/// when a live version has no usable input (every one held by a transaction in the mempool).
+fn conflict_set(live: &[Version], usable: &[Coin]) -> Option<Vec<Coin>> {
+    let mut chosen: Vec<Coin> = Vec::new();
+    let mut uncovered: Vec<&Version> = live.iter().collect();
+    while !uncovered.is_empty() {
+        let best = usable
+            .iter()
+            .filter(|c| !chosen.contains(c))
+            .map(|c| (uncovered.iter().filter(|v| v.inputs.contains(&c.outpoint())).count(), c.sats, c))
+            .filter(|(n, _, _)| *n > 0)
+            .max_by_key(|(n, sats, _)| (*n, *sats))?;
+        let coin = best.2.clone();
+        uncovered.retain(|v| !v.inputs.contains(&coin.outpoint()));
+        chosen.push(coin);
+    }
+    Some(chosen)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1504,12 +1568,15 @@ async fn plan_pq2_payment(state: &AppState, address: String, to: String, amount:
     if sent.iter().any(|s| s.status == "submitting") {
         return Err(Failure::new("sending"));
     }
-    // A rebuild is decided again from the original's state as the refresh found it.
-    if let Some(r) = &rebuild {
-        if sent.iter().any(|s| s.txid == r.txid && original_went_out(s)) {
-            return Err(Failure::new("rebuild_original_went_out"));
-        }
-    }
+    // A rebuild is decided again from its lineage's state as the refresh found it.
+    let live = match &rebuild {
+        Some(r) if r.bound() => match lineage_state(&r.versions, &sent, &coins) {
+            LineageState::WentOut => return Err(Failure::new("rebuild_original_went_out")),
+            LineageState::Live(live) if live.is_empty() => return Err(Failure::new("rebuild_inputs_spent")),
+            LineageState::Live(live) => live,
+        },
+        _ => Vec::new(),
+    };
     let pending = pending_everywhere(&sources, &coins, &own, &template.address, &mut flags).await?;
     let name = account_name(Kind::Pq2, Some(&address));
     let earlier = earlier_payments(&sent, &name, &coins.spendable, &pending);
@@ -1527,14 +1594,11 @@ async fn plan_pq2_payment(state: &AppState, address: String, to: String, amount:
     let path = if mldsa44_fits { chain.pq2_path(wanted) } else { Path::Slhdsa128s };
     let account = Account::new(template, path).ok_or_else(|| Failure::new("address_not_ready"))?;
     // Through the SLH-DSA leaf, the fewest coins that pay (largest first), or as many as fit for "all";
-    // the coins earlier payments require, and for a rebuild the original's coins, go first.
+    // the coins earlier payments require, and for a rebuild only the coins it needs to conflict with every
+    // version of its lineage that could still confirm, go first; the rest by amount and size.
     let mut required = if path == Path::Mldsa44 { earlier.usable.clone() } else { earlier.required.clone() };
-    if let Some(r) = &rebuild {
-        let original: Vec<Coin> = earlier.usable.iter().filter(|c| r.inputs.contains(&c.outpoint())).cloned().collect();
-        if original.is_empty() {
-            return Err(Failure::new("rebuild_inputs_spent"));
-        }
-        for c in original {
+    if !live.is_empty() {
+        for c in conflict_set(&live, &earlier.usable).ok_or_else(|| Failure::new("rebuild_inputs_spent"))? {
             if !required.contains(&c) {
                 required.push(c);
             }
@@ -1545,10 +1609,8 @@ async fn plan_pq2_payment(state: &AppState, address: String, to: String, amount:
     let to_own_pq2 = own_pq2(state).contains(&destination.address);
     let mut plan = wallet::plan_spend_to(&account, &earlier.usable, &required, &destination, amount, chain.lock_time(), change.as_ref().map(|t| &t.script_pubkey))
         .map_err(|e| if e == PlanError::NeedsChange { Failure::new("pq2_change_limit") } else { e.into() })?;
-    if let Some(r) = &rebuild {
-        if !plan.coins.iter().any(|c| r.inputs.contains(&c.outpoint())) {
-            return Err(Failure::new("rebuild_no_common_input"));
-        }
+    if !live.iter().all(|v| plan.coins.iter().any(|c| v.inputs.contains(&c.outpoint()))) {
+        return Err(Failure::new("rebuild_no_common_input"));
     }
     let change_used = plan.change > 0;
     let creates_pq2 = change_used || to_own_pq2;
@@ -1596,7 +1658,7 @@ async fn plan_pq2_payment(state: &AppState, address: String, to: String, amount:
             several_coins: plan.coins.len() > 1,
             change_address: change.filter(|_| change_used).map(|t| t.address),
             change_blocked: change_index.is_none(),
-            rebuilt_from: rebuild.as_ref().map(|r| r.txid.clone()),
+            rebuilt_from: rebuild.as_ref().map(|r| r.root.txid.clone()),
         }),
     };
     let caution = went_out || earlier.elsewhere || earlier.unrecorded;
@@ -1654,7 +1716,7 @@ async fn rebuild_plan(state: &AppState, txid: &str) -> Res<SendPlan> {
         return Err(Failure::new("no_rebuild"));
     }
     let amount = format_coins(old.send);
-    let rebuild = Rebuild { txid: old.txid.clone(), inputs: old.outpoints.clone() };
+    let rebuild = Rebuild::of(&state.book()?, &old);
     match plan_pq2_payment(state, old.address.clone(), old.to.clone(), amount, Some(Path::Slhdsa128s), Some(rebuild.clone())).await {
         Err(f) if f.code == "insufficient" || f.code == "pq2_change_limit" => {
             plan_pq2_payment(state, old.address.clone(), old.to.clone(), "all".into(), Some(Path::Slhdsa128s), Some(rebuild)).await
@@ -1748,17 +1810,16 @@ async fn send_plan<F: Future<Output = bool>>(
             return rebuild_unsent(state, &pending).await;
         }
     }
-    // A rebuild, right before it goes out: it still spends one of the original's inputs, and the original
-    // has not gone out meanwhile (looked up again now; no answer, no broadcast).
-    if let Some(r) = &pending.rebuild {
-        if !pending.plan.coins.iter().any(|c| r.inputs.contains(&c.outpoint())) {
-            return Err(Failure::new("rebuild_no_common_input"));
-        }
-        if !r.txid.is_empty() {
-            let status = state.sources.tx_status(&r.txid).await.value?;
+    // A rebuild, right before it goes out: no version of its lineage (as the book has it now) has gone out
+    // meanwhile (each looked up again now; no answer, no broadcast), and it still spends an input of every
+    // version that could still confirm. Then it joins the lineage, before it is recorded and sent.
+    if let Some(r) = pending.rebuild.as_ref().filter(|r| r.bound()) {
+        let versions = state.book()?.lineage_of(&r.root.txid).map_or_else(|| r.versions.clone(), |l| l.versions.clone());
+        for v in &versions {
+            let status = state.sources.tx_status(&v.txid).await.value?;
             if matches!(status, TxStatus::Confirmed { .. } | TxStatus::Mempool) {
                 let _ = edit_sent(state, |sent| {
-                    if let Some(s) = sent.iter_mut().find(|s| s.txid == r.txid) {
+                    if let Some(s) = sent.iter_mut().find(|s| s.txid == v.txid) {
                         let (st, n) = match status {
                             TxStatus::Confirmed { confirmations } => ("confirmed", confirmations.min(REQUIRED_BLOCKS - 1)),
                             _ => ("mempool", 0),
@@ -1771,6 +1832,15 @@ async fn send_plan<F: Future<Output = bool>>(
                 return Err(Failure::new("rebuild_original_went_out"));
             }
         }
+        let recorded: Vec<Sent> = store::load(&state.sent_path());
+        let LineageState::Live(live) = lineage_state(&versions, &recorded, &coins) else {
+            return Err(Failure::new("rebuild_original_went_out"));
+        };
+        if !live.iter().all(|v| pending.plan.coins.iter().any(|c| v.inputs.contains(&c.outpoint()))) {
+            return Err(Failure::new("rebuild_no_common_input"));
+        }
+        let version = Version { txid: signed.txid.clone(), inputs: pending.plan.coins.iter().map(Coin::outpoint).collect() };
+        state.edit_book(|b| b.add_version(&r.root, version))?;
     }
     // The change address is handed out before the payment is recorded: it is never given to another.
     if let Some(Pq2Pending { change: Some(index), .. }) = pending.pq2 {
@@ -1826,7 +1896,7 @@ async fn rebuild_unsent(state: &AppState, pending: &PendingSend) -> Res<SendResu
     let p = pending.pq2.ok_or_else(|| Failure::new("chain_changed"))?;
     let address = state.pq2_template(p.chain, p.index)?.address;
     let to = pending.destination.address.clone();
-    let rebuild = Rebuild { txid: String::new(), inputs: pending.plan.coins.iter().map(Coin::outpoint).collect() };
+    let rebuild = Rebuild::unsent();
     let mut plan = plan_pq2_payment(state, address.clone(), to.clone(), format_coins(pending.plan.send), Some(Path::Slhdsa128s), Some(rebuild.clone())).await;
     if matches!(&plan, Err(f) if f.code == "insufficient" || f.code == "pq2_change_limit") {
         plan = plan_pq2_payment(state, address, to, "all".into(), Some(Path::Slhdsa128s), Some(rebuild)).await;
@@ -2350,7 +2420,14 @@ async fn activity_of(state: &AppState) -> Res<Vec<ActivityItem>> {
     // state read for it.
     let candidate = |s: &Sent| s.from == "pq2" && s.signature == "mldsa44" && matches!(s.status.as_str(), "unknown" | "rejected" | "failed");
     let chain = if sent.iter().any(candidate) { current_chain(&state.sources, &mut Flags::default()).await.ok() } else { None };
-    Ok(sent.into_iter().map(|s| ActivityItem { rebuild: chain.as_ref().is_some_and(|c| needs_rebuild(&s, c)), sent: s }).collect())
+    // Not offered once any version of the payment's lineage is confirmed or on its way.
+    let book = state.book().ok();
+    let went_out = |s: &Sent| {
+        let versions = book.as_ref().and_then(|b| b.lineage_of(&s.txid)).map(|l| l.versions.clone()).unwrap_or_default();
+        versions.iter().any(|v| sent.iter().any(|r| r.txid == v.txid && original_went_out(r) && r.status != "replaced"))
+    };
+    let flags: Vec<bool> = sent.iter().map(|s| chain.as_ref().is_some_and(|c| needs_rebuild(s, c)) && !went_out(s)).collect();
+    Ok(sent.into_iter().zip(flags).map(|(s, rebuild)| ActivityItem { rebuild, sent: s }).collect())
 }
 
 #[derive(Serialize)]
@@ -5665,8 +5742,8 @@ mod pq2_tests {
         assert_eq!(w.state.book().unwrap().chains[1].issued, 0);
         assert!(result.txid.is_empty());
         let rebuilt = result.rebuilt.unwrap();
-        assert_eq!((rebuilt.signature, rebuilt.inputs), (Path::Slhdsa128s, 2));
-        assert!(rebuilt.fee > view.fee);
+        // Dropped before it was sent, the original binds nothing: the fewest coins that pay, as any payment.
+        assert_eq!((rebuilt.signature, rebuilt.inputs), (Path::Slhdsa128s, 1));
         // The rebuild goes through the system dialog like any payment, then out.
         let sent = block(send_plan(&w.state, &rebuilt.id, Some("en"), |_| std::future::ready(true))).unwrap();
         assert!(matches!(sent.result, BroadcastResult::Sent { .. }));
@@ -5723,10 +5800,10 @@ mod pq2_tests {
                 let rebuilt = result.rebuilt.unwrap();
                 assert_eq!(rebuilt.signature, Path::Slhdsa128s);
                 assert_eq!(rebuilt.pq2.as_ref().unwrap().rebuilt_from.as_deref(), Some(result.txid.as_str()));
-                // It spends the refused payment's coins, so the two can never both go through.
+                // It spends a coin of the refused payment, so the two can never both go through.
                 assert_eq!(rebuilt.replaces, 1);
                 let pending = guard(&w.state.pending).take().unwrap();
-                assert!(records[0].outpoints.iter().all(|o| pending.plan.coins.iter().any(|c| &c.outpoint() == o)));
+                assert!(records[0].outpoints.iter().any(|o| pending.plan.coins.iter().any(|c| &c.outpoint() == o)));
             } else {
                 assert!(result.rebuilt.is_none());
             }
@@ -5882,6 +5959,81 @@ mod pq2_tests {
         assert_eq!(result.unwrap_err().code, "pq2_scan_needed");
         assert!(guard(&w.net.broadcasts).is_empty());
         assert!(w.state.book().unwrap().chains[1].handed_out.is_empty());
+    }
+
+    /// An ML-DSA-44 payment of the wallet's, recorded with this status and these inputs.
+    fn ml_record(w: &Wallet, address: &str, txid: &str, status: &str, inputs: &[String]) -> Sent {
+        let record = Sent {
+            txid: txid.into(), created: now(), from: "pq2".into(), address: address.into(), to: elsewhere(),
+            send: 100_000, fee: 4_000, change: 0, vsize: 1_000, size: 4_000, signature: "mldsa44".into(), inputs: inputs.len(),
+            sign_ms: 1.0, status: status.into(), confirmations: 0, proof_verified: false, reason: String::new(),
+            outpoints: inputs.to_vec(), doubted: true, lookup_mark: 0,
+        };
+        let mut all: Vec<Sent> = store::load(&w.state.sent_path());
+        all.push(record.clone());
+        store::save(&w.state.sent_path(), &all).unwrap();
+        record
+    }
+
+    fn held_by(txid: char, vout: u32, sats: u64, by: char) -> Value {
+        json!({"txid": txid.to_string().repeat(64), "vout": vout, "sats": sats, "height": H4T + 7, "spent_in_mempool": true, "spent_by": by.to_string().repeat(64)})
+    }
+
+    #[test]
+    fn two_rebuilds_of_one_payment_can_never_both_confirm() {
+        let (w, address) = funded("lineage");
+        let (a, b) = (format!("{}:0", "d".repeat(64)), format!("{}:2", "e".repeat(64)));
+        // T spent {A, B} through ML-DSA-44 and was refused; ML-DSA-44 checks are off now.
+        let t = ml_record(&w, &address, &"71".repeat(32), "rejected", &[a.clone(), b.clone()]);
+        *guard(&w.net.state) = m4_state(H4T + 12, true);
+        // B is held by another transaction in the mempool: the first rebuild R1 can only conflict through A.
+        guard(&w.net.utxos).insert(address.clone(), vec![utxo('d', 0, 150_000, H4T + 7), held_by('e', 2, 60_000, 'f')]);
+        let r1 = block(rebuild_plan(&w.state, &t.txid)).unwrap();
+        let r1_coins: Vec<String> = guard(&w.state.pending).as_ref().unwrap().plan.coins.iter().map(Coin::outpoint).collect();
+        assert_eq!(r1_coins, vec![a.clone()]);
+        let sent = block(send_plan(&w.state, &r1.id, Some("en"), |_| std::future::ready(true))).unwrap();
+        let r1_txid = sent.txid.clone();
+        // The lineage of T is in the book: T, then R1.
+        let lineage = w.state.book().unwrap().lineage_of(&t.txid).unwrap().clone();
+        assert_eq!(lineage.versions.iter().map(|v| v.txid.as_str()).collect::<Vec<_>>(), vec![t.txid.as_str(), r1_txid.as_str()]);
+        // R1 waits in the mempool, holding A; B is free again. A second rebuild of T would spend only B.
+        guard(&w.net.txs).insert(r1_txid.clone(), json!({"status": "mempool"}));
+        guard(&w.net.utxos).insert(address.clone(), vec![held_by('d', 0, 150_000, '9'), utxo('e', 2, 60_000, H4T + 7)]);
+        assert_eq!(block(rebuild_plan(&w.state, &t.txid)).unwrap_err().code, "rebuild_original_went_out");
+        // R1 leaves the mempool and both coins are free: a new version must conflict with T and R1, so it
+        // spends A, the one input they share.
+        guard(&w.net.txs).insert(r1_txid.clone(), json!({"status": "unknown"}));
+        guard(&w.net.utxos).insert(address.clone(), vec![utxo('d', 0, 150_000, H4T + 7), utxo('e', 2, 60_000, H4T + 7)]);
+        let r2 = block(rebuild_plan(&w.state, &t.txid)).unwrap();
+        assert!(guard(&w.state.pending).as_ref().unwrap().plan.coins.iter().any(|c| c.outpoint() == a));
+        // R1 reappears in the mempool before R2 is sent: nothing goes out.
+        let net = w.net.clone();
+        let r1_again = r1_txid.clone();
+        let err = block(send_plan(&w.state, &r2.id, Some("en"), move |_| {
+            guard(&net.txs).insert(r1_again, json!({"status": "mempool"}));
+            std::future::ready(true)
+        })).unwrap_err();
+        assert_eq!(err.code, "rebuild_original_went_out");
+        assert_eq!(guard(&w.net.broadcasts).len(), 2, "only R1, sent to both APIs");
+        // Once a version is confirmed, no more rebuilds of T.
+        guard(&w.net.txs).insert(r1_txid, json!({"status": "confirmed", "confirmations": 1}));
+        assert_eq!(block(rebuild_plan(&w.state, &t.txid)).unwrap_err().code, "rebuild_original_went_out");
+    }
+
+    #[test]
+    fn a_large_ml_dsa_payment_falls_back_to_a_partial_slh_spend() {
+        let (w, address) = dusted("large-rebuild", 12);
+        // T spent all 13 coins through ML-DSA-44 (they fit there) and was refused. Through SLH-DSA all 13
+        // would be about 104 KB; the large coin alone pays.
+        let mut inputs = vec![format!("{}:0", "9".repeat(64))];
+        inputs.extend((1..=12).map(|i| format!("{}:{i}", "8".repeat(64))));
+        let t = ml_record(&w, &address, &"72".repeat(32), "rejected", &inputs);
+        *guard(&w.net.state) = m4_state(H4T + 12, true);
+        let view = block(rebuild_plan(&w.state, &t.txid)).unwrap();
+        assert_eq!((view.signature, view.inputs), (Path::Slhdsa128s, 1));
+        assert!(view.size <= wallet::MAX_TX_BYTES);
+        let p = view.pq2.unwrap();
+        assert_eq!(p.staying_coins, 12);
     }
 
     #[test]

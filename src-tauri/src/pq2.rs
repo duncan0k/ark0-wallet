@@ -120,13 +120,49 @@ pub struct Book {
     /// asks only about blocks from there on.
     #[serde(default)]
     pub history_tip: Option<u32>,
+    /// Payments rebuilt through the SLH-DSA leaf: each lineage holds the original and every version made
+    /// from it, with their inputs. A new version must conflict with every version that could still confirm.
+    #[serde(default)]
+    pub lineages: Vec<Lineage>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Lineage {
+    pub versions: Vec<Version>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Version {
+    pub txid: String,
+    /// Its inputs, as "txid:vout".
+    pub inputs: Vec<String>,
+}
+
+impl Book {
+    /// The lineage a payment belongs to, if it has been rebuilt before.
+    pub fn lineage_of(&self, txid: &str) -> Option<&Lineage> {
+        self.lineages.iter().find(|l| l.versions.iter().any(|v| v.txid == txid))
+    }
+
+    /// Records `version` as a new version of the lineage of `root` (made of `root` alone so far when it has
+    /// none).
+    pub fn add_version(&mut self, root: &Version, version: Version) {
+        match self.lineages.iter_mut().find(|l| l.versions.iter().any(|v| v.txid == root.txid)) {
+            Some(l) => {
+                if !l.versions.iter().any(|v| v.txid == version.txid) {
+                    l.versions.push(version);
+                }
+            }
+            None => self.lineages.push(Lineage { versions: vec![root.clone(), version] }),
+        }
+    }
 }
 
 impl Book {
     /// The book of a wallet whose receiving address at index 0 is `wallet`. `made_here`: the words were
     /// made on this device just now, so no other copy has handed out anything.
     pub fn new(wallet: &str, made_here: bool) -> Book {
-        Book { version: FILE_VERSION, wallet: wallet.to_string(), chains: Default::default(), scan_needed: !made_here, history_tip: None }
+        Book { version: FILE_VERSION, wallet: wallet.to_string(), chains: Default::default(), scan_needed: !made_here, history_tip: None, lineages: Vec::new() }
     }
 
     /// The chain and index of one of the wallet's own pq2 addresses (handed out or used).
