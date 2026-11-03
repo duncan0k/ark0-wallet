@@ -310,6 +310,9 @@ pub struct AppState {
     /// Tests: run by a create or restore before its section.
     #[cfg(test)]
     before_set_up: Mutex<Option<Box<dyn FnMut(&AppState) + Send>>>,
+    /// Tests: run before a plan is kept, ahead of the section that checks and keeps it.
+    #[cfg(test)]
+    before_plan_kept: Mutex<Option<Box<dyn FnMut(&AppState) + Send>>>,
     /// Tests: run when a session has been installed, before its book is written.
     #[cfg(test)]
     after_session_installed: Mutex<Option<Box<dyn FnMut(&AppState) + Send>>>,
@@ -354,6 +357,8 @@ impl AppState {
             after_session_installed: Mutex::new(None),
             #[cfg(test)]
             before_set_up: Mutex::new(None),
+            #[cfg(test)]
+            before_plan_kept: Mutex::new(None),
             #[cfg(test)]
             before_commit: Mutex::new(None),
             sent_lookups: Mutex::new(HashSet::new()),
@@ -1713,10 +1718,10 @@ async fn plan_payment(state: &AppState, from: Kind, to: String, amount: String) 
     let caution = went_out || earlier.elsewhere || earlier.unrecorded;
     // The plan is kept only for the wallet and session it was made in.
     state.current(&snapshot)?;
-    *guard(&state.pending) = Some(PendingSend {
+    keep_plan(state, &snapshot, PendingSend {
         id: view.id.clone(), created: Instant::now(), kind: from, path: account.path, destination, plan, caution, sources: flags,
         creates_pq2, pq2: None, plan_address: view_from_address, rebuild: None,
-    });
+    })?;
     Ok(view)
 }
 
@@ -1880,14 +1885,31 @@ async fn plan_pq2_payment_in(state: &AppState, snapshot: Snapshot, address: Stri
     let caution = went_out || earlier.elsewhere || earlier.unrecorded;
     // The plan is kept only for the wallet and session it was made in.
     state.current(&snapshot)?;
-    *guard(&state.pending) = Some(PendingSend {
+    keep_plan(state, &snapshot, PendingSend {
         id: view.id.clone(), created: Instant::now(), kind: Kind::Pq2, path: account.path, destination, plan, caution, sources: flags,
         creates_pq2,
         pq2: Some(Pq2Pending { chain: chain_index, index, change: change_index.filter(|_| change_used) }),
         plan_address: address,
         rebuild,
-    });
+    })?;
     Ok(view)
+}
+
+/// Keeps a plan for review: the check that the wallet and session are still those of `snapshot` and the
+/// replacement of the kept plan are one section under the commit lock, which locking also takes, so a
+/// plan begun before a lock never replaces one made after it. Err("locked") then, with nothing kept.
+fn keep_plan(state: &AppState, snapshot: &Snapshot, plan: PendingSend) -> Res<()> {
+    #[cfg(test)]
+    {
+        let hook = guard(&state.before_plan_kept).take();
+        if let Some(mut hook) = hook {
+            hook(state);
+        }
+    }
+    let _commit = guard(&state.commit_ops);
+    state.still_current(snapshot)?;
+    *guard(&state.pending) = Some(plan);
+    Ok(())
 }
 
 /// Whether every usable coin of a pq2 address fits in one transaction through the ML-DSA-44 leaf, with a
@@ -6500,6 +6522,42 @@ mod pq2_tests {
         })).unwrap();
         assert!(guard(&w.net.broadcasts).is_empty());
         assert_eq!(result.rebuilt.unwrap().signature, Path::Slhdsa128s);
+    }
+
+    #[test]
+    fn a_plan_begun_before_a_lock_never_replaces_a_later_one() {
+        for fallback in [false, true] {
+            let (w, address) = funded(if fallback { "kept-fallback" } else { "kept-plan" });
+            let ml = block(plan_pq2_payment(&w.state, address.clone(), elsewhere(), "0.001".into(), Some(Path::Mldsa44), None)).unwrap();
+            // Plan R has passed its last check; before it is kept, the wallet is locked and unlocked and a
+            // new plan N is made.
+            let newer: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+            let n_id = newer.clone();
+            let to = address.clone();
+            *guard(&w.state.before_plan_kept) = Some(Box::new(move |state: &AppState| {
+                state.lock();
+                state.open_session(&words(0x33), state.generation(), true).unwrap();
+                let n = std::thread::scope(|s| s.spawn(|| block(plan_pq2_payment(state, to.clone(), elsewhere(), "0.002".into(), None, None))).join().unwrap()).unwrap();
+                *guard(&n_id) = Some(n.id);
+            }));
+            let result = if fallback {
+                // R is the SLH-DSA plan that replaces an ML-DSA-44 payment dropped unsent.
+                let net = w.net.clone();
+                block(send_plan(&w.state, &ml.id, Some("en"), move |_| {
+                    *guard(&net.state) = m4_state(H4T + 11, true);
+                    std::future::ready(true)
+                })).map(|_| ())
+            } else {
+                block(plan_pq2_payment(&w.state, address, elsewhere(), "0.001".into(), None, None)).map(|_| ())
+            };
+            assert_eq!(result.unwrap_err().code, "locked", "fallback: {fallback}");
+            // N is the plan kept, and it can be confirmed.
+            let n = guard(&newer).clone().unwrap();
+            assert_eq!(guard(&w.state.pending).as_ref().map(|p| p.id.clone()), Some(n.clone()), "fallback: {fallback}");
+            assert!(guard(&w.net.broadcasts).is_empty());
+            block(send_plan(&w.state, &n, Some("en"), |_| std::future::ready(true))).unwrap();
+            assert!(!guard(&w.net.broadcasts).is_empty());
+        }
     }
 
     #[test]
