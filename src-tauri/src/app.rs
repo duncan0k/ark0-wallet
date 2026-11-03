@@ -105,6 +105,14 @@ impl From<SignError> for Failure {
 
 type Res<T> = Result<T, Failure>;
 
+/// A wallet's identity (its pq2 receiving address at index 0) and the session generation, taken when
+/// asynchronous pq2 work starts: its results go to that wallet's book only, and only in that session.
+#[derive(Clone, Debug)]
+struct Bound {
+    wallet: String,
+    generation: u64,
+}
+
 /// The unlocked wallet.
 struct Session {
     legacy: bool,
@@ -292,9 +300,9 @@ pub struct AppState {
     /// Tests: this many next saves of the pq2 book fail.
     #[cfg(test)]
     fail_book_writes: AtomicUsize,
-    /// Tests: run after every network answer a scan gets.
+    /// Tests: run after every network answer a scan or a refresh of pq2 gets.
     #[cfg(test)]
-    after_scan_answer: Mutex<Option<Box<dyn FnMut(&AppState) + Send>>>,
+    after_network_answer: Mutex<Option<Box<dyn FnMut(&AppState) + Send>>>,
     /// Lookups started by any refresh, until their results have been saved.
     sent_lookups: Mutex<HashSet<String>>,
     /// Counts locks. Work that began before a lock (an unlock's key derivation, a send waiting on the
@@ -324,7 +332,7 @@ impl AppState {
             #[cfg(test)]
             fail_book_writes: AtomicUsize::new(0),
             #[cfg(test)]
-            after_scan_answer: Mutex::new(None),
+            after_network_answer: Mutex::new(None),
             sent_lookups: Mutex::new(HashSet::new()),
             generation: AtomicU64::new(0),
             locked: watch::channel(()).0,
@@ -494,6 +502,26 @@ impl AppState {
         let mut session = guard(&self.session);
         let s = session.as_mut().filter(|s| s.pq2_wallet.as_deref() == Some(wallet) && self.generation() == generation);
         s.ok_or_else(|| Failure::new("locked"))?.pq2_template(chain, index)
+    }
+
+    /// The open pq2 wallet and the session generation: what asynchronous pq2 work binds itself to.
+    fn bind(&self) -> Option<Bound> {
+        let wallet = guard(&self.session).as_ref()?.pq2_wallet.clone()?;
+        Some(Bound { wallet, generation: self.generation() })
+    }
+
+    /// After an answer from the network: Err("locked") unless the bound wallet is still open in the same
+    /// session.
+    fn answered(&self, bound: &Bound) -> Res<()> {
+        #[cfg(test)]
+        {
+            let hook = guard(&self.after_network_answer).take();
+            if let Some(mut hook) = hook {
+                hook(self);
+                *guard(&self.after_network_answer) = Some(hook);
+            }
+        }
+        self.still_open(&bound.wallet, bound.generation)
     }
 
     fn book(&self) -> Res<Book> {
@@ -1022,9 +1050,9 @@ fn anything_paid(coins: &Coins) -> bool {
 }
 
 /// Records the pq2 address as used when its coins show anything paid to it.
-fn note_used(state: &AppState, chain: u32, index: u32, address: &str, coins: &Coins) {
+fn note_used(state: &AppState, bound: &Bound, chain: u32, index: u32, address: &str, coins: &Coins) {
     if anything_paid(coins) {
-        let _ = state.edit_book(|b| b.chains[chain as usize].mark_used(index, address));
+        let _ = state.edit_book_of(&bound.wallet, bound.generation, |b| b.chains[chain as usize].mark_used(index, address));
     }
 }
 
@@ -1049,10 +1077,14 @@ fn pq2_blocked(legacy: bool, chain: &Chain, book: Option<&Book>, chain_index: u3
     None
 }
 
-async fn pq2_overview(state: &AppState, chain: &Chain, sources: &Sources, flags: &mut Flags) -> Option<Pq2View> {
-    let h4t = chain.lattice_height?;
-    let legacy = guard(&state.session).as_ref().is_none_or(|s| s.pq2_wallet.is_none());
-    let book = state.book().ok();
+/// The pq2 part of the overview, bound to the wallet open when the refresh began (`bound`, None for a
+/// wallet without pq2): after every answer from the network it checks that wallet is still open in the
+/// same session, and it reads and writes that wallet's book only. Err("locked") otherwise.
+async fn pq2_overview(state: &AppState, bound: Option<&Bound>, chain: &Chain, sources: &Sources, flags: &mut Flags) -> Res<Option<Pq2View>> {
+    let Some(h4t) = chain.lattice_height else { return Ok(None) };
+    let read_book = || bound.and_then(|b| state.edit_book_of(&b.wallet, b.generation, |x| x.clone()).ok());
+    let legacy = bound.is_none();
+    let book = read_book();
     let mut view = Pq2View {
         blocked: pq2_blocked(legacy, chain, book.as_ref(), RECEIVE_CHAIN),
         allowed: chain.pq2_allowed && !legacy,
@@ -1069,29 +1101,28 @@ async fn pq2_overview(state: &AppState, chain: &Chain, sources: &Sources, flags:
         scanned: book.as_ref().map_or([0, 0], |b| [b.chains[0].scanned, b.chains[1].scanned]),
         issued: book.as_ref().map_or([0, 0], |b| [b.chains[0].issued, b.chains[1].issued]),
     };
-    if book.is_none() {
-        return Some(view);
-    }
+    let (Some(bound), Some(_)) = (bound, &book) else { return Ok(Some(view)) };
     // Reserved addresses first: one that received something since the last check is looked up below.
-    if !check_reserved(state, sources, flags).await {
+    if !check_reserved(state, bound, sources, flags).await? {
         view.complete = false;
     }
-    let Some(book) = state.book().ok() else { return Some(view) };
+    let Some(book) = read_book() else { return Ok(Some(view)) };
     for (c, chain_book) in book.chains.iter().enumerate() {
         for index in chain_book.watched() {
             // Verified: only an address the wallet's own keys give at that index (a book changed on disk
             // gets no status).
             let Some(address) = chain_book.addresses.get(&index).cloned() else { continue };
-            if state.pq2_template(c as u32, index).ok().is_none_or(|t| t.address != address) {
+            if state.pq2_template_of(&bound.wallet, bound.generation, c as u32, index).ok().is_none_or(|t| t.address != address) {
                 view.complete = false;
                 continue;
             }
             let found = flags.take(sources.coins(&address).await);
+            state.answered(bound)?;
             let Ok(coins) = found else {
                 view.complete = false;
                 continue;
             };
-            note_used(state, c as u32, index, &address, &coins);
+            note_used(state, bound, c as u32, index, &address, &coins);
             let sum = |c: &[Coin]| c.iter().map(|c| c.sats).sum::<u64>();
             let mut list: Vec<Pq2CoinView> = Vec::new();
             for (c, spending) in coins.spendable.iter().map(|c| (c, false)).chain(coins.pending.iter().map(|c| (c, true))) {
@@ -1109,7 +1140,7 @@ async fn pq2_overview(state: &AppState, chain: &Chain, sources: &Sources, flags:
             view.pending += sum(&coins.pending);
             view.incoming += incoming;
             if !list.is_empty() {
-                let template = state.pq2_template(c as u32, index).ok();
+                let template = state.pq2_template_of(&bound.wallet, bound.generation, c as u32, index).ok();
                 let fits = template.as_ref().is_some_and(|t| mldsa44_fits(t, &coins.spendable, &Destination { address: t.address.clone(), script_pubkey: t.script_pubkey.clone(), dust: 330 }));
                 view.addresses.push(Pq2AddressView {
                     chain: c as u32,
@@ -1129,10 +1160,10 @@ async fn pq2_overview(state: &AppState, chain: &Chain, sources: &Sources, flags:
     if !view.spend_allowed {
         view.spendable = 0;
     }
-    let book = state.book().ok();
+    let book = read_book();
     view.blocked = pq2_blocked(legacy, chain, book.as_ref(), RECEIVE_CHAIN);
     view.change_blocked = !chain.pq2_allowed || book.as_ref().is_none_or(|b| !b.chains[CHANGE_CHAIN as usize].can_issue());
-    Some(view)
+    Ok(Some(view))
 }
 
 #[tauri::command]
@@ -1142,6 +1173,8 @@ pub async fn overview(state: State<'_, AppState>) -> Res<Overview> {
 
 async fn overview_of(state: &AppState) -> Res<Overview> {
     let (schnorr, mldsa44, mixed) = state.templates()?;
+    let bound = state.bind();
+    let generation = state.generation();
     let sources = state.sources.clone();
     let mut flags = Flags::default();
     let chain = match current_chain(&sources, &mut flags).await {
@@ -1171,7 +1204,11 @@ async fn overview_of(state: &AppState) -> Res<Overview> {
             complete,
         });
     }
-    let pq2 = pq2_overview(state, &chain, &sources, &mut flags).await;
+    let pq2 = pq2_overview(state, bound.as_ref(), &chain, &sources, &mut flags).await?;
+    // Nothing of a wallet that was locked or replaced meanwhile is shown.
+    if state.generation() != generation {
+        return Err(Failure::new("locked"));
+    }
     Ok(Overview { chain: Some(chain), problem: None, accounts, pq2, fetched: now() })
 }
 
@@ -1234,17 +1271,8 @@ async fn scan_pq2(state: &AppState, wider: bool) -> Res<ScanResult> {
     let generation = state.generation();
     let wallet = guard(&state.session).as_ref().ok_or_else(|| Failure::new("locked"))?.pq2_wallet.clone().ok_or_else(|| Failure::new("pq2_unavailable"))?;
     let book = state.edit_book_of(&wallet, generation, |b| b.clone())?;
-    let answered = |state: &AppState| -> Res<()> {
-        #[cfg(test)]
-        {
-            let hook = guard(&state.after_scan_answer).take();
-            if let Some(mut hook) = hook {
-                hook(state);
-                *guard(&state.after_scan_answer) = Some(hook);
-            }
-        }
-        state.still_open(&wallet, generation)
-    };
+    let bound = Bound { wallet: wallet.clone(), generation };
+    let answered = |state: &AppState| state.answered(&bound);
     let mut found = 0;
     let mut flags = Flags::default();
     let mut tip = u32::MAX;
@@ -1329,8 +1357,8 @@ async fn history_since(sources: &Sources, addresses: &[String], from: u32, flags
 /// (`history_tip`, less six blocks for a reorganization); one that did becomes used, and its coins are
 /// looked up like the others'. False when the site could not answer: the tip of the last check stays where
 /// it was.
-async fn check_reserved(state: &AppState, sources: &Sources, flags: &mut Flags) -> bool {
-    let Ok(book) = state.book() else { return true };
+async fn check_reserved(state: &AppState, bound: &Bound, sources: &Sources, flags: &mut Flags) -> Res<bool> {
+    let Ok(book) = state.edit_book_of(&bound.wallet, bound.generation, |b| b.clone()) else { return Ok(true) };
     let reserved: Vec<(u32, u32, String)> = book
         .chains
         .iter()
@@ -1338,32 +1366,34 @@ async fn check_reserved(state: &AppState, sources: &Sources, flags: &mut Flags) 
         .flat_map(|(c, chain)| chain.reserved().into_iter().filter_map(move |i| chain.addresses.get(&i).map(|a| (c as u32, i, a.clone()))))
         .collect();
     if reserved.is_empty() {
-        return true;
+        return Ok(true);
     }
     let from = book.history_tip.unwrap_or(0).saturating_sub(HISTORY_OVERLAP);
     let mut tip = u32::MAX;
     let mut found = Vec::new();
     for part in reserved.chunks(crate::api::MAX_HISTORY_ADDRESSES) {
         let addresses: Vec<String> = part.iter().map(|(_, _, a)| a.clone()).collect();
-        let Some(history) = history_since(sources, &addresses, from, flags).await else { return false };
+        let history = history_since(sources, &addresses, from, flags).await;
+        state.answered(bound)?;
+        let Some(history) = history else { return Ok(false) };
         tip = tip.min(history.tip_height);
         for ((c, i, a), used) in part.iter().zip(history.used) {
             // Only an address the wallet's own keys give at that index.
-            if used && state.pq2_template(*c, *i).is_ok_and(|t| &t.address == a) {
+            if used && state.pq2_template_of(&bound.wallet, bound.generation, *c, *i).is_ok_and(|t| &t.address == a) {
                 found.push((*c, *i, a.clone()));
             }
         }
     }
     // Every address found used and the new watermark go into the book in one save: when that fails, none
     // of it is kept, and the next check asks about the same blocks again.
-    state
-        .edit_book(|b| {
+    Ok(state
+        .edit_book_of(&bound.wallet, bound.generation, |b| {
             for (c, i, a) in &found {
                 b.chains[*c as usize].mark_used(*i, a);
             }
             b.history_tip = Some(tip);
         })
-        .is_ok()
+        .is_ok())
 }
 
 /// What the review shows of a payment from a pq2 address.
@@ -1542,6 +1572,7 @@ async fn plan_payment(state: &AppState, from: Kind, to: String, amount: String) 
 /// the ML-DSA-44 leaf this one replaces.
 async fn plan_pq2_payment(state: &AppState, address: String, to: String, amount: String, wanted: Option<Path>, rebuild: Option<Rebuild>) -> Res<SendPlan> {
     state.touch();
+    let plan_bound = state.bind();
     let book = state.book()?;
     let (chain_index, index) = book.find(&address).ok_or_else(|| Failure::new("address_not_ready"))?;
     let destination = parse_destination(&to)?;
@@ -1560,7 +1591,9 @@ async fn plan_pq2_payment(state: &AppState, address: String, to: String, amount:
     }
     let template = state.pq2_template(chain_index, index)?;
     let coins = flags.take(sources.coins(&template.address).await)?;
-    note_used(state, chain_index, index, &address, &coins);
+    if let Some(bound) = &plan_bound {
+        note_used(state, bound, chain_index, index, &address, &coins);
+    }
     let at = now();
     let sent = refresh_sent(state, |s| {
         matches!(s.status.as_str(), "mempool" | "unknown") || (s.status == "confirmed" && !s.proven()) || (refused(s) && recent(s, at))
@@ -5565,7 +5598,7 @@ mod pq2_tests {
             let a_first = pq2_address(&w, 0, 0);
             // While the scan of wallet A waits for the network, A is removed and B is restored.
             let mut answers = 0;
-            *guard(&w.state.after_scan_answer) = Some(Box::new(move |state: &AppState| {
+            *guard(&w.state.after_network_answer) = Some(Box::new(move |state: &AppState| {
                 answers += 1;
                 if answers == at_answer {
                     state.lock();
@@ -5573,7 +5606,7 @@ mod pq2_tests {
                 }
             }));
             assert_eq!(block(scan_pq2(&w.state, false)).unwrap_err().code, "locked", "answer {at_answer}");
-            *guard(&w.state.after_scan_answer) = None;
+            *guard(&w.state.after_network_answer) = None;
             let book = w.state.book().unwrap();
             assert_ne!(pq2_address(&w, 0, 0), a_first);
             assert_eq!(book.wallet, pq2_address(&w, 0, 0));
@@ -5612,6 +5645,34 @@ mod pq2_tests {
         // The reserved addresses are now checked by the refresh, and the scan completes the migration.
         block(scan_pq2(&w.state, false)).unwrap();
         assert_eq!(block(new_pq2_address(&w.state)).unwrap().index, 22);
+    }
+
+    #[test]
+    fn a_late_refresh_answer_never_reaches_another_wallets_book() {
+        for at_answer in [1usize, 3] {
+            let w = wallet("refresh-switch", words(0x61), false, m4_state(H4T + 100, false));
+            block(scan_pq2(&w.state, false)).unwrap();
+            // A's reserved index 2 was paid since the scan, and its address 20 (handed out) holds coins.
+            *guard(&w.net.state) = m4_state(H4T + 110, false);
+            guard(&w.net.history).insert(pq2_address(&w, 0, 2), H4T + 105);
+            let a20 = block(new_pq2_address(&w.state)).unwrap().address;
+            guard(&w.net.utxos).insert(a20, vec![utxo('a', 0, 5_000, H4T + 106)]);
+            // While A's refresh waits for the network, A is removed and B is restored.
+            let mut answers = 0;
+            *guard(&w.state.after_network_answer) = Some(Box::new(move |state: &AppState| {
+                answers += 1;
+                if answers == at_answer {
+                    state.lock();
+                    state.open_session(&words(0x62), state.generation(), false).unwrap();
+                }
+            }));
+            assert_eq!(block(overview_of(&w.state)).err().map(|f| f.code), Some("locked".to_string()), "answer {at_answer}");
+            *guard(&w.state.after_network_answer) = None;
+            let book = w.state.book().unwrap();
+            assert_eq!(book.wallet, pq2_address(&w, 0, 0));
+            assert!(book.scan_needed && book.history_tip.is_none(), "answer {at_answer}: no watermark of A");
+            assert!(book.chains.iter().all(|c| c.addresses.is_empty() && c.used.is_empty()), "answer {at_answer}: nothing of A");
+        }
     }
 
     #[test]
