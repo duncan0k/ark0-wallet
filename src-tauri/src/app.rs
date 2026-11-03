@@ -1059,10 +1059,13 @@ fn anything_paid(coins: &Coins) -> bool {
 }
 
 /// Records the pq2 address as used when its coins show anything paid to it.
-fn note_used(state: &AppState, bound: &Bound, chain: u32, index: u32, address: &str, coins: &Coins) {
+/// Records a use of the address when its coins show anything paid to it (`Book::record_use`: the range
+/// extended and a scan required when another copy may now hand out more). The save's failure is returned.
+fn note_used(state: &AppState, bound: &Bound, chain: u32, index: u32, address: &str, coins: &Coins) -> Res<()> {
     if anything_paid(coins) {
-        let _ = state.edit_book_of(&bound.wallet, bound.generation, |b| b.chains[chain as usize].mark_used(index, address));
+        state.edit_book_of(&bound.wallet, bound.generation, |b| b.record_use(chain, index, address))?;
     }
+    Ok(())
 }
 
 /// Why no new pq2 address can be handed out on `chain_index` now, or None.
@@ -1131,7 +1134,9 @@ async fn pq2_overview(state: &AppState, bound: Option<&Bound>, chain: &Chain, so
                 view.complete = false;
                 continue;
             };
-            note_used(state, bound, c as u32, index, &address, &coins);
+            if note_used(state, bound, c as u32, index, &address, &coins).is_err() {
+                view.complete = false;
+            }
             let sum = |c: &[Coin]| c.iter().map(|c| c.sats).sum::<u64>();
             let mut list: Vec<Pq2CoinView> = Vec::new();
             for (c, spending) in coins.spendable.iter().map(|c| (c, false)).chain(coins.pending.iter().map(|c| (c, true))) {
@@ -1282,9 +1287,10 @@ async fn scan_pq2(state: &AppState, wider: bool) -> Res<ScanResult> {
     // A scan needs to be finished before addresses are handed out again: set before the first use it finds
     // is saved, cleared only after both chains and their reserved addresses are.
     let book = state.edit_book_of(&wallet, generation, |b| {
-        b.scan_needed = true;
+        b.require_scan();
         b.clone()
     })?;
+    let revision = book.scan_revision;
     let bound = Bound { wallet: wallet.clone(), generation };
     let answered = |state: &AppState| state.answered(&bound);
     let mut found = 0;
@@ -1337,7 +1343,10 @@ async fn scan_pq2(state: &AppState, wider: bool) -> Res<ScanResult> {
         })?;
     }
     let book = state.edit_book_of(&wallet, generation, |b| {
-        b.scan_needed = false;
+        // Only when nothing required a scan again while this one ran.
+        if b.scan_revision == revision {
+            b.scan_needed = false;
+        }
         if tip != u32::MAX {
             b.history_tip = Some(b.history_tip.map_or(tip, |t| t.min(tip)));
         }
@@ -1403,9 +1412,7 @@ async fn check_reserved(state: &AppState, bound: &Bound, sources: &Sources, flag
     Ok(state
         .edit_book_of(&bound.wallet, bound.generation, |b| {
             for (c, i, a) in &found {
-                if b.chains[*c as usize].mark_found(*i, a) {
-                    b.scan_needed = true;
-                }
+                b.record_use(*c, *i, a);
             }
             b.history_tip = Some(tip);
         })
@@ -1608,7 +1615,7 @@ async fn plan_pq2_payment(state: &AppState, address: String, to: String, amount:
     let template = state.pq2_template(chain_index, index)?;
     let coins = flags.take(sources.coins(&template.address).await)?;
     if let Some(bound) = &plan_bound {
-        note_used(state, bound, chain_index, index, &address, &coins);
+        note_used(state, bound, chain_index, index, &address, &coins)?;
     }
     let at = now();
     let sent = refresh_sent(state, |s| {
@@ -5769,6 +5776,66 @@ mod pq2_tests {
     }
 
     #[test]
+    fn a_plain_scan_after_a_cut_wider_one_covers_the_use_it_found() {
+        let w = wallet("cut-then-plain", words(0x66), false, m4_state(H4T + 100, false));
+        block(scan_pq2(&w.state, false)).unwrap();
+        // The wider scan finds index 80 used, saves it, and the site stops answering after 80's batch.
+        guard(&w.net.history).insert(pq2_address(&w, 0, 80), H4T + 50);
+        // Five batches of 20 (0 to 99), each asked of both APIs.
+        *guard(&w.net.history_ok) = Some(10);
+        assert_eq!(block(scan_pq2(&w.state, true)).unwrap_err().code, "history_unavailable");
+        assert!(w.state.book().unwrap().chains[0].used.contains(&80));
+        // A plain scan must cover the reserved range and a full gap past 80, every address saved.
+        *guard(&w.net.history_ok) = None;
+        block(scan_pq2(&w.state, false)).unwrap();
+        let book = w.state.book().unwrap();
+        assert!(!book.scan_needed);
+        assert!(book.chains[0].issued >= 101);
+        for i in 0..book.chains[0].issued {
+            assert!(book.chains[0].addresses.contains_key(&i), "the address of index {i} is in the book");
+        }
+        // So a later payment to index 90 is seen by the refresh.
+        *guard(&w.net.state) = m4_state(H4T + 120, false);
+        guard(&w.net.history).insert(pq2_address(&w, 0, 90), H4T + 115);
+        block(overview_of(&w.state)).unwrap();
+        assert!(w.state.book().unwrap().chains[0].used.contains(&90));
+    }
+
+    #[test]
+    fn a_scan_does_not_clear_a_requirement_raised_while_it_ran() {
+        let w = wallet("scan-revision", words(0x67), false, m4_state(H4T + 100, false));
+        block(scan_pq2(&w.state, false)).unwrap();
+        // While a wider scan runs, something else requires a scan (a use found by a refresh).
+        let mut raised = false;
+        *guard(&w.state.after_network_answer) = Some(Box::new(move |state: &AppState| {
+            if !raised {
+                raised = true;
+                state.edit_book(|b| b.require_scan()).unwrap();
+            }
+        }));
+        block(scan_pq2(&w.state, true)).unwrap();
+        *guard(&w.state.after_network_answer) = None;
+        assert!(w.state.book().unwrap().scan_needed, "raised during the scan: it stays until another scan");
+        block(scan_pq2(&w.state, false)).unwrap();
+        assert!(!w.state.book().unwrap().scan_needed);
+    }
+
+    #[test]
+    fn a_use_seen_in_a_coin_lookup_extends_the_reserved_range() {
+        let w = wallet("coin-use", words(0x68), false, m4_state(H4T + 100, false));
+        block(scan_pq2(&w.state, false)).unwrap();
+        // Reserved index 19 receives a payment, seen by a coin lookup before any history check.
+        let address = pq2_address(&w, 0, 19);
+        guard(&w.net.utxos).insert(address.clone(), vec![utxo('a', 0, 300_000, H4T + 101)]);
+        let _ = block(plan_pq2_payment(&w.state, address, elsewhere(), "all".into(), None, None));
+        let book = w.state.book().unwrap();
+        assert!(book.chains[0].used.contains(&19));
+        assert_eq!(book.chains[0].issued, 40, "a full gap past 19");
+        assert!(book.scan_needed);
+        assert_eq!(block(new_pq2_address(&w.state)).unwrap_err().code, "pq2_scan_needed");
+    }
+
+    #[test]
     fn the_wider_scan_looks_at_the_scanned_range_again() {
         let w = wallet("wider-again", words(0x58), false, m4_state(H4T + 100, false));
         block(scan_pq2(&w.state, false)).unwrap();
@@ -6107,7 +6174,7 @@ mod pq2_tests {
         assert!(view.change > 0);
         let state = &w.state;
         let result = block(send_plan(state, &view.id, Some("en"), |_| {
-            state.edit_book(|b| b.scan_needed = true).unwrap();
+            state.edit_book(|b| b.require_scan()).unwrap();
             std::future::ready(true)
         }));
         assert_eq!(result.unwrap_err().code, "pq2_scan_needed");

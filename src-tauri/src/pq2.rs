@@ -77,19 +77,6 @@ impl ChainBook {
         self.used.insert(index)
     }
 
-    /// Records a use found by a history check of reserved addresses. When it lies within a gap of the end
-    /// of the reserved range, the range is extended to a full gap past it (another copy of the wallet may
-    /// now hand out addresses up to there), and true is returned: a scan must then look further.
-    pub fn mark_found(&mut self, index: u32, address: &str) -> bool {
-        self.mark_used(index, address);
-        let top = index.saturating_add(GAP_LIMIT + 1);
-        if self.issued < top {
-            self.issued = top;
-            return true;
-        }
-        false
-    }
-
     /// The indices whose coins the wallet looks up: those it handed out and those it has seen used.
     pub fn watched(&self) -> Vec<u32> {
         self.handed_out.union(&self.used).copied().collect()
@@ -112,7 +99,10 @@ impl ChainBook {
     /// Where a scan stops: once it has looked at `minimum` indices from its start and the last 20 it looked
     /// at had nothing (an index this device handed out counts as something: it may still be paid).
     pub fn scan_done(&self, start: u32, at: u32, minimum: u32) -> bool {
-        if at < start.saturating_add(minimum) || at < GAP_LIMIT {
+        // The whole issued range, and a full gap past the highest index known used, every address of them
+        // looked at.
+        let past_used = self.used.last().map_or(0, |h| h.saturating_add(GAP_LIMIT + 1));
+        if at < start.saturating_add(minimum) || at < GAP_LIMIT || at < self.issued || at < past_used {
             return false;
         }
         (at - GAP_LIMIT..at).all(|i| !self.used.contains(&i) && !self.handed_out.contains(&i))
@@ -133,6 +123,9 @@ pub struct Book {
     /// asks only about blocks from there on.
     #[serde(default)]
     pub history_tip: Option<u32>,
+    /// Changes whenever a scan is required (`require_scan`).
+    #[serde(default)]
+    pub scan_revision: u64,
     /// Payments rebuilt through the SLH-DSA leaf: each lineage holds the original and every version made
     /// from it, with their inputs. A new version must conflict with every version that could still confirm.
     #[serde(default)]
@@ -175,7 +168,30 @@ impl Book {
     /// The book of a wallet whose receiving address at index 0 is `wallet`. `made_here`: the words were
     /// made on this device just now, so no other copy has handed out anything.
     pub fn new(wallet: &str, made_here: bool) -> Book {
-        Book { version: FILE_VERSION, wallet: wallet.to_string(), chains: Default::default(), scan_needed: !made_here, history_tip: None, lineages: Vec::new() }
+        Book { version: FILE_VERSION, wallet: wallet.to_string(), chains: Default::default(), scan_needed: !made_here, history_tip: None, scan_revision: 0, lineages: Vec::new() }
+    }
+
+    /// Requires a scan before any address is handed out. The revision changes each time, so that a scan
+    /// that began before clears the requirement only if nothing raised it again meanwhile.
+    pub fn require_scan(&mut self) {
+        self.scan_needed = true;
+        self.scan_revision = self.scan_revision.wrapping_add(1);
+    }
+
+    /// Records a use of the address at this chain and index, however the wallet learnt of it (a history
+    /// check, a coin lookup in a refresh or in planning). When this device did not hand the address out and
+    /// it lies within a gap of the end of the issued range, another copy of the wallet may now hand out
+    /// addresses up to a gap past it: the range is extended to there and a scan is required. Returns
+    /// whether the use is new.
+    pub fn record_use(&mut self, chain: u32, index: u32, address: &str) -> bool {
+        let c = &mut self.chains[chain as usize];
+        let new = c.mark_used(index, address);
+        let top = index.saturating_add(GAP_LIMIT + 1);
+        if !c.handed_out.contains(&index) && c.issued < top {
+            c.issued = top;
+            self.require_scan();
+        }
+        new
     }
 
     /// The chain and index of one of the wallet's own pq2 addresses (handed out or used).
@@ -217,7 +233,7 @@ impl Book {
             self.chains[*c as usize].addresses.entry(*i).or_insert_with(|| a.clone());
         }
         self.version = FILE_VERSION;
-        self.scan_needed = true;
+        self.require_scan();
     }
 }
 
