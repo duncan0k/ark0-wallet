@@ -393,6 +393,7 @@ export const zhHans: Messages = {
     pq2_waiting: 'pq2 地址还不可用',
     pq2_unknown_state: '现在读不到节点的 pq2 规则状态',
     pq2_scan_needed: '请先检查恢复钱包的 pq2 地址',
+    pq2_book_full: 'pq2 地址簿已满：更改未保存',
     pq2_gap_limit: '已显示的 pq2 地址中有 20 个还没收到付款，请先用其中一个',
     pq2_change_limit: '这笔付款需要找零，但现在不能使用新的找零地址：请选择「全部」，或等之前的付款进块',
     no_rebuild: '这笔付款现在无法重新生成',

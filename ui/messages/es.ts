@@ -393,6 +393,7 @@ export const es: Messages = {
     pq2_waiting: 'Las direcciones pq2 aún no están disponibles',
     pq2_unknown_state: 'Ahora no se puede leer el estado del nodo para las reglas pq2',
     pq2_scan_needed: 'Comprueba primero las direcciones pq2 del monedero restaurado',
+    pq2_book_full: 'La libreta de direcciones pq2 está llena: el cambio no se guardó',
     pq2_gap_limit: 'Ya se mostraron 20 direcciones pq2 sin pagos; usa primero una de ellas',
     pq2_change_limit: 'Este pago necesitaría cambio, y ahora no se puede usar una dirección de cambio nueva: elige «Todo», o espera a que los pagos anteriores estén en un bloque',
     no_rebuild: 'Este pago no se puede rehacer ahora',

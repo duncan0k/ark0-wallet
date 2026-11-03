@@ -247,6 +247,12 @@ impl Rebuild {
     }
 }
 
+/// What a command reports when the pq2 book could not be read or saved: `pq2_book_full` when the change
+/// would make it larger than the wallet reads back.
+fn book_write_failure(e: std::io::Error) -> Failure {
+    Failure::new(if e.kind() == std::io::ErrorKind::FileTooLarge { "pq2_book_full" } else { "io" })
+}
+
 /// Whether a version of the payment is in the mempool or confirmed, by the wallet's records: then no more
 /// rebuilds of it.
 fn lineage_went_out(versions: &[Version], sent: &[Sent]) -> bool {
@@ -467,7 +473,8 @@ impl AppState {
                 if self.fail_book_writes.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok() {
                     return Err(std::io::Error::other("a failing disk (test)"));
                 }
-                store::save(&path, b)?;
+                // Never a book the wallet could not read back: the change is refused instead.
+                store::save_readable(&path, b)?;
             }
         }
         Ok(result)
@@ -481,7 +488,7 @@ impl AppState {
             Some(b) if b.wallet == wallet && b.valid() => Ok(change(b)),
             _ => Err(Failure::new("pq2_unavailable")),
         })
-        .map_err(|_| Failure::new("io"))?
+        .map_err(book_write_failure)?
     }
 
     /// The pq2 book of the wallet named `wallet`, changed under its lock, only while that wallet is still
@@ -493,7 +500,7 @@ impl AppState {
             Some(b) if b.wallet == wallet && b.valid() && self.generation() == generation => Ok(change(b)),
             _ => Err(Failure::new("locked")),
         })
-        .map_err(|_| Failure::new("io"))?
+        .map_err(book_write_failure)?
     }
 
     /// Err("locked") unless `wallet` is still the open wallet and nothing locked it since `generation`.
@@ -5964,6 +5971,40 @@ mod pq2_tests {
             assert!(book.chains.iter().all(|c| c.issued == 0 && c.scanned == 0 && c.addresses.is_empty()), "scan: {scan}");
             assert_eq!(book.scan_revision, 0, "scan: {scan}");
         }
+    }
+
+    #[test]
+    fn a_book_is_never_written_larger_than_the_wallet_reads() {
+        let w = wallet("book-full", words(0x6f), true, m4_state(H4T + 10, false));
+        let limit = store::MAX_FILE_BYTES as usize;
+        // A book of many used change addresses, a few bytes short of the limit.
+        let fill = |n: u32, extra: usize| {
+            let mut b = w.state.book().unwrap();
+            let c = &mut b.chains[1];
+            c.issued = n;
+            c.used = (0..n).collect();
+            c.addresses = (0..n).map(|i| (i, format!("tb1z{:060}", i))).collect();
+            if n > 0 {
+                c.addresses.insert(0, format!("tb1z{}", "q".repeat(60 + extra)));
+            }
+            b
+        };
+        let size = |b: &Book| serde_json::to_vec_pretty(b).unwrap().len();
+        let (mut low, mut high) = (0u32, 100_000u32);
+        while low + 1 < high {
+            let mid = (low + high) / 2;
+            if size(&fill(mid, 0)) <= limit { low = mid } else { high = mid }
+        }
+        let gap = limit - size(&fill(low, 0));
+        let book = fill(low, gap.saturating_sub(8));
+        assert!(size(&book) <= limit && size(&book) + 50 > limit);
+        std::fs::write(w.state.pq2_path(), serde_json::to_vec_pretty(&book).unwrap()).unwrap();
+        let before = std::fs::read(w.state.pq2_path()).unwrap();
+        assert_eq!(w.state.book().unwrap(), book, "the wallet reads it");
+        // One more address would make it larger than the wallet reads: refused, and the old file stays.
+        assert_eq!(block(new_pq2_address(&w.state)).unwrap_err().code, "pq2_book_full");
+        assert_eq!(std::fs::read(w.state.pq2_path()).unwrap(), before);
+        assert_eq!(w.state.book().unwrap(), book);
     }
 
     #[test]

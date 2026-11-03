@@ -393,6 +393,7 @@ export const ko: Messages = {
     pq2_waiting: 'pq2 주소를 아직 쓸 수 없습니다',
     pq2_unknown_state: '지금은 pq2 규칙에 대한 노드의 상태를 읽을 수 없습니다',
     pq2_scan_needed: '먼저 복원된 지갑의 pq2 주소를 확인하세요',
+    pq2_book_full: 'pq2 주소록이 가득 찼습니다. 변경 사항이 저장되지 않았습니다',
     pq2_gap_limit: '표시한 pq2 주소 중 20개가 아직 지불을 받지 않았습니다. 먼저 그중 하나를 쓰세요',
     pq2_change_limit: '이 지불에는 잔돈이 필요한데, 지금은 새 잔돈 주소를 쓸 수 없습니다. ‘전부’를 고르거나 이전 지불이 블록에 들어갈 때까지 기다리세요',
     no_rebuild: '이 지불은 지금 다시 만들 수 없습니다',

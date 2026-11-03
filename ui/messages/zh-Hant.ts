@@ -393,6 +393,7 @@ export const zhHant: Messages = {
     pq2_waiting: 'pq2 地址還不可用',
     pq2_unknown_state: '現在讀不到節點的 pq2 規則狀態',
     pq2_scan_needed: '請先檢查復原錢包的 pq2 地址',
+    pq2_book_full: 'pq2 地址簿已滿：變更未儲存',
     pq2_gap_limit: '已顯示的 pq2 地址中有 20 個還沒收到付款，請先用其中一個',
     pq2_change_limit: '這筆付款需要找零，但現在不能使用新的找零地址：請選擇「全部」，或等之前的付款進塊',
     no_rebuild: '這筆付款現在無法重新產生',

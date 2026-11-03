@@ -391,6 +391,7 @@ export const en = {
     pq2_waiting: 'pq2 addresses are not available yet',
     pq2_unknown_state: 'The node’s state for the pq2 rules cannot be read right now',
     pq2_scan_needed: 'Check the restored wallet’s pq2 addresses first',
+    pq2_book_full: 'The pq2 address book is full: the change was not saved',
     pq2_gap_limit: '20 pq2 addresses shown so far have not been paid; use one of them first',
     pq2_change_limit: 'This payment would need change, and no new change address can be used right now: choose “All”, or wait until earlier payments are in a block',
     no_rebuild: 'This payment cannot be rebuilt now',

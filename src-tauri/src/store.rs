@@ -307,6 +307,16 @@ pub fn save<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
     write_atomic(path, &serde_json::to_vec_pretty(value)?)
 }
 
+/// Like `save`, but never a file larger than `read_capped` reads back: above that, the old file stays and
+/// the write fails (`FileTooLarge`).
+pub fn save_readable<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec_pretty(value)?;
+    if bytes.len() as u64 > MAX_FILE_BYTES {
+        return Err(std::io::Error::new(std::io::ErrorKind::FileTooLarge, "larger than the wallet reads back"));
+    }
+    write_atomic(path, &bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
