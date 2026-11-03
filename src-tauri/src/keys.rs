@@ -708,7 +708,6 @@ mod tests {
         assert!(mldsa::verify(&p.sign_mldsa44(&message).unwrap(), &message, MLDSA44_CONTEXT, p.mldsa44_public_key()));
     }
 
-    /// RFC 4231's HMAC-SHA-512 test cases 1, 2, 3, 6 and 7 (a key longer than the block is hashed first).
     /// SHA-512 over the core type is SHA-512, at every length around the block boundaries.
     #[test]
     fn sha512_over_the_core_is_sha512() {
@@ -720,6 +719,7 @@ mod tests {
         }
     }
 
+    /// RFC 4231's HMAC-SHA-512 test cases 1, 2, 3, 6 and 7 (a key longer than the block is hashed first).
     #[test]
     fn hmac_sha512_matches_rfc_4231() {
         let cases: [(Vec<u8>, Vec<u8>, &str); 5] = [
