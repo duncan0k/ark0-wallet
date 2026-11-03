@@ -116,6 +116,7 @@ struct Bound {
 /// What a refresh works for, taken in one section of the session: the three fixed templates, the pq2
 /// wallet (None without pq2) and the session generation. A refresh checks it again after every wait on the
 /// network and before it returns (`AppState::current`).
+#[derive(Clone)]
 struct Snapshot {
     templates: (Template, Template, Template),
     bound: Option<Bound>,
@@ -1659,10 +1660,16 @@ async fn plan_payment(state: &AppState, from: Kind, to: String, amount: String) 
 /// the change chain (or no change, at its gap limit), nLockTime H4T. `rebuilt_from`: the payment through
 /// the ML-DSA-44 leaf this one replaces.
 async fn plan_pq2_payment(state: &AppState, address: String, to: String, amount: String, wanted: Option<Path>, rebuild: Option<Rebuild>) -> Res<SendPlan> {
-    state.touch();
     let snapshot = state.snapshot()?;
+    plan_pq2_payment_in(state, snapshot, address, to, amount, wanted, rebuild).await
+}
+
+/// `plan_pq2_payment` for the wallet and session of `snapshot` (a confirmation's own, for its fallback):
+/// every book read and every derivation is of that wallet, checked after each wait on the network.
+async fn plan_pq2_payment_in(state: &AppState, snapshot: Snapshot, address: String, to: String, amount: String, wanted: Option<Path>, rebuild: Option<Rebuild>) -> Res<SendPlan> {
+    state.touch();
     let plan_bound = snapshot.bound.clone();
-    let book = state.book()?;
+    let book = state.edit_book_for(&snapshot, |b| b.clone())?;
     let (chain_index, index) = book.find(&address).ok_or_else(|| Failure::new("address_not_ready"))?;
     let destination = parse_destination(&to)?;
     let amount = parse_amount(&amount)?;
@@ -1678,8 +1685,11 @@ async fn plan_pq2_payment(state: &AppState, address: String, to: String, amount:
     if own.iter().any(|t| t.address == destination.address && !shown(t.kind, &chain)) {
         return Err(Failure::new("destination_not_ready"));
     }
-    let template = state.pq2_template(chain_index, index)?;
-    let coins = flags.take(sources.coins(&template.address).await)?;
+    let bound = snapshot.bound.clone().ok_or_else(|| Failure::new("pq2_unavailable"))?;
+    let template = state.pq2_template_of(&bound.wallet, bound.generation, chain_index, index)?;
+    let coins = flags.take(sources.coins(&template.address).await);
+    state.current(&snapshot)?;
+    let coins = coins?;
     if let Some(bound) = &plan_bound {
         note_used(state, bound, chain_index, index, &address, &coins)?;
     }
@@ -1699,15 +1709,17 @@ async fn plan_pq2_payment(state: &AppState, address: String, to: String, amount:
         },
         _ => Vec::new(),
     };
-    let pending = pending_everywhere(&sources, &coins, &own, &template.address, &mut flags).await?;
+    let pending = pending_everywhere(&sources, &coins, &own, &template.address, &mut flags).await;
+    state.current(&snapshot)?;
+    let pending = pending?;
     let name = account_name(Kind::Pq2, Some(&address));
     let earlier = earlier_payments(&sent, &name, &coins.spendable, &pending);
     let went_out = earlier.spent || surfaced(&sent);
     // No new address, change included, while a recovery scan is incomplete: only payments without change.
-    let book_now = state.book()?;
+    let book_now = state.edit_book_for(&snapshot, |b| b.clone())?;
     let change_index = book_now.chains[CHANGE_CHAIN as usize].next().filter(|_| chain.pq2_allowed && !book_now.scan_needed);
     let change = match change_index {
-        Some(i) => Some(state.pq2_template(CHANGE_CHAIN, i)?),
+        Some(i) => Some(state.pq2_template_of(&bound.wallet, bound.generation, CHANGE_CHAIN, i)?),
         None => None,
     };
     // Through the ML-DSA-44 leaf every usable coin of the address goes at once: the spend shows the key all
@@ -1912,7 +1924,7 @@ async fn send_plan<F: Future<Output = bool>>(
         return Err(Failure::new("no_plan"));
     }
     let (account, coins, spending) = match recheck_payment(state, &mut pending).await {
-        Err(f) if f.code == "mldsa44_disabled" => return rebuild_unsent(state, &pending).await,
+        Err(f) if f.code == "mldsa44_disabled" => return rebuild_unsent(state, &pending, &snapshot).await,
         other => other?,
     };
     let dialog = crate::confirm::payment(
@@ -1951,8 +1963,9 @@ async fn send_plan<F: Future<Output = bool>>(
     // unsent and rebuilt through the SLH-DSA leaf.
     if pending.pq2.is_some() && pending.path == Path::Mldsa44 {
         let still = current_chain(&state.sources, &mut Flags::default()).await.is_ok_and(|c| c.pq2_spendable && c.pq2_mldsa44_allowed());
+        state.current(&snapshot)?;
         if !still {
-            return rebuild_unsent(state, &pending).await;
+            return rebuild_unsent(state, &pending, &snapshot).await;
         }
     }
     // A rebuild, right before it goes out: no version of its lineage has gone out meanwhile (each looked up
@@ -2100,16 +2113,23 @@ async fn send_plan<F: Future<Output = bool>>(
 
 /// The payment through the ML-DSA-44 leaf was not recorded or sent; the same payment through the SLH-DSA
 /// leaf, planned anew, waits for review.
-async fn rebuild_unsent(state: &AppState, pending: &PendingSend) -> Res<SendResult> {
+async fn rebuild_unsent(state: &AppState, pending: &PendingSend, snapshot: &Snapshot) -> Res<SendResult> {
+    // For the wallet and session the confirmation began in, and no other: checked before the address is
+    // derived, through the planning (after each of its waits and before it keeps the plan) and before
+    // returning.
+    state.current(snapshot)?;
     let p = pending.pq2.ok_or_else(|| Failure::new("chain_changed"))?;
-    let address = state.pq2_template(p.chain, p.index)?.address;
+    let bound = snapshot.bound.as_ref().ok_or_else(|| Failure::new("pq2_unavailable"))?;
+    let address = state.pq2_template_of(&bound.wallet, bound.generation, p.chain, p.index)?.address;
     let to = pending.destination.address.clone();
     let rebuild = Rebuild::unsent();
-    let mut plan = plan_pq2_payment(state, address.clone(), to.clone(), format_coins(pending.plan.send), Some(Path::Slhdsa128s), Some(rebuild.clone())).await;
+    let mut plan = plan_pq2_payment_in(state, snapshot.clone(), address.clone(), to.clone(), format_coins(pending.plan.send), Some(Path::Slhdsa128s), Some(rebuild.clone())).await;
     if matches!(&plan, Err(f) if f.code == "insufficient" || f.code == "pq2_change_limit") {
-        plan = plan_pq2_payment(state, address, to, "all".into(), Some(Path::Slhdsa128s), Some(rebuild)).await;
+        plan = plan_pq2_payment_in(state, snapshot.clone(), address, to, "all".into(), Some(Path::Slhdsa128s), Some(rebuild)).await;
     }
-    Ok(SendResult { result: BroadcastResult::Unknown, txid: String::new(), sign_ms: 0.0, rebuilt: Some(plan?) })
+    let plan = plan?;
+    state.current(snapshot)?;
+    Ok(SendResult { result: BroadcastResult::Unknown, txid: String::new(), sign_ms: 0.0, rebuilt: Some(plan) })
 }
 
 fn signed_record(pending: &PendingSend, signed: &wallet::Signed, sign_ms: f64) -> Sent {
@@ -6149,6 +6169,27 @@ mod pq2_tests {
         })).unwrap();
         assert!(guard(&w.net.broadcasts).is_empty());
         assert_eq!(result.rebuilt.unwrap().signature, Path::Slhdsa128s);
+    }
+
+    #[test]
+    fn an_unsent_fallback_stays_with_the_wallet_it_began_for() {
+        let (w, address) = funded("fallback-switch");
+        let view = block(plan_pq2_payment(&w.state, address, elsewhere(), "0.001".into(), Some(Path::Mldsa44), None)).unwrap();
+        // The tripwire is spent while the dialog is open, and while the state is read again the wallet is
+        // replaced: the fallback through SLH-DSA must not be planned for the new wallet.
+        let net = w.net.clone();
+        *guard(&w.state.after_network_answer) = Some(Box::new(|state: &AppState| {
+            state.lock();
+            state.open_session(&words(0x6e), state.generation(), true).unwrap();
+        }));
+        let result = block(send_plan(&w.state, &view.id, Some("en"), move |_| {
+            *guard(&net.state) = m4_state(H4T + 11, true);
+            std::future::ready(true)
+        }));
+        *guard(&w.state.after_network_answer) = None;
+        assert_eq!(result.err().map(|f| f.code), Some("locked".to_string()));
+        assert!(guard(&w.state.pending).is_none(), "no plan kept for the new wallet");
+        assert!(guard(&w.net.broadcasts).is_empty());
     }
 
     #[test]
