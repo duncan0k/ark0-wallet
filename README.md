@@ -20,7 +20,9 @@ Ark-0 is a test network for trying things out. It may be reset at any time.
   replaces, and is made only while that coin is free. Through SLH-DSA a payment takes only the coins it
   needs; through ML-DSA-44 it takes every coin of the address. Each address is shown once; at most 20 shown
   and unpaid at a time. A restored wallet checks its pq2 addresses first by their history on the site (until
-  20 in a row were never paid, on each chain), and can check further. Two copies of one wallet in use at the
+  20 in a row were never paid, on each chain), and can check further. Addresses it holds in reserve are
+  checked on every refresh from six blocks below their last check; Ark-0 has one block producer, so a
+  reorganisation deeper than six blocks is not watched for. Two copies of one wallet in use at the
   same time may each show the same pq2 address, which ties the payments to it together; each copy still sees
   every payment to the addresses it showed or holds in reserve, and a further check finds the rest.
 - **Keys stay on the device.** They come from 24 recovery words, and the wallet file is encrypted with a
