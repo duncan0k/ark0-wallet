@@ -24,7 +24,9 @@ use std::collections::{BTreeMap, BTreeSet};
 pub const GAP_LIMIT: u32 = 20;
 /// How many more indices a wider scan looks at on each chain, at least.
 pub const WIDER_SCAN: u32 = 100;
-const FILE_VERSION: u32 = 1;
+/// 2: addresses of reserved indices and `history_tip` (the history check). Books of version 1 are migrated
+/// when the wallet is opened (`migrate_from_1`).
+const FILE_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChainBook {
@@ -136,10 +138,37 @@ impl Book {
 
     /// Whether the book's shape is one this version wrote.
     pub fn valid(&self) -> bool {
-        self.version == FILE_VERSION
-            && self.chains.iter().all(|c| {
-                c.handed_out.iter().chain(&c.used).all(|i| *i < c.issued) && c.addresses.keys().all(|i| *i < c.issued)
-            })
+        self.version == FILE_VERSION && self.shape_ok()
+    }
+
+    /// Whether every record lies below its chain's issued index.
+    fn shape_ok(&self) -> bool {
+        self.chains.iter().all(|c| c.handed_out.iter().chain(&c.used).all(|i| *i < c.issued) && c.addresses.keys().all(|i| *i < c.issued))
+    }
+
+    /// A book of version 1, written before the history check: it kept no addresses for reserved indices
+    /// and no history tip. True for such a book of this wallet whose records are whole.
+    pub fn needs_migration(&self, wallet: &str) -> bool {
+        self.version == 1 && self.wallet == wallet && self.shape_ok()
+    }
+
+    /// The reserved indices whose address the book does not have, by chain.
+    pub fn reserved_without_address(&self) -> Vec<(u32, u32)> {
+        self.chains
+            .iter()
+            .enumerate()
+            .flat_map(|(c, chain)| chain.reserved().into_iter().filter(|i| !chain.addresses.contains_key(i)).map(move |i| (c as u32, i)))
+            .collect()
+    }
+
+    /// Makes a version 1 book a version 2 one: every issued record is kept, the addresses of reserved
+    /// indices are filled in, and a new scan is required (the old one could not see emptied addresses).
+    pub fn migrate_from_1(&mut self, reserved: &[(u32, u32, String)]) {
+        for (c, i, a) in reserved {
+            self.chains[*c as usize].addresses.entry(*i).or_insert_with(|| a.clone());
+        }
+        self.version = FILE_VERSION;
+        self.scan_needed = true;
     }
 }
 
@@ -213,7 +242,13 @@ mod tests {
         bad.chains[0].issued = 2;
         assert!(!bad.valid());
         let mut bad = b.clone();
-        bad.version = 2;
+        bad.version = 3;
         assert!(!bad.valid());
+        // Version 1 is not valid as it is: it is migrated (it needs a scan, and its reserved addresses).
+        let mut old = b.clone();
+        old.version = 1;
+        assert!(!old.valid() && old.needs_migration("tb1zwallet") && !old.needs_migration("tb1zother"));
+        old.migrate_from_1(&[]);
+        assert!(old.valid() && old.scan_needed);
     }
 }

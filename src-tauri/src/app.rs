@@ -349,11 +349,20 @@ impl AppState {
         drop(current);
         self.touch();
         // A pq2 book of another wallet, or none: a fresh one, which scans first unless the words are new.
+        // A book of an older version is migrated: its records kept, the reserved addresses derived, and a
+        // scan required.
         if let Some(wallet) = wallet {
-            let _ = self.edit_book_raw(|book| {
-                if book.as_ref().is_none_or(|b| b.wallet != wallet || !b.valid()) {
-                    *book = Some(Book::new(&wallet, made_here));
+            let current = self.edit_book_raw(|book| book.clone()).ok().flatten();
+            let mut reserved = Vec::new();
+            if let Some(old) = current.filter(|b| b.needs_migration(&wallet)) {
+                for (c, i) in old.reserved_without_address() {
+                    reserved.push((c, i, self.pq2_template(c, i)?.address));
                 }
+            }
+            let _ = self.edit_book_raw(|book| match book {
+                Some(b) if b.needs_migration(&wallet) => b.migrate_from_1(&reserved),
+                Some(b) if b.wallet == wallet && b.valid() => {}
+                _ => *book = Some(Book::new(&wallet, made_here)),
             });
         }
         Ok(())
@@ -5494,6 +5503,38 @@ mod pq2_tests {
             assert!(book.scan_needed, "answer {at_answer}: B still needs its own scan");
             assert!(book.chains.iter().all(|c| c.addresses.is_empty() && c.issued == 0 && c.scanned == 0), "answer {at_answer}");
         }
+    }
+
+    #[test]
+    fn a_book_from_before_the_history_check_is_migrated_and_scanned_again() {
+        let w = wallet("migrate", words(0x60), true, m4_state(H4T + 100, false));
+        // A book as the version without the history check wrote it: version 1, no history tip, addresses
+        // only for indices handed out or used, 2 to 21 reserved by its scan.
+        let old = json!({
+            "version": 1, "wallet": pq2_address(&w, 0, 0), "scan_needed": false,
+            "chains": [
+                {"issued": 22, "handed_out": [0, 1], "used": [1], "scanned": 22,
+                 "addresses": {"0": pq2_address(&w, 0, 0), "1": pq2_address(&w, 0, 1)}},
+                {"issued": 0, "handed_out": [], "used": [], "scanned": 0, "addresses": {}}
+            ]
+        });
+        std::fs::write(w.state.pq2_path(), old.to_string()).unwrap();
+        w.state.lock();
+        w.state.open_session(&words(0x60), w.state.generation(), false).unwrap();
+        let book = w.state.book().unwrap();
+        // Every issued record kept, a new scan required, reserved addresses filled in.
+        assert_eq!(book.version, 2);
+        assert!(book.scan_needed);
+        assert_eq!(book.chains[0].issued, 22);
+        assert_eq!(book.chains[0].handed_out.iter().copied().collect::<Vec<_>>(), vec![0, 1]);
+        assert!(book.chains[0].used.contains(&1));
+        for i in 0..22 {
+            assert_eq!(book.chains[0].addresses.get(&i), Some(&pq2_address(&w, 0, i)), "index {i}");
+        }
+        assert_eq!(block(new_pq2_address(&w.state)).unwrap_err().code, "pq2_scan_needed");
+        // The reserved addresses are now checked by the refresh, and the scan completes the migration.
+        block(scan_pq2(&w.state, false)).unwrap();
+        assert_eq!(block(new_pq2_address(&w.state)).unwrap().index, 22);
     }
 
     #[test]
