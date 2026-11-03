@@ -150,11 +150,25 @@ pub fn exists(path: &Path) -> bool {
 }
 
 /// A new vault at `path`; refused when one is there already.
+/// Seals and writes a new vault in one go (tests; the wallet seals before it takes its locks).
+#[cfg(test)]
 pub fn create(path: &Path, password: &str, secret: &Secret) -> Result<(), VaultError> {
+    create_sealed(path, &seal_new(password, secret)?)
+}
+
+/// A new vault sealed in memory: the slow key derivation done, nothing on disk yet.
+pub struct Sealed(VaultFile);
+
+pub fn seal_new(password: &str, secret: &Secret) -> Result<Sealed, VaultError> {
+    Ok(Sealed(seal(password, secret)?))
+}
+
+/// Writes a sealed vault, unless one exists.
+pub fn create_sealed(path: &Path, sealed: &Sealed) -> Result<(), VaultError> {
     if exists(path) {
         return Err(VaultError::Exists);
     }
-    write_replacing(path, &seal(password, secret)?)
+    write_replacing(path, &sealed.0)
 }
 
 pub fn open(path: &Path, password: &str) -> Result<Secret, VaultError> {

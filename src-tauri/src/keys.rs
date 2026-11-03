@@ -85,7 +85,7 @@ impl<'de> serde::Deserialize<'de> for SecretBytes {
 }
 
 /// The secret a vault holds.
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum Secret {
     /// 24 words.

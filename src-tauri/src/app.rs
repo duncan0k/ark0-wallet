@@ -307,6 +307,9 @@ pub struct AppState {
     /// Tests: run in a confirmation after its last wait on the network, before it commits the payment.
     #[cfg(test)]
     before_commit: Mutex<Option<Box<dyn FnMut(&AppState) + Send>>>,
+    /// Tests: run by a create or restore before its section.
+    #[cfg(test)]
+    before_set_up: Mutex<Option<Box<dyn FnMut(&AppState) + Send>>>,
     /// Tests: run when a session has been installed, before its book is written.
     #[cfg(test)]
     after_session_installed: Mutex<Option<Box<dyn FnMut(&AppState) + Send>>>,
@@ -349,6 +352,8 @@ impl AppState {
             after_network_answer: Mutex::new(None),
             #[cfg(test)]
             after_session_installed: Mutex::new(None),
+            #[cfg(test)]
+            before_set_up: Mutex::new(None),
             #[cfg(test)]
             before_commit: Mutex::new(None),
             sent_lookups: Mutex::new(HashSet::new()),
@@ -432,15 +437,22 @@ impl AppState {
     /// made on this device, so no other copy of the wallet has handed out pq2 addresses.
     fn open_session(&self, secret: &Secret, generation: u64, made_here: bool) -> Res<()> {
         let session = Session::new(secret)?;
+        self.install_session(session, generation, made_here, || Ok(()))
+    }
+
+    /// Installs a session whose keys are derived, unless the wallet was locked since `generation`.
+    /// `first_write` (a new wallet's vault), the session and the wallet's first book are made in one
+    /// section under the commit lock, after the generation check: locking, removing or replacing a wallet
+    /// (each takes that lock) cannot come between them, and a request begun before a lock writes nothing.
+    fn install_session(&self, session: Session, generation: u64, made_here: bool, first_write: impl FnOnce() -> Res<()>) -> Res<()> {
         let wallet = session.pq2_wallet.clone();
-        // Installing the session and writing its first book are one section under the commit lock:
-        // locking, removing or replacing a wallet (each takes that lock) cannot come between them, and a
-        // set-up begun before a lock writes nothing.
         let _commit = guard(&self.commit_ops);
-        let mut current = guard(&self.session);
+        // The generation changes only under the commit lock.
         if self.generation() != generation {
             return Err(Failure::new("locked"));
         }
+        first_write()?;
+        let mut current = guard(&self.session);
         *current = Some(session);
         drop(current);
         self.touch();
@@ -714,19 +726,42 @@ pub fn create_wallet(state: State<'_, AppState>, password: String) -> Res<Status
 fn create_confirmed_wallet(state: &AppState, password: String) -> Res<()> {
     let password = Zeroizing::new(password);
     let generation = state.generation();
-    let new = {
-        let _one_at_a_time = guard(&state.vault_ops);
-        let mut pending = guard(&state.new_wallet);
+    let secret = {
+        let pending = guard(&state.new_wallet);
         let new = pending.as_ref().ok_or_else(|| Failure::new("no_phrase"))?;
         if !new.confirmed {
             return Err(Failure::new("phrase_not_confirmed"));
         }
-        // Keep the words for another try on failure, under the same lock as cancellation and locking.
-        remove_orphaned_record(state)?;
-        vault::create(&state.vault_path(), &password, &new.secret)?;
-        pending.take().expect("the pending wallet was checked above")
+        new.secret.clone()
     };
-    state.open_session(&new.secret, generation, true)
+    // The slow derivations first, outside any lock.
+    let sealed = vault::seal_new(&password, &secret)?;
+    let session = Session::new(&secret)?;
+    before_set_up(state);
+    let _one_at_a_time = guard(&state.vault_ops);
+    state.install_session(session, generation, true, || {
+        // The same confirmed words still pending; they are kept for another try on failure, and taken
+        // only once the vault is written.
+        let mut pending = guard(&state.new_wallet);
+        if !pending.as_ref().is_some_and(|n| n.confirmed && n.secret == secret) {
+            return Err(Failure::new("no_phrase"));
+        }
+        remove_orphaned_record(state)?;
+        vault::create_sealed(&state.vault_path(), &sealed)?;
+        pending.take();
+        Ok(())
+    })
+}
+
+/// Tests: run by a create or restore after its slow derivations, before its section.
+fn before_set_up(_state: &AppState) {
+    #[cfg(test)]
+    {
+        let hook = guard(&_state.before_set_up).take();
+        if let Some(mut hook) = hook {
+            hook(_state);
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -759,12 +794,16 @@ fn restore_wallet_from_text(state: &AppState, text: String, password: String) ->
     let (text, password) = (Zeroizing::new(text), Zeroizing::new(password));
     let generation = state.generation();
     let secret = parse_recovery(&text)?;
-    {
-        let _one_at_a_time = guard(&state.vault_ops);
+    // The slow derivations first, outside any lock.
+    let sealed = vault::seal_new(&password, &secret)?;
+    let session = Session::new(&secret)?;
+    before_set_up(state);
+    let _one_at_a_time = guard(&state.vault_ops);
+    state.install_session(session, generation, false, || {
         remove_orphaned_record(state)?;
-        vault::create(&state.vault_path(), &password, &secret)?;
-    }
-    state.open_session(&secret, generation, false)
+        vault::create_sealed(&state.vault_path(), &sealed)?;
+        Ok(())
+    })
 }
 
 #[tauri::command]
@@ -6030,6 +6069,30 @@ mod pq2_tests {
         assert_eq!(block(new_pq2_address(&w.state)).unwrap_err().code, "pq2_book_full");
         assert_eq!(std::fs::read(w.state.pq2_path()).unwrap(), before);
         assert_eq!(w.state.book().unwrap(), book);
+    }
+
+    #[test]
+    fn a_create_or_restore_begun_before_a_lock_writes_nothing() {
+        for restoring in [true, false] {
+            let w = wallet("stale-setup", words(0x74), true, m4_state(H4T + 10, false));
+            w.state.lock();
+            std::fs::remove_file(w.state.pq2_path()).unwrap();
+            let password = "a long enough password".to_string();
+            // The request has derived its keys; then the wallet is locked (its removal confirmed).
+            *guard(&w.state.before_set_up) = Some(Box::new(|state: &AppState| state.lock()));
+            let result = if restoring {
+                restore_wallet_from_text(&w.state, words(0x75).recovery_text().to_string(), password.clone())
+            } else {
+                *guard(&w.state.new_wallet) = Some(NewWallet { secret: words(0x76), confirmed: true });
+                create_confirmed_wallet(&w.state, password.clone())
+            };
+            assert_eq!(result.unwrap_err().code, "locked", "restoring: {restoring}");
+            // Nothing on disk, no session; the next wallet is made as if the stale request never ran.
+            assert!(!vault::exists(&w.state.vault_path()) && !w.state.pq2_path().exists(), "restoring: {restoring}");
+            assert!(guard(&w.state.session).is_none());
+            restore_wallet_from_text(&w.state, words(0x77).recovery_text().to_string(), password).unwrap();
+            assert_eq!(w.state.book().unwrap().wallet, pq2_address(&w, 0, 0));
+        }
     }
 
     #[test]
