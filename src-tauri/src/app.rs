@@ -1671,6 +1671,8 @@ async fn plan_pq2_payment(state: &AppState, address: String, to: String, amount:
         earlier_payments(&others, &name, &coins.spendable, &pending).required
     };
     let mut required = if path == Path::Mldsa44 { earlier.usable.clone() } else { others_required };
+    // Versions the forced inputs already conflict with need nothing more; the cover is for the rest.
+    targets.retain(|v| !required.iter().any(|c| v.inputs.contains(&c.outpoint())));
     if !targets.is_empty() {
         for c in conflict_set(&targets, &earlier.usable).ok_or_else(|| Failure::new("rebuild_inputs_spent"))? {
             if !required.contains(&c) {
@@ -6338,6 +6340,34 @@ mod pq2_tests {
         // It passes the record's retry rules (it shares an input with every one of them) and goes out.
         let sent = block(send_plan(&w.state, &view.id, Some("en"), |_| std::future::ready(true))).unwrap();
         assert!(matches!(sent.result, BroadcastResult::Sent { .. }), "{sent:?}");
+    }
+
+    #[test]
+    fn the_cover_counts_the_inputs_other_payments_already_force() {
+        let w = wallet("cover-forced", words(0x69), true, m4_state(H4T + 10, false));
+        let address = block(new_pq2_address(&w.state)).unwrap().address;
+        // X of 3,000,000 and C1..C12 of 200,000 + i.
+        let x = format!("{}:0", "9".repeat(64));
+        let cs: Vec<String> = (1..=12).map(|i| format!("{}:{i}", "8".repeat(64))).collect();
+        let mut utxos = vec![utxo('9', 0, 3_000_000, H4T + 7)];
+        utxos.extend((1..=12u32).map(|i| utxo('8', i, 200_000 + u64::from(i), H4T + 7)));
+        guard(&w.net.utxos).insert(address.clone(), utxos);
+        // T spent {X, C1} through ML-DSA-44 and was refused; twelve other unclear payments of the address
+        // each spent one Ci, which the retry rules force.
+        let t = ml_record(&w, &address, &"75".repeat(32), "rejected", &[x.clone(), cs[0].clone()]);
+        let mut all: Vec<Sent> = store::load(&w.state.sent_path());
+        all[0].send = 250_000;
+        for (i, c) in cs.iter().enumerate() {
+            all.push(Sent { txid: format!("{:064x}", 0x6000 + i), signature: "slhdsa128s".into(), status: "unknown".into(), outpoints: vec![c.clone()], ..all[0].clone() });
+        }
+        store::save(&w.state.sent_path(), &all).unwrap();
+        *guard(&w.net.state) = m4_state(H4T + 12, true);
+        // C1, forced for its own payment, already conflicts with T: X is not added.
+        let view = block(rebuild_plan(&w.state, &t.txid)).unwrap();
+        assert_eq!((view.signature, view.inputs), (Path::Slhdsa128s, 12));
+        assert!(view.size <= wallet::MAX_TX_BYTES && view.change > 0);
+        let coins: Vec<String> = guard(&w.state.pending).as_ref().unwrap().plan.coins.iter().map(Coin::outpoint).collect();
+        assert!(!coins.contains(&x) && cs.iter().all(|c| coins.contains(c)));
     }
 
     #[test]
