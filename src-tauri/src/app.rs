@@ -233,9 +233,17 @@ impl Rebuild {
         !self.root.txid.is_empty()
     }
 
-    /// The anchor: the original's first input, which every version spends.
+    /// The anchor: the original's first input (the first version of the lineage), which every version
+    /// spends.
     fn anchor(&self) -> Option<&str> {
-        self.root.inputs.first().map(String::as_str)
+        self.versions.first().unwrap_or(&self.root).inputs.first().map(String::as_str)
+    }
+
+    /// Whether every recorded version of the payment spends its anchor. A lineage made before every version
+    /// had to may hold one that does not; such a payment is not rebuilt (`rebuild_not_possible`): a new
+    /// version could share no input with it.
+    fn anchored(&self, versions: &[Version]) -> bool {
+        self.anchor().is_some_and(|a| versions.iter().all(|v| v.inputs.iter().any(|i| i == a)))
     }
 }
 
@@ -1698,6 +1706,9 @@ async fn plan_pq2_payment_in(state: &AppState, snapshot: Snapshot, address: Stri
             if lineage_went_out(&r.versions, &sent) {
                 return Err(Failure::new("rebuild_original_went_out"));
             }
+            if !r.anchored(&r.versions) {
+                return Err(Failure::new("rebuild_not_possible"));
+            }
             Some(r.anchor().ok_or_else(|| Failure::new("rebuild_anchor_unavailable"))?.to_string())
         }
         _ => None,
@@ -1997,6 +2008,11 @@ async fn send_plan<F: Future<Output = bool>>(
         state.still_current(&snapshot)?;
         let rebuild = pending.rebuild.as_ref().filter(|r| r.bound());
         if let Some(r) = rebuild {
+            // Every version recorded now spends the anchor, and so does the one planned.
+            let recorded = state.edit_book_for(&snapshot, |b| b.lineage_of(&r.root.txid).map(|l| l.versions.clone()))?;
+            if !r.anchored(&r.versions) || recorded.is_some_and(|v| !r.anchored(&v)) {
+                return Err(Failure::new("rebuild_not_possible"));
+            }
             if !r.anchor().is_some_and(|a| pending.plan.coins.iter().any(|c| c.outpoint() == a)) {
                 return Err(Failure::new("rebuild_anchor_unavailable"));
             }
@@ -6617,6 +6633,39 @@ mod pq2_tests {
             assert!(!inputs.is_empty());
             assert!(inputs.iter().all(|i| i.contains(&a)), "case {case}: {inputs:?} ({result:?})");
         }
+    }
+
+    #[test]
+    fn a_lineage_with_a_version_that_does_not_spend_the_anchor_is_not_rebuilt() {
+        // An earlier build left T = {A, B} and an SLH-DSA rebuild R1 spending B alone, sent and unclear.
+        let (w, address) = funded("unanchored");
+        let (a, b) = (format!("{}:0", "a".repeat(64)), format!("{}:1", "b".repeat(64)));
+        let t = ml_record(&w, &address, &"7b".repeat(32), "rejected", &[a.clone(), b.clone()]);
+        let r1 = Sent { txid: "7c".repeat(32), signature: "slhdsa128s".into(), status: "unknown".into(), outpoints: vec![b.clone()], inputs: 1, ..t.clone() };
+        let mut all: Vec<Sent> = store::load(&w.state.sent_path());
+        all.push(r1.clone());
+        store::save(&w.state.sent_path(), &all).unwrap();
+        let root = Version { txid: t.txid.clone(), inputs: t.outpoints.clone() };
+        w.state.edit_book(|bk| bk.add_version(&root, Version { txid: r1.txid.clone(), inputs: r1.outpoints.clone() })).unwrap();
+        // A is free, B is held by another transaction Q in the mempool: a version from A would share no
+        // input with R1 once Q leaves.
+        *guard(&w.net.state) = m4_state(H4T + 12, true);
+        guard(&w.net.utxos).insert(address.clone(), vec![utxo('a', 0, 104_176, H4T + 7), held_by('b', 1, 104_176, 'f')]);
+        assert_eq!(block(rebuild_plan(&w.state, &t.txid)).unwrap_err().code, "rebuild_not_possible");
+        assert!(guard(&w.state.pending).is_none());
+        // The commit checks it too: such a version recorded after planning stops the payment.
+        let (w, address) = funded("unanchored-commit");
+        let t = ml_record(&w, &address, &"7d".repeat(32), "rejected", &[format!("{}:0", "d".repeat(64)), format!("{}:2", "e".repeat(64))]);
+        *guard(&w.net.state) = m4_state(H4T + 12, true);
+        let r = block(rebuild_plan(&w.state, &t.txid)).unwrap();
+        let root = Version { txid: t.txid.clone(), inputs: t.outpoints.clone() };
+        *guard(&w.state.before_commit) = Some(Box::new(move |state: &AppState| {
+            let other = Version { txid: "7e".repeat(32), inputs: vec![format!("{}:2", "e".repeat(64))] };
+            state.edit_book(|bk| bk.add_version(&root, other)).unwrap();
+        }));
+        assert_eq!(block(send_plan(&w.state, &r.id, Some("en"), |_| std::future::ready(true))).err().map(|f| f.code), Some("rebuild_not_possible".to_string()));
+        assert!(guard(&w.net.broadcasts).is_empty());
+        assert_eq!(store::load::<Vec<Sent>>(&w.state.sent_path()).len(), 1, "no record");
     }
 
     #[test]
