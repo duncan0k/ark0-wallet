@@ -307,6 +307,9 @@ pub struct AppState {
     /// Tests: run in a confirmation after its last wait on the network, before it commits the payment.
     #[cfg(test)]
     before_commit: Mutex<Option<Box<dyn FnMut(&AppState) + Send>>>,
+    /// Tests: run when a session has been installed, before its book is written.
+    #[cfg(test)]
+    after_session_installed: Mutex<Option<Box<dyn FnMut(&AppState) + Send>>>,
     /// Tests: run after every network answer a scan or a refresh of pq2 gets.
     #[cfg(test)]
     after_network_answer: Mutex<Option<Box<dyn FnMut(&AppState) + Send>>>,
@@ -344,6 +347,8 @@ impl AppState {
             fail_sent_writes: AtomicUsize::new(0),
             #[cfg(test)]
             after_network_answer: Mutex::new(None),
+            #[cfg(test)]
+            after_session_installed: Mutex::new(None),
             #[cfg(test)]
             before_commit: Mutex::new(None),
             sent_lookups: Mutex::new(HashSet::new()),
@@ -428,6 +433,10 @@ impl AppState {
     fn open_session(&self, secret: &Secret, generation: u64, made_here: bool) -> Res<()> {
         let session = Session::new(secret)?;
         let wallet = session.pq2_wallet.clone();
+        // Installing the session and writing its first book are one section under the commit lock:
+        // locking, removing or replacing a wallet (each takes that lock) cannot come between them, and a
+        // set-up begun before a lock writes nothing.
+        let _commit = guard(&self.commit_ops);
         let mut current = guard(&self.session);
         if self.generation() != generation {
             return Err(Failure::new("locked"));
@@ -435,6 +444,13 @@ impl AppState {
         *current = Some(session);
         drop(current);
         self.touch();
+        #[cfg(test)]
+        {
+            let hook = guard(&self.after_session_installed).take();
+            if let Some(mut hook) = hook {
+                hook(self);
+            }
+        }
         // A pq2 book of another wallet, or none: a fresh one, which scans first unless the words are new.
         // A book of an older version is migrated: its records kept, the reserved addresses derived, and a
         // scan required.
@@ -6005,6 +6021,40 @@ mod pq2_tests {
         assert_eq!(block(new_pq2_address(&w.state)).unwrap_err().code, "pq2_book_full");
         assert_eq!(std::fs::read(w.state.pq2_path()).unwrap(), before);
         assert_eq!(w.state.book().unwrap(), book);
+    }
+
+    #[test]
+    fn nothing_comes_between_a_new_session_and_its_first_book() {
+        let w = wallet("setup", words(0x70), true, m4_state(H4T + 10, false));
+        // Wallet A's set-up pauses right after its session is installed.
+        let (installed, paused) = std::sync::mpsc::channel();
+        *guard(&w.state.after_session_installed) = Some(Box::new(move |_: &AppState| {
+            installed.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(500));
+        }));
+        std::thread::scope(|s| {
+            let state = &w.state;
+            state.lock();
+            let generation = state.generation();
+            let a = s.spawn(move || state.open_session(&words(0x71), generation, true));
+            paused.recv().unwrap();
+            // Meanwhile A is locked away, B restored and given an address.
+            state.lock();
+            state.open_session(&words(0x72), state.generation(), true).unwrap();
+            block(new_pq2_address(state)).unwrap();
+            a.join().unwrap().unwrap();
+        });
+        // B keeps its book, and the address it handed out.
+        let book = w.state.book().unwrap();
+        assert_eq!(book.wallet, pq2_address(&w, 0, 0));
+        assert!(book.chains[0].handed_out.contains(&0));
+        // A set-up begun before a lock writes nothing and ends locked.
+        let before = std::fs::read(w.state.pq2_path()).unwrap();
+        let generation = w.state.generation();
+        w.state.lock();
+        assert_eq!(w.state.open_session(&words(0x73), generation, true).unwrap_err().code, "locked");
+        assert_eq!(std::fs::read(w.state.pq2_path()).unwrap(), before);
+        assert!(guard(&w.state.session).is_none());
     }
 
     #[test]
