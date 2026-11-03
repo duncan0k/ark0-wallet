@@ -1734,18 +1734,24 @@ async fn plan_pq2_payment_in(state: &AppState, snapshot: Snapshot, address: Stri
     // Through the SLH-DSA leaf, the fewest coins that pay (largest first), or as many as fit for "all";
     // the coins other payments still waiting require go first, and for a rebuild its anchor, which must be
     // spendable now. The versions of the rebuild's own payment need nothing more: they all spend the anchor.
+    // The payment's other unclear payments are covered starting from the anchor: one already spending it
+    // needs nothing more.
+    let anchor_coin = match &anchor {
+        Some(a) => Some(earlier.usable.iter().find(|c| &c.outpoint() == a).ok_or_else(|| Failure::new("rebuild_anchor_unavailable"))?.clone()),
+        None => None,
+    };
     let lineage: HashSet<&str> = rebuild.iter().filter(|r| r.bound()).flat_map(|r| r.versions.iter().map(|v| v.txid.as_str())).collect();
     let others_required = if lineage.is_empty() {
         earlier.required.clone()
     } else {
         let others: Vec<Sent> = sent.iter().filter(|s| !lineage.contains(s.txid.as_str())).cloned().collect();
-        earlier_payments(&others, &name, &coins.spendable, &pending).required
+        let forced: Vec<Coin> = anchor_coin.iter().cloned().collect();
+        earlier_payments(&others, &name, &coins.spendable, &pending).cover(&forced)
     };
     let mut required = if path == Path::Mldsa44 { earlier.usable.clone() } else { others_required };
-    if let Some(anchor) = &anchor {
-        let coin = earlier.usable.iter().find(|c| &c.outpoint() == anchor).ok_or_else(|| Failure::new("rebuild_anchor_unavailable"))?;
-        if !required.contains(coin) {
-            required.insert(0, coin.clone());
+    if let Some(coin) = anchor_coin {
+        if !required.contains(&coin) {
+            required.insert(0, coin);
         }
     }
     // nLockTime H4T when the payment creates a pq2 output: its change, or one of the wallet's own pq2
@@ -2443,6 +2449,8 @@ struct Earlier {
     required: Vec<Coin>,
     /// The txids of those payments.
     replaces: Vec<String>,
+    /// For each of those payments, its usable coins: spending any one of them covers it.
+    covers: Vec<Vec<Coin>>,
     /// Such a payment with no usable coins left, or with a coin spent by a payment on its way, and no
     /// proven cover: it may still go out, and a new payment may be one more rather than a retry.
     spent: bool,
@@ -2472,7 +2480,7 @@ fn earlier_payments(sent: &[Sent], account: &str, spendable: &[Coin], pending: &
         }
     });
     let spending: HashSet<String> = pending.coins.iter().map(Coin::outpoint).chain(in_flight).collect();
-    let mut e = Earlier { usable: Vec::new(), required: Vec::new(), replaces: Vec::new(), spent: false, elsewhere: false, unrecorded };
+    let mut e = Earlier { usable: Vec::new(), required: Vec::new(), replaces: Vec::new(), covers: Vec::new(), spent: false, elsewhere: false, unrecorded };
     for s in sent.iter().filter(|s| unclear(s) || refused(s)) {
         if s.outpoints.iter().any(|o| taken.contains(o)) {
             // A proven payment spends one of its coins: it cannot go through.
@@ -2489,12 +2497,36 @@ fn earlier_payments(sent: &[Sent], account: &str, spendable: &[Coin], pending: &
                     e.required.push(coin.clone());
                 }
                 e.replaces.push(s.txid.clone());
+                e.covers.push(usable.iter().filter(|c| s.outpoints.contains(&c.outpoint())).cloned().collect());
             }
             None => e.spent = true,
         }
     }
     e.usable = usable;
     e
+}
+
+impl Earlier {
+    /// The coins to add to `forced` (inputs the payment spends anyway) so that it covers every payment in
+    /// `covers`: a payment one of whose coins is already spent is covered; then, one at a time, the coin
+    /// shared by the most payments not yet covered, the largest among equals.
+    fn cover(&self, forced: &[Coin]) -> Vec<Coin> {
+        let mut added: Vec<Coin> = Vec::new();
+        loop {
+            let open: Vec<&Vec<Coin>> = self.covers.iter().filter(|set| !set.iter().any(|c| forced.contains(c) || added.contains(c))).collect();
+            let mut best: Option<(&Coin, usize)> = None;
+            for coin in open.iter().flat_map(|set| set.iter()) {
+                let n = open.iter().filter(|set| set.contains(coin)).count();
+                if best.is_none_or(|(b, bn)| n > bn || (n == bn && coin.sats > b.sats)) {
+                    best = Some((coin, n));
+                }
+            }
+            match best {
+                Some((coin, _)) => added.push(coin.clone()),
+                None => return added,
+            }
+        }
+    }
 }
 
 /// Releases this refresh's claims even when its future is dropped before the lookups finish.
@@ -6666,6 +6698,50 @@ mod pq2_tests {
         assert_eq!(block(send_plan(&w.state, &r.id, Some("en"), |_| std::future::ready(true))).err().map(|f| f.code), Some("rebuild_not_possible".to_string()));
         assert!(guard(&w.net.broadcasts).is_empty());
         assert_eq!(store::load::<Vec<Sent>>(&w.state.sent_path()).len(), 1, "no record");
+    }
+
+    #[test]
+    fn the_other_payments_are_covered_starting_from_the_anchor() {
+        // T's anchor A (100,000) and a rebuild of 50,000; twelve other unclear payments of the address, each
+        // {A, Yi}, Yi = 200,000 + i, all free: A alone covers every one of them.
+        let w = wallet("cover-anchor", words(0x6a), true, m4_state(H4T + 10, false));
+        let address = block(new_pq2_address(&w.state)).unwrap().address;
+        let a = format!("{}:0", "9".repeat(64));
+        let mut utxos = vec![utxo('9', 0, 100_000, H4T + 7)];
+        utxos.extend((1..=12u32).map(|i| utxo('8', i, 200_000 + u64::from(i), H4T + 7)));
+        guard(&w.net.utxos).insert(address.clone(), utxos);
+        let t = ml_record(&w, &address, &"7f".repeat(32), "rejected", std::slice::from_ref(&a));
+        let mut all: Vec<Sent> = store::load(&w.state.sent_path());
+        all[0].send = 50_000;
+        for i in 1..=12u32 {
+            let y = format!("{}:{i}", "8".repeat(64));
+            all.push(Sent { txid: format!("{:064x}", 0x7000 + i), signature: "slhdsa128s".into(), status: "unknown".into(), outpoints: vec![a.clone(), y], ..all[0].clone() });
+        }
+        store::save(&w.state.sent_path(), &all).unwrap();
+        *guard(&w.net.state) = m4_state(H4T + 12, true);
+        let view = block(rebuild_plan(&w.state, &t.txid)).unwrap();
+        let coins: Vec<String> = guard(&w.state.pending).as_ref().unwrap().plan.coins.iter().map(Coin::outpoint).collect();
+        assert_eq!(coins, vec![a]);
+        assert!(view.inputs == 1 && view.change > 0);
+    }
+
+    #[test]
+    fn a_cover_takes_the_coin_shared_by_the_most_payments_then_the_largest() {
+        let coin = |c: char, sats: u64| Coin { txid: c.to_string().repeat(64), vout: 0, sats, height: 1 };
+        let e = Earlier {
+            usable: Vec::new(), required: Vec::new(), replaces: Vec::new(), spent: false, elsewhere: false, unrecorded: false,
+            covers: vec![
+                vec![coin('a', 10), coin('b', 50)],
+                vec![coin('b', 50), coin('c', 90)],
+                vec![coin('b', 50), coin('d', 5)],
+                vec![coin('e', 70), coin('f', 80)],
+            ],
+        };
+        // b covers three, then f, the larger of the last one's.
+        assert_eq!(e.cover(&[]), vec![coin('b', 50), coin('f', 80)]);
+        // Forced inputs cover what they share first.
+        assert_eq!(e.cover(&[coin('e', 70)]), vec![coin('b', 50)]);
+        assert_eq!(e.cover(&[coin('a', 10), coin('c', 90), coin('d', 5), coin('e', 70)]), Vec::<Coin>::new());
     }
 
     #[test]
