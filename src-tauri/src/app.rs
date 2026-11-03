@@ -297,9 +297,15 @@ pub struct AppState {
     sent_ops: Mutex<()>,
     /// Held while the pq2 book is read, changed and saved (`edit_book`).
     pq2_ops: Mutex<()>,
+    /// Held while a payment is committed: the final check of a rebuild's lineage, its joining the lineage,
+    /// the change address handed out and the record made as submitting, all in one section.
+    commit_ops: Mutex<()>,
     /// Tests: this many next saves of the pq2 book fail.
     #[cfg(test)]
     fail_book_writes: AtomicUsize,
+    /// Tests: run in a confirmation after its last wait on the network, before it commits the payment.
+    #[cfg(test)]
+    before_commit: Mutex<Option<Box<dyn FnMut(&AppState) + Send>>>,
     /// Tests: run after every network answer a scan or a refresh of pq2 gets.
     #[cfg(test)]
     after_network_answer: Mutex<Option<Box<dyn FnMut(&AppState) + Send>>>,
@@ -329,10 +335,13 @@ impl AppState {
             vault_ops: Mutex::new(()),
             sent_ops: Mutex::new(()),
             pq2_ops: Mutex::new(()),
+            commit_ops: Mutex::new(()),
             #[cfg(test)]
             fail_book_writes: AtomicUsize::new(0),
             #[cfg(test)]
             after_network_answer: Mutex::new(None),
+            #[cfg(test)]
+            before_commit: Mutex::new(None),
             sent_lookups: Mutex::new(HashSet::new()),
             generation: AtomicU64::new(0),
             locked: watch::channel(()).0,
@@ -1868,51 +1877,74 @@ async fn send_plan<F: Future<Output = bool>>(
             return rebuild_unsent(state, &pending).await;
         }
     }
-    // A rebuild, right before it goes out: no version of its lineage (as the book has it now) has gone out
-    // meanwhile (each looked up again now; no answer, no broadcast), and it still spends an input of every
-    // version that could still confirm. Then it joins the lineage, before it is recorded and sent.
-    if let Some(r) = pending.rebuild.as_ref().filter(|r| r.bound()) {
-        let versions = state.book()?.lineage_of(&r.root.txid).map_or_else(|| r.versions.clone(), |l| l.versions.clone());
-        for v in &versions {
-            let status = state.sources.tx_status(&v.txid).await.value?;
-            if matches!(status, TxStatus::Confirmed { .. } | TxStatus::Mempool) {
-                let _ = edit_sent(state, |sent| {
-                    if let Some(s) = sent.iter_mut().find(|s| s.txid == v.txid) {
-                        let (st, n) = match status {
-                            TxStatus::Confirmed { confirmations } => ("confirmed", confirmations.min(REQUIRED_BLOCKS - 1)),
-                            _ => ("mempool", 0),
-                        };
-                        s.status = st.into();
-                        s.confirmations = n;
-                    }
-                    mark_replaced(sent);
-                });
+    // A rebuild, right before it goes out: no version of its lineage has gone out meanwhile (each looked up
+    // again now; no answer, no broadcast).
+    let looked_up: Option<Vec<Version>> = match pending.rebuild.as_ref().filter(|r| r.bound()) {
+        None => None,
+        Some(r) => {
+            let versions = state.book()?.lineage_of(&r.root.txid).map_or_else(|| vec![r.root.clone()], |l| l.versions.clone());
+            for v in &versions {
+                let status = state.sources.tx_status(&v.txid).await.value?;
+                if matches!(status, TxStatus::Confirmed { .. } | TxStatus::Mempool) {
+                    let _ = edit_sent(state, |sent| {
+                        if let Some(s) = sent.iter_mut().find(|s| s.txid == v.txid) {
+                            let (st, n) = match status {
+                                TxStatus::Confirmed { confirmations } => ("confirmed", confirmations.min(REQUIRED_BLOCKS - 1)),
+                                _ => ("mempool", 0),
+                            };
+                            s.status = st.into();
+                            s.confirmations = n;
+                        }
+                        mark_replaced(sent);
+                    });
+                    return Err(Failure::new("rebuild_original_went_out"));
+                }
+            }
+            Some(versions)
+        }
+    };
+    #[cfg(test)]
+    {
+        let hook = guard(&state.before_commit).take();
+        if let Some(mut hook) = hook {
+            hook(state);
+        }
+    }
+    {
+        // One section, with no wait on the network: the rebuild's lineage as it is now (it must be the one
+        // whose versions were just looked up; a version added meanwhile means another review), the rebuild
+        // conflicting with every version that could still confirm, its joining the lineage, the change
+        // address, and the record as submitting. Another confirmation of the same payment waits here.
+        let _commit = guard(&state.commit_ops);
+        if let (Some(r), Some(versions)) = (pending.rebuild.as_ref().filter(|r| r.bound()), &looked_up) {
+            let now = state.book()?.lineage_of(&r.root.txid).map_or_else(|| vec![r.root.clone()], |l| l.versions.clone());
+            if now != *versions {
+                return Err(Failure::new("rebuild_lineage_changed"));
+            }
+            let recorded: Vec<Sent> = store::load_existing(&state.sent_path()).map_err(|_| Failure::new("io"))?;
+            let LineageState::Live(live) = lineage_state(&now, &recorded, &coins) else {
                 return Err(Failure::new("rebuild_original_went_out"));
+            };
+            if !live.iter().all(|v| pending.plan.coins.iter().any(|c| v.inputs.contains(&c.outpoint()))) {
+                return Err(Failure::new("rebuild_no_common_input"));
+            }
+            let version = Version { txid: signed.txid.clone(), inputs: pending.plan.coins.iter().map(Coin::outpoint).collect() };
+            state.edit_book(|b| b.add_version(&r.root, version))?;
+        }
+        // The change address is handed out before the payment is recorded: it is never given to another.
+        if let Some(Pq2Pending { change: Some(index), .. }) = pending.pq2 {
+            let address = state.pq2_template(CHANGE_CHAIN, index)?.address;
+            match state.edit_book(|b| if b.scan_needed { None } else { Some(b.chains[CHANGE_CHAIN as usize].issue(index, &address)) })? {
+                None => return Err(Failure::new("pq2_scan_needed")),
+                Some(false) => return Err(Failure::new("coins_changed")),
+                Some(true) => {}
             }
         }
-        let recorded: Vec<Sent> = store::load(&state.sent_path());
-        let LineageState::Live(live) = lineage_state(&versions, &recorded, &coins) else {
-            return Err(Failure::new("rebuild_original_went_out"));
-        };
-        if !live.iter().all(|v| pending.plan.coins.iter().any(|c| v.inputs.contains(&c.outpoint()))) {
-            return Err(Failure::new("rebuild_no_common_input"));
-        }
-        let version = Version { txid: signed.txid.clone(), inputs: pending.plan.coins.iter().map(Coin::outpoint).collect() };
-        state.edit_book(|b| b.add_version(&r.root, version))?;
+        let record = signed_record(&pending, &signed, sign_ms);
+        // Recorded before the API sees it. Not sent at all when that fails, when the wallet was locked or
+        // removed meanwhile, or when another of its payments on the way spends one of the same coins.
+        record_payment(state, &pending, &coins, &spending, generation, record)?;
     }
-    // The change address is handed out before the payment is recorded: it is never given to another.
-    if let Some(Pq2Pending { change: Some(index), .. }) = pending.pq2 {
-        let address = state.pq2_template(CHANGE_CHAIN, index)?.address;
-        match state.edit_book(|b| if b.scan_needed { None } else { Some(b.chains[CHANGE_CHAIN as usize].issue(index, &address)) })? {
-            None => return Err(Failure::new("pq2_scan_needed")),
-            Some(false) => return Err(Failure::new("coins_changed")),
-            Some(true) => {}
-        }
-    }
-    let record = signed_record(&pending, &signed, sign_ms);
-    // Recorded before the API sees it. Not sent at all when that fails, when the wallet was locked or
-    // removed meanwhile, or when another of its payments on the way spends one of the same coins.
-    record_payment(state, &pending, &coins, &spending, generation, record)?;
     let result = state.sources.broadcast(&signed.hex, &signed.txid).await.value;
     // What the API answered; a refusal is kept too, and looked up again later (activity), because only
     // the network can say whether the transaction went out.
@@ -6140,6 +6172,53 @@ mod pq2_tests {
         // Once a version is confirmed, no more rebuilds of T.
         guard(&w.net.txs).insert(r1_txid, json!({"status": "confirmed", "confirmations": 1}));
         assert_eq!(block(rebuild_plan(&w.state, &t.txid)).unwrap_err().code, "rebuild_original_went_out");
+    }
+
+    #[test]
+    fn concurrent_rebuilds_of_one_payment_cannot_both_go_out() {
+        let (w, address) = funded("concurrent");
+        let (a, b) = (format!("{}:0", "d".repeat(64)), format!("{}:2", "e".repeat(64)));
+        let t = ml_record(&w, &address, &"74".repeat(32), "rejected", &[a.clone(), b.clone()]);
+        *guard(&w.net.state) = m4_state(H4T + 12, true);
+        // B is held by another transaction: the first rebuild R1 spends A. Its confirmation is put aside.
+        guard(&w.net.utxos).insert(address.clone(), vec![utxo('d', 0, 150_000, H4T + 7), held_by('e', 2, 60_000, 'f')]);
+        let r1 = block(rebuild_plan(&w.state, &t.txid)).unwrap();
+        let r1_pending = guard(&w.state.pending).take().unwrap();
+        assert_eq!(r1_pending.plan.coins.iter().map(Coin::outpoint).collect::<Vec<_>>(), vec![a.clone()]);
+        // Now A is held and B is free: the second rebuild R2 spends B.
+        guard(&w.net.utxos).insert(address.clone(), vec![held_by('d', 0, 150_000, '9'), utxo('e', 2, 60_000, H4T + 7)]);
+        let r2 = block(rebuild_plan(&w.state, &t.txid)).unwrap();
+        assert_eq!(guard(&w.state.pending).as_ref().unwrap().plan.coins.iter().map(Coin::outpoint).collect::<Vec<_>>(), vec![b.clone()]);
+        // R2's confirmation has read the lineage (T alone) and waits on the network; meanwhile R1's
+        // confirmation goes all the way: R1 joins the lineage and is sent, and comes back unclear.
+        let net = w.net.clone();
+        let address_in = address.clone();
+        let r1_id = r1.id.clone();
+        let mut r1_pending = Some(r1_pending);
+        *guard(&w.state.before_commit) = Some(Box::new(move |state: &AppState| {
+            let Some(pending) = r1_pending.take() else { return };
+            let r2_pending = guard(&state.pending).replace(pending);
+            guard(&net.utxos).insert(address_in.clone(), vec![utxo('d', 0, 150_000, H4T + 7), utxo('e', 2, 60_000, H4T + 7)]);
+            let r1_id = r1_id.clone();
+            let sent = std::thread::scope(|scope| scope.spawn(|| block(send_plan(state, &r1_id, Some("en"), |_| std::future::ready(true)))).join().unwrap());
+            let sent = sent.unwrap();
+            assert!(matches!(sent.result, BroadcastResult::Sent { .. }));
+            edit_sent(state, |all| {
+                if let Some(s) = all.iter_mut().find(|s| s.txid == sent.txid) {
+                    s.status = "unknown".into();
+                }
+            }).unwrap();
+            guard(&net.utxos).insert(address_in.clone(), vec![held_by('d', 0, 150_000, '6'), utxo('e', 2, 60_000, H4T + 7)]);
+            *guard(&state.pending) = r2_pending;
+        }));
+        let result = block(send_plan(&w.state, &r2.id, Some("en"), |_| std::future::ready(true)));
+        *guard(&w.state.before_commit) = None;
+        // R2 shares no input with R1, which could still confirm: it must not go out.
+        assert_eq!(result.err().map(|f| f.code), Some("rebuild_lineage_changed".to_string()), "R2 must not go out beside R1");
+        let broadcasts = guard(&w.net.broadcasts).clone();
+        assert_eq!(broadcasts.len(), 2, "only R1, sent to both APIs");
+        let lineage = w.state.book().unwrap().lineage_of(&t.txid).unwrap().clone();
+        assert_eq!(lineage.versions.len(), 2, "T and R1 only");
     }
 
     #[test]

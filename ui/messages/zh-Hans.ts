@@ -400,6 +400,7 @@ export const zhHans: Messages = {
     rebuild_inputs_spent: '原来那笔付款的币已经不在了，所以不改用别的币重新付款',
     rebuild_no_common_input: '这笔付款不会花原来那笔的任何一个币，两笔可能都成功，已停止',
     history_unavailable: '网站暂时无法告知哪些 pq2 地址用过，所以检查没有完成。请稍后再试；在此之前不会显示新的 pq2 地址。',
+    rebuild_lineage_changed: '在此期间这笔付款已生成了另一个版本，所以这一笔没有发出；请重新核对',
     internal: '内部错误',
   },
 };
