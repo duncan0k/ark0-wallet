@@ -27,7 +27,7 @@ use crate::p2mr::{Kind, Template, MLDSA44_CONTEXT, SLHDSA128S_CONTEXT};
 use crate::{mldsa, slhdsa};
 use hmac::{Hmac, KeyInit, Mac};
 use secp256k1::{schnorr, Keypair, XOnlyPublicKey};
-use sha2::{Digest, Sha256, Sha512};
+use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
 /// The signet challenge of Ark-0: a 1-of-1 multisig of its block signing key.
@@ -583,6 +583,7 @@ fn checked(key: &mldsa::KeyPair, message: &[u8; 32], signature: [u8; mldsa::SIGN
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::Sha512;
     use crate::p2mr::tests::{h, vectors};
 
     fn bip39(entropy: [u8; 32]) -> Secret {
