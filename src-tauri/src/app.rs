@@ -113,6 +113,15 @@ struct Bound {
     generation: u64,
 }
 
+/// What a refresh works for, taken in one section of the session: the three fixed templates, the pq2
+/// wallet (None without pq2) and the session generation. A refresh checks it again after every wait on the
+/// network and before it returns (`AppState::current`).
+struct Snapshot {
+    templates: (Template, Template, Template),
+    bound: Option<Bound>,
+    generation: u64,
+}
+
 /// The unlocked wallet.
 struct Session {
     legacy: bool,
@@ -513,12 +522,6 @@ impl AppState {
         s.ok_or_else(|| Failure::new("locked"))?.pq2_template(chain, index)
     }
 
-    /// The open pq2 wallet and the session generation: what asynchronous pq2 work binds itself to.
-    fn bind(&self) -> Option<Bound> {
-        let wallet = guard(&self.session).as_ref()?.pq2_wallet.clone()?;
-        Some(Bound { wallet, generation: self.generation() })
-    }
-
     /// After an answer from the network: Err("locked") unless the bound wallet is still open in the same
     /// session.
     fn answered(&self, bound: &Bound) -> Res<()> {
@@ -535,6 +538,38 @@ impl AppState {
 
     fn book(&self) -> Res<Book> {
         self.edit_book(|b| b.clone())
+    }
+
+    /// The open wallet's templates, pq2 identity and session generation, all read under one hold of the
+    /// session (a lock changes the generation under the same hold).
+    fn snapshot(&self) -> Res<Snapshot> {
+        let session = guard(&self.session);
+        let s = session.as_ref().ok_or_else(|| Failure::new("locked"))?;
+        let generation = self.generation();
+        Ok(Snapshot {
+            templates: (s.schnorr.clone(), s.mldsa44.clone(), s.mixed.clone()),
+            bound: s.pq2_wallet.clone().map(|wallet| Bound { wallet, generation }),
+            generation,
+        })
+    }
+
+    /// Err("locked") unless the wallet of the snapshot is still open in the same session: after each wait
+    /// on the network, and before a refresh returns or keeps anything.
+    fn current(&self, snapshot: &Snapshot) -> Res<()> {
+        #[cfg(test)]
+        {
+            let hook = guard(&self.after_network_answer).take();
+            if let Some(mut hook) = hook {
+                hook(self);
+                *guard(&self.after_network_answer) = Some(hook);
+            }
+        }
+        let session = guard(&self.session);
+        let same = session.as_ref().is_some_and(|s| s.pq2_wallet == snapshot.bound.as_ref().map(|b| b.wallet.clone()));
+        if !same || self.generation() != snapshot.generation {
+            return Err(Failure::new("locked"));
+        }
+        Ok(())
     }
 
     /// The pq2 template at this chain and index.
@@ -1186,12 +1221,13 @@ pub async fn overview(state: State<'_, AppState>) -> Res<Overview> {
 }
 
 async fn overview_of(state: &AppState) -> Res<Overview> {
-    let (schnorr, mldsa44, mixed) = state.templates()?;
-    let bound = state.bind();
-    let generation = state.generation();
+    let snapshot = state.snapshot()?;
+    let (schnorr, mldsa44, mixed) = snapshot.templates.clone();
     let sources = state.sources.clone();
     let mut flags = Flags::default();
-    let chain = match current_chain(&sources, &mut flags).await {
+    let chain = current_chain(&sources, &mut flags).await;
+    state.current(&snapshot)?;
+    let chain = match chain {
         Ok(c) => c,
         Err(f) => return Ok(Overview { chain: None, problem: Some(f.code), accounts: vec![], pq2: None, fetched: now() }),
     };
@@ -1199,6 +1235,7 @@ async fn overview_of(state: &AppState) -> Res<Overview> {
     for t in [schnorr, mldsa44, mixed] {
         // Coins are looked up for every address, shown or not: the seed alone makes it, and coins may be there.
         let found = flags.take(sources.coins(&t.address).await);
+        state.current(&snapshot)?;
         let sum = |c: &[Coin]| c.iter().map(|c| c.sats).sum::<u64>();
         let (spendable, pending, incoming, n, complete) = match &found {
             Ok(c) => (sum(&c.spendable), sum(&c.pending), c.incoming.iter().map(|i| i.sats).sum(), c.spendable.len(), c.incoming_complete && !c.truncated),
@@ -1218,11 +1255,9 @@ async fn overview_of(state: &AppState) -> Res<Overview> {
             complete,
         });
     }
-    let pq2 = pq2_overview(state, bound.as_ref(), &chain, &sources, &mut flags).await?;
+    let pq2 = pq2_overview(state, snapshot.bound.as_ref(), &chain, &sources, &mut flags).await?;
     // Nothing of a wallet that was locked or replaced meanwhile is shown.
-    if state.generation() != generation {
-        return Err(Failure::new("locked"));
-    }
+    state.current(&snapshot)?;
     Ok(Overview { chain: Some(chain), problem: None, accounts, pq2, fetched: now() })
 }
 
@@ -1242,18 +1277,25 @@ pub async fn pq2_new_address(state: State<'_, AppState>) -> Res<NewAddress> {
 
 async fn new_pq2_address(state: &AppState) -> Res<NewAddress> {
     state.touch();
-    let legacy = guard(&state.session).as_ref().ok_or_else(|| Failure::new("locked"))?.pq2_wallet.is_none();
-    let chain = current_chain(&state.sources, &mut Flags::default()).await?;
+    let snapshot = state.snapshot()?;
+    let legacy = snapshot.bound.is_none();
+    let chain = current_chain(&state.sources, &mut Flags::default()).await;
+    state.current(&snapshot)?;
+    let chain = chain?;
     if chain.lattice_height.is_none() {
         return Err(Failure::new("address_not_ready"));
     }
-    let book = if legacy { None } else { Some(state.book()?) };
+    let book = match &snapshot.bound {
+        None => None,
+        Some(b) => Some(state.edit_book_of(&b.wallet, b.generation, |x| x.clone())?),
+    };
     if let Some(reason) = pq2_blocked(legacy, &chain, book.as_ref(), RECEIVE_CHAIN) {
         return Err(Failure::new(&format!("pq2_{reason}")));
     }
     let index = book.as_ref().and_then(|b| b.chains[RECEIVE_CHAIN as usize].next()).ok_or_else(|| Failure::new("pq2_gap_limit"))?;
-    let template = state.pq2_template(RECEIVE_CHAIN, index)?;
-    let issued = state.edit_book(|b| !b.scan_needed && b.chains[RECEIVE_CHAIN as usize].issue(index, &template.address))?;
+    let bound = snapshot.bound.as_ref().ok_or_else(|| Failure::new("pq2_unavailable"))?;
+    let template = state.pq2_template_of(&bound.wallet, bound.generation, RECEIVE_CHAIN, index)?;
+    let issued = state.edit_book_of(&bound.wallet, bound.generation, |b| !b.scan_needed && b.chains[RECEIVE_CHAIN as usize].issue(index, &template.address))?;
     if !issued {
         return Err(Failure::new("pq2_gap_limit"));
     }
@@ -1527,6 +1569,7 @@ fn own_pq2(state: &AppState) -> HashSet<String> {
 
 async fn plan_payment(state: &AppState, from: Kind, to: String, amount: String) -> Res<SendPlan> {
     state.touch();
+    let snapshot = state.snapshot()?;
     let template = guard(&state.session).as_ref().ok_or_else(|| Failure::new("locked"))?.template(from)?;
     let own = state.own_templates()?;
     let destination = parse_destination(&to)?;
@@ -1582,6 +1625,8 @@ async fn plan_payment(state: &AppState, from: Kind, to: String, amount: String) 
         pq2: None,
     };
     let caution = went_out || earlier.elsewhere || earlier.unrecorded;
+    // The plan is kept only for the wallet and session it was made in.
+    state.current(&snapshot)?;
     *guard(&state.pending) = Some(PendingSend {
         id: view.id.clone(), created: Instant::now(), kind: from, path: account.path, destination, plan, caution, sources: flags,
         creates_pq2, pq2: None, plan_address: view_from_address, rebuild: None,
@@ -1595,7 +1640,8 @@ async fn plan_payment(state: &AppState, from: Kind, to: String, amount: String) 
 /// the ML-DSA-44 leaf this one replaces.
 async fn plan_pq2_payment(state: &AppState, address: String, to: String, amount: String, wanted: Option<Path>, rebuild: Option<Rebuild>) -> Res<SendPlan> {
     state.touch();
-    let plan_bound = state.bind();
+    let snapshot = state.snapshot()?;
+    let plan_bound = snapshot.bound.clone();
     let book = state.book()?;
     let (chain_index, index) = book.find(&address).ok_or_else(|| Failure::new("address_not_ready"))?;
     let destination = parse_destination(&to)?;
@@ -1738,6 +1784,8 @@ async fn plan_pq2_payment(state: &AppState, address: String, to: String, amount:
         }),
     };
     let caution = went_out || earlier.elsewhere || earlier.unrecorded;
+    // The plan is kept only for the wallet and session it was made in.
+    state.current(&snapshot)?;
     *guard(&state.pending) = Some(PendingSend {
         id: view.id.clone(), created: Instant::now(), kind: Kind::Pq2, path: account.path, destination, plan, caution, sources: flags,
         creates_pq2,
@@ -2510,22 +2558,23 @@ pub async fn activity(state: State<'_, AppState>) -> Res<Vec<ActivityItem>> {
 }
 
 async fn activity_of(state: &AppState) -> Res<Vec<ActivityItem>> {
-    if !state.unlocked() {
-        return Err(Failure::new("locked"));
-    }
+    let snapshot = state.snapshot()?;
     let at = now();
     let sent = refresh_sent(state, |s| !s.proven() && (!settled(s) || recent(s, at)), &mut Flags::default()).await;
+    state.current(&snapshot)?;
     // Only when there is a pq2 payment through the ML-DSA-44 leaf that did not go through is the node's
     // state read for it.
     let candidate = |s: &Sent| s.from == "pq2" && s.signature == "mldsa44" && matches!(s.status.as_str(), "unknown" | "rejected" | "failed");
     let chain = if sent.iter().any(candidate) { current_chain(&state.sources, &mut Flags::default()).await.ok() } else { None };
+    state.current(&snapshot)?;
     // Not offered once any version of the payment's lineage is confirmed or on its way.
-    let book = state.book().ok();
+    let book = snapshot.bound.as_ref().and_then(|b| state.edit_book_of(&b.wallet, b.generation, |x| x.clone()).ok());
     let went_out = |s: &Sent| {
         let versions = book.as_ref().and_then(|b| b.lineage_of(&s.txid)).map(|l| l.versions.clone()).unwrap_or_default();
         versions.iter().any(|v| sent.iter().any(|r| r.txid == v.txid && original_went_out(r) && r.status != "replaced"))
     };
     let flags: Vec<bool> = sent.iter().map(|s| chain.as_ref().is_some_and(|c| needs_rebuild(s, c)) && !went_out(s)).collect();
+    state.current(&snapshot)?;
     Ok(sent.into_iter().zip(flags).map(|(s, rebuild)| ActivityItem { rebuild, sent: s }).collect())
 }
 
@@ -5835,6 +5884,31 @@ mod pq2_tests {
         assert_eq!(book.chains[0].issued, 40, "a full gap past 19");
         assert!(book.scan_needed);
         assert_eq!(block(new_pq2_address(&w.state)).unwrap_err().code, "pq2_scan_needed");
+    }
+
+    #[test]
+    fn a_refresh_of_activity_or_a_new_address_never_mixes_two_wallets() {
+        // Activity: A's records are looked up; meanwhile A is removed and B restored.
+        let (w, address) = funded("activity-switch");
+        ml_record(&w, &address, &"76".repeat(32), "rejected", &[format!("{}:0", "d".repeat(64))]);
+        *guard(&w.net.state) = m4_state(H4T + 12, true);
+        *guard(&w.state.after_network_answer) = Some(Box::new(|state: &AppState| {
+            state.lock();
+            state.open_session(&words(0x6a), state.generation(), false).unwrap();
+        }));
+        assert_eq!(block(activity_of(&w.state)).err().map(|f| f.code), Some("locked".to_string()));
+        // A new address: A's request waits on the chain state; meanwhile A is replaced by a wallet made here.
+        let (w, _) = funded("address-switch");
+        let a_book = w.state.book().unwrap();
+        *guard(&w.state.after_network_answer) = Some(Box::new(|state: &AppState| {
+            state.lock();
+            state.open_session(&words(0x6b), state.generation(), true).unwrap();
+        }));
+        assert_eq!(block(new_pq2_address(&w.state)).err().map(|f| f.code), Some("locked".to_string()));
+        *guard(&w.state.after_network_answer) = None;
+        let b_book = w.state.book().unwrap();
+        assert_ne!(b_book.wallet, a_book.wallet);
+        assert!(b_book.chains[0].handed_out.is_empty(), "nothing handed out in B for A's request");
     }
 
     #[test]
