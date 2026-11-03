@@ -1283,8 +1283,11 @@ pub async fn pq2_new_address(state: State<'_, AppState>) -> Res<NewAddress> {
 
 async fn new_pq2_address(state: &AppState) -> Res<NewAddress> {
     state.touch();
-    let _book_op = state.book_ops.lock().await;
+    // The wallet this command is for is the one open when it was called: still that one once the book is
+    // free, or `locked`.
     let snapshot = state.snapshot()?;
+    let _book_op = state.book_ops.lock().await;
+    state.still_current(&snapshot)?;
     let legacy = snapshot.bound.is_none();
     let chain = current_chain(&state.sources, &mut Flags::default()).await;
     state.current(&snapshot)?;
@@ -1329,11 +1332,12 @@ pub async fn pq2_scan(state: State<'_, AppState>, wider: bool) -> Res<ScanResult
 
 async fn scan_pq2(state: &AppState, wider: bool) -> Res<ScanResult> {
     state.touch();
+    // Every result of this scan is bound to the wallet and the session it was called in: once the book is
+    // free, after each answer from the network, and before each write to the book, both are checked again.
+    let snapshot = state.snapshot()?;
+    let Bound { wallet, generation } = snapshot.bound.clone().ok_or_else(|| Failure::new("pq2_unavailable"))?;
     let _book_op = state.book_ops.lock().await;
-    // Every result of this scan is bound to the wallet and the session it began in: after each answer from
-    // the network, and before each write to the book, both are checked again.
-    let generation = state.generation();
-    let wallet = guard(&state.session).as_ref().ok_or_else(|| Failure::new("locked"))?.pq2_wallet.clone().ok_or_else(|| Failure::new("pq2_unavailable"))?;
+    state.still_current(&snapshot)?;
     // A scan needs to be finished before addresses are handed out again: set before the first use it finds
     // is saved, cleared only after both chains and their reserved addresses are.
     let book = state.edit_book_of(&wallet, generation, |b| {
@@ -5932,6 +5936,34 @@ mod pq2_tests {
         let book = w.state.book().unwrap();
         assert!(book.chains[0].used.contains(&0) && !book.scan_needed && book.chains[0].issued == 1);
         assert_eq!(block(new_pq2_address(&w.state)).unwrap().index, 1);
+    }
+
+    #[test]
+    fn a_command_waiting_for_the_book_stays_with_the_wallet_it_was_called_for() {
+        for scan in [false, true] {
+            let w = wallet("wait-book", words(0x6b), true, m4_state(H4T + 10, false));
+            // Another operation holds the book (A's history check, say) while the command is called for A.
+            let held = w.state.book_ops.try_lock().unwrap();
+            std::thread::scope(|s| {
+                let state = &w.state;
+                let command = s.spawn(move || {
+                    if scan { block(scan_pq2(state, false)).map(|_| ()) } else { block(new_pq2_address(state)).map(|_| ()) }
+                });
+                std::thread::sleep(Duration::from_millis(1_000));
+                assert!(!command.is_finished());
+                // A is removed and B is opened; then the book is free.
+                state.lock();
+                state.open_session(&words(0x6c), state.generation(), !scan).unwrap();
+                drop(held);
+                assert_eq!(command.join().unwrap().unwrap_err().code, "locked", "scan: {scan}");
+            });
+            // Nothing written into B's book.
+            let book = w.state.book().unwrap();
+            assert_eq!(book.wallet, pq2_address(&w, 0, 0));
+            assert_eq!(book.scan_needed, scan, "scan: {scan}");
+            assert!(book.chains.iter().all(|c| c.issued == 0 && c.scanned == 0 && c.addresses.is_empty()), "scan: {scan}");
+            assert_eq!(book.scan_revision, 0, "scan: {scan}");
+        }
     }
 
     #[test]
