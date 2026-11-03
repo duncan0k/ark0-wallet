@@ -24,8 +24,10 @@ use std::collections::{BTreeMap, BTreeSet};
 pub const GAP_LIMIT: u32 = 20;
 /// How many more indices a wider scan looks at on each chain, at least.
 pub const WIDER_SCAN: u32 = 100;
-/// 2: addresses of reserved indices and `history_tip` (the history check). Books of version 1 are migrated
-/// when the wallet is opened (`migrate_from_1`).
+/// 2: addresses of reserved indices and how far each one's history has been checked (`checked`). Books of
+/// version 1 are migrated when the wallet is opened (`migrate_from_1`). A book of version 2 written with a
+/// single watermark for all reserved addresses is read without it: each address is checked from block 0
+/// once.
 const FILE_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,6 +43,10 @@ pub struct ChainBook {
     /// The address of every index handed out, used, or reserved by a scan, so that the wallet knows its own
     /// addresses without deriving keys.
     pub addresses: BTreeMap<u32, String>,
+    /// For each reserved index, the height up to which its address's history has been checked (by a
+    /// history check, or by the scan that reserved it). An index without one is checked from block 0.
+    #[serde(default)]
+    pub checked: BTreeMap<u32, u32>,
 }
 
 impl ChainBook {
@@ -67,6 +73,7 @@ impl ChainBook {
         self.issued = index + 1;
         self.handed_out.insert(index);
         self.addresses.insert(index, address.to_string());
+        self.checked.remove(&index);
         true
     }
 
@@ -74,6 +81,7 @@ impl ChainBook {
     pub fn mark_used(&mut self, index: u32, address: &str) -> bool {
         self.issued = self.issued.max(index.saturating_add(1));
         self.addresses.insert(index, address.to_string());
+        self.checked.remove(&index);
         self.used.insert(index)
     }
 
@@ -119,10 +127,6 @@ pub struct Book {
     /// A wallet restored here, or one made before this version, may have pq2 addresses another copy handed
     /// out: none is handed out here until a recovery scan has run.
     pub scan_needed: bool,
-    /// The site's tip at the last history check of the reserved addresses (or at the scan): the next check
-    /// asks only about blocks from there on.
-    #[serde(default)]
-    pub history_tip: Option<u32>,
     /// Changes whenever a scan is required (`require_scan`).
     #[serde(default)]
     pub scan_revision: u64,
@@ -168,7 +172,7 @@ impl Book {
     /// The book of a wallet whose receiving address at index 0 is `wallet`. `made_here`: the words were
     /// made on this device just now, so no other copy has handed out anything.
     pub fn new(wallet: &str, made_here: bool) -> Book {
-        Book { version: FILE_VERSION, wallet: wallet.to_string(), chains: Default::default(), scan_needed: !made_here, history_tip: None, scan_revision: 0, lineages: Vec::new() }
+        Book { version: FILE_VERSION, wallet: wallet.to_string(), chains: Default::default(), scan_needed: !made_here, scan_revision: 0, lineages: Vec::new() }
     }
 
     /// Requires a scan before any address is handed out. The revision changes each time, so that a scan
@@ -212,7 +216,7 @@ impl Book {
     }
 
     /// A book of version 1, written before the history check: it kept no addresses for reserved indices
-    /// and no history tip. True for such a book of this wallet whose records are whole.
+    /// and no history watermark. True for such a book of this wallet whose records are whole.
     pub fn needs_migration(&self, wallet: &str) -> bool {
         self.version == 1 && self.wallet == wallet && self.shape_ok()
     }

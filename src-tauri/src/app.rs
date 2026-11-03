@@ -16,7 +16,7 @@ use crate::store::{self, Sent, Settings};
 use crate::vault::{self, VaultError};
 use crate::wallet::{self, Account, Amount, Plan, PlanError, SignError, FEE_RATE};
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::{poll_fn, Future};
 use std::path::PathBuf;
 #[cfg(test)]
@@ -279,6 +279,11 @@ pub struct AppState {
     /// Held while a payment is committed: the final check of a rebuild's lineage, its joining the lineage,
     /// the change address handed out and the record made as submitting, all in one section.
     commit_ops: Mutex<()>,
+    /// One operation on the pq2 address book at a time, held across its waits on the network: a recovery
+    /// scan, a history check of the reserved addresses, handing out a receiving address, handing out a
+    /// change address when a payment is committed. A history check that finds another operation running
+    /// (a scan among them) is skipped; the next refresh makes it.
+    book_ops: tokio::sync::Mutex<()>,
     /// Tests: this many next saves of the pq2 book fail.
     #[cfg(test)]
     fail_book_writes: AtomicUsize,
@@ -318,6 +323,7 @@ impl AppState {
             sent_ops: Mutex::new(()),
             pq2_ops: Mutex::new(()),
             commit_ops: Mutex::new(()),
+            book_ops: tokio::sync::Mutex::const_new(()),
             #[cfg(test)]
             fail_book_writes: AtomicUsize::new(0),
             #[cfg(test)]
@@ -1269,6 +1275,7 @@ pub async fn pq2_new_address(state: State<'_, AppState>) -> Res<NewAddress> {
 
 async fn new_pq2_address(state: &AppState) -> Res<NewAddress> {
     state.touch();
+    let _book_op = state.book_ops.lock().await;
     let snapshot = state.snapshot()?;
     let legacy = snapshot.bound.is_none();
     let chain = current_chain(&state.sources, &mut Flags::default()).await;
@@ -1314,6 +1321,7 @@ pub async fn pq2_scan(state: State<'_, AppState>, wider: bool) -> Res<ScanResult
 
 async fn scan_pq2(state: &AppState, wider: bool) -> Res<ScanResult> {
     state.touch();
+    let _book_op = state.book_ops.lock().await;
     // Every result of this scan is bound to the wallet and the session it began in: after each answer from
     // the network, and before each write to the book, both are checked again.
     let generation = state.generation();
@@ -1329,13 +1337,13 @@ async fn scan_pq2(state: &AppState, wider: bool) -> Res<ScanResult> {
     let answered = |state: &AppState| state.answered(&bound);
     let mut found = 0;
     let mut flags = Flags::default();
-    let mut tip = u32::MAX;
     let batch = crate::api::MAX_HISTORY_ADDRESSES as u32;
     for c in [RECEIVE_CHAIN, CHANGE_CHAIN] {
         let minimum = if wider { book.chains[c as usize].scanned.saturating_add(WIDER_SCAN) } else { GAP_LIMIT };
         let mut at = 0;
-        // The addresses of indices that are not used: those that end up reserved are kept in the book.
-        let mut unused: HashMap<u32, String> = HashMap::new();
+        // The addresses of indices that are not used, with the tip their history was checked to: those that
+        // end up reserved are kept in the book.
+        let mut unused: HashMap<u32, (String, u32)> = HashMap::new();
         loop {
             let done = state.edit_book_of(&wallet, generation, |b| b.chains[c as usize].scan_done(0, at, minimum))?;
             if done || at >= crate::keys::MAX_PQ2_INDEX - batch {
@@ -1349,7 +1357,6 @@ async fn scan_pq2(state: &AppState, wider: bool) -> Res<ScanResult> {
             let history = flags.take(state.sources.history(&addresses, 0).await);
             answered(state)?;
             let history = history.map_err(|_| Failure::new("history_unavailable"))?;
-            tip = tip.min(history.tip_height);
             for (i, template) in templates.iter().enumerate() {
                 let index = at + i as u32;
                 let coins = flags.take(state.sources.coins(&template.address).await);
@@ -1360,7 +1367,7 @@ async fn scan_pq2(state: &AppState, wider: bool) -> Res<ScanResult> {
                         found += 1;
                     }
                 } else {
-                    unused.insert(index, template.address.clone());
+                    unused.insert(index, (template.address.clone(), history.tip_height));
                 }
             }
             at += batch;
@@ -1369,9 +1376,11 @@ async fn scan_pq2(state: &AppState, wider: bool) -> Res<ScanResult> {
             let chain = &mut b.chains[c as usize];
             chain.scanned_to(at);
             let issued = chain.issued;
-            for (i, a) in unused {
+            for (i, (a, tip)) in unused {
                 if i < issued {
                     chain.addresses.entry(i).or_insert(a);
+                    // This scan asked about the address's whole history, up to that tip.
+                    chain.checked.insert(i, tip);
                 }
             }
         })?;
@@ -1380,9 +1389,6 @@ async fn scan_pq2(state: &AppState, wider: bool) -> Res<ScanResult> {
         // Only when nothing required a scan again while this one ran.
         if b.scan_revision == revision {
             b.scan_needed = false;
-        }
-        if tip != u32::MAX {
-            b.history_tip = Some(b.history_tip.map_or(tip, |t| t.min(tip)));
         }
         b.clone()
     })?;
@@ -1410,47 +1416,61 @@ async fn history_since(sources: &Sources, addresses: &[String], from: u32, flags
     (second.tip_height >= again).then_some(second)
 }
 
-/// Asks the site whether any reserved address received something in the blocks since the last check
-/// (`history_tip`, less six blocks for a reorganization); one that did becomes used, and its coins are
-/// looked up like the others'. False when the site could not answer: the tip of the last check stays where
-/// it was.
+/// Asks the site whether any reserved address received something in the blocks since its own last check
+/// (the height in `checked`, less six blocks for a reorganization; from block 0 when it has none); one that
+/// did becomes used, and its coins are looked up like the others'. Only the addresses asked about move
+/// their watermark, each to the tip of the answer that covered it. Skipped (false) while another operation
+/// on the address book runs, a scan among them. False also when the site could not answer: the addresses
+/// it answered for are saved, the others stay where they were.
 async fn check_reserved(state: &AppState, bound: &Bound, sources: &Sources, flags: &mut Flags) -> Res<bool> {
+    let Ok(_book_op) = state.book_ops.try_lock() else { return Ok(false) };
     let Ok(book) = state.edit_book_of(&bound.wallet, bound.generation, |b| b.clone()) else { return Ok(true) };
-    let reserved: Vec<(u32, u32, String)> = book
-        .chains
-        .iter()
-        .enumerate()
-        .flat_map(|(c, chain)| chain.reserved().into_iter().filter_map(move |i| chain.addresses.get(&i).map(|a| (c as u32, i, a.clone()))))
-        .collect();
-    if reserved.is_empty() {
-        return Ok(true);
+    // The reserved addresses, grouped by the block their check starts from.
+    let mut by_start: BTreeMap<u32, Vec<(u32, u32, String)>> = BTreeMap::new();
+    for (c, chain) in book.chains.iter().enumerate() {
+        for i in chain.reserved() {
+            let Some(a) = chain.addresses.get(&i) else { continue };
+            let from = chain.checked.get(&i).map_or(0, |h| h.saturating_sub(HISTORY_OVERLAP));
+            by_start.entry(from).or_default().push((c as u32, i, a.clone()));
+        }
     }
-    let from = book.history_tip.unwrap_or(0).saturating_sub(HISTORY_OVERLAP);
-    let mut tip = u32::MAX;
+    let mut answered_all = true;
+    let mut checked: Vec<(u32, u32, u32)> = Vec::new();
     let mut found = Vec::new();
-    for part in reserved.chunks(crate::api::MAX_HISTORY_ADDRESSES) {
-        let addresses: Vec<String> = part.iter().map(|(_, _, a)| a.clone()).collect();
-        let history = history_since(sources, &addresses, from, flags).await;
-        state.answered(bound)?;
-        let Some(history) = history else { return Ok(false) };
-        tip = tip.min(history.tip_height);
-        for ((c, i, a), used) in part.iter().zip(history.used) {
-            // Only an address the wallet's own keys give at that index.
-            if used && state.pq2_template_of(&bound.wallet, bound.generation, *c, *i).is_ok_and(|t| &t.address == a) {
-                found.push((*c, *i, a.clone()));
+    'ask: for (from, list) in &by_start {
+        for part in list.chunks(crate::api::MAX_HISTORY_ADDRESSES) {
+            let addresses: Vec<String> = part.iter().map(|(_, _, a)| a.clone()).collect();
+            let history = history_since(sources, &addresses, *from, flags).await;
+            state.answered(bound)?;
+            let Some(history) = history else {
+                answered_all = false;
+                break 'ask;
+            };
+            for ((c, i, a), used) in part.iter().zip(history.used) {
+                checked.push((*c, *i, history.tip_height));
+                // Only an address the wallet's own keys give at that index.
+                if used && state.pq2_template_of(&bound.wallet, bound.generation, *c, *i).is_ok_and(|t| &t.address == a) {
+                    found.push((*c, *i, a.clone()));
+                }
             }
         }
     }
-    // Every address found used and the new watermark go into the book in one save: when that fails, none
-    // of it is kept, and the next check asks about the same blocks again.
-    Ok(state
+    if checked.is_empty() {
+        return Ok(answered_all);
+    }
+    // The uses found and the watermarks of the addresses asked about go into the book in one save: when
+    // that fails, none of it is kept, and the next check asks about the same blocks again.
+    let saved = state
         .edit_book_of(&bound.wallet, bound.generation, |b| {
+            for (c, i, tip) in &checked {
+                b.chains[*c as usize].checked.insert(*i, *tip);
+            }
             for (c, i, a) in &found {
                 b.record_use(*c, *i, a);
             }
-            b.history_tip = Some(tip);
         })
-        .is_ok())
+        .is_ok();
+    Ok(answered_all && saved)
 }
 
 /// What the review shows of a payment from a pq2 address.
@@ -1960,6 +1980,11 @@ async fn send_plan<F: Future<Output = bool>>(
             hook(state);
         }
     }
+    // Handing out the change address is an operation on the address book: it waits for one in progress.
+    let _book_op = match pending.pq2 {
+        Some(Pq2Pending { change: Some(_), .. }) => Some(state.book_ops.lock().await),
+        _ => None,
+    };
     {
         // One section, with no wait on the network, in this order and with no rollback: the checks (the
         // wallet and session the confirmation began in; for a rebuild, its anchor among the coins it
@@ -5629,12 +5654,20 @@ mod pq2_tests {
         }
     }
 
+    /// The heights the reserved addresses' histories were checked to, each once.
+    fn watermarks(book: &Book) -> Vec<u32> {
+        let mut v: Vec<u32> = book.chains.iter().flat_map(|c| c.checked.values().copied()).collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
     #[test]
     fn a_late_payment_to_a_reserved_address_is_seen() {
         let w = wallet("reserved", words(0x57), false, m4_state(H4T + 100, false));
         let r = block(scan_pq2(&w.state, false)).unwrap();
         assert_eq!((r.found, r.issued), (0, [20, 20]));
-        assert_eq!(w.state.book().unwrap().history_tip, Some(H4T + 100));
+        assert_eq!(watermarks(&w.state.book().unwrap()), vec![H4T + 100]);
         // Index 0 was reserved, never handed out here; another copy of the wallet hands it out and it is
         // paid in a later block.
         *guard(&w.net.state) = m4_state(H4T + 110, false);
@@ -5648,7 +5681,7 @@ mod pq2_tests {
         assert!(p.addresses.iter().any(|a| a.index == 0 && a.spendable == 12_000));
         let book = w.state.book().unwrap();
         assert!(book.chains[0].used.contains(&0));
-        assert_eq!(book.history_tip, Some(H4T + 110));
+        assert_eq!(watermarks(&book), vec![H4T + 110]);
         // The next refresh asks from the new tip only.
         guard(&w.net.history_from).clear();
         block(overview_of(&w.state)).unwrap();
@@ -5659,7 +5692,7 @@ mod pq2_tests {
     fn a_payment_in_blocks_a_reorganization_replaced_is_seen() {
         let w = wallet("reorg", words(0x59), false, m4_state(H4T + 100, false));
         block(scan_pq2(&w.state, false)).unwrap();
-        assert_eq!(w.state.book().unwrap().history_tip, Some(H4T + 100));
+        assert_eq!(watermarks(&w.state.book().unwrap()), vec![H4T + 100]);
         // The last six blocks are replaced by a chain of the same height whose block H4T + 97 pays reserved
         // index 4: asking from the last tip would miss it.
         let address = pq2_address(&w, 0, 4);
@@ -5688,7 +5721,7 @@ mod pq2_tests {
         let asked = guard(&w.net.history_from).clone();
         assert_eq!(asked, [H4T + 94, H4T + 94, H4T + 84, H4T + 84].repeat(2));
         assert!(p.complete && p.addresses.iter().any(|a| a.index == 7 && a.spendable == 3_000));
-        assert_eq!(w.state.book().unwrap().history_tip, Some(H4T + 90));
+        assert_eq!(watermarks(&w.state.book().unwrap()), vec![H4T + 90]);
         // The second answer still below its `from`: the check is not answered, and nothing moves.
         let w = wallet("tip-lower-twice", words(0x5b), false, m4_state(H4T + 100, false));
         block(scan_pq2(&w.state, false)).unwrap();
@@ -5699,7 +5732,7 @@ mod pq2_tests {
         assert!(!p.complete);
         let book = w.state.book().unwrap();
         assert!(!book.chains[0].used.contains(&7));
-        assert_eq!(book.history_tip, Some(H4T + 100));
+        assert_eq!(watermarks(&book), vec![H4T + 100]);
     }
 
     #[test]
@@ -5713,14 +5746,144 @@ mod pq2_tests {
         let p = block(overview_of(&w.state)).unwrap().pq2.unwrap();
         assert!(!p.complete);
         let book = w.state.book().unwrap();
-        assert_eq!(book.history_tip, Some(H4T + 100), "the watermark did not move past the unsaved payment");
+        assert_eq!(watermarks(&book), vec![H4T + 100], "the watermark did not move past the unsaved payment");
         assert!(!book.chains[0].used.contains(&3));
         // The next check still covers H4T + 101 and saves it.
         *guard(&w.net.state) = m4_state(H4T + 120, false);
         block(overview_of(&w.state)).unwrap();
         let book = w.state.book().unwrap();
         assert!(book.chains[0].used.contains(&3));
-        assert_eq!(book.history_tip, Some(H4T + 120));
+        assert_eq!(watermarks(&book), vec![H4T + 120]);
+    }
+
+    #[test]
+    fn every_operation_on_the_address_book_holds_it_across_its_waits_on_the_network() {
+        let w = wallet("one-op", words(0x64), false, m4_state(H4T + 100, false));
+        let held = Arc::new(Mutex::new(Vec::new()));
+        let h = held.clone();
+        *guard(&w.state.after_network_answer) = Some(Box::new(move |state: &AppState| guard(&h).push(state.book_ops.try_lock().is_err())));
+        block(scan_pq2(&w.state, false)).unwrap();
+        assert!(guard(&held).len() > 20 && guard(&held).iter().all(|h| *h), "the scan");
+        guard(&held).clear();
+        block(new_pq2_address(&w.state)).unwrap();
+        assert!(!guard(&held).is_empty() && guard(&held).iter().all(|h| *h), "a new address");
+        // A refresh: every answer to its history check comes while it holds the book (the coin lookups
+        // after it do not need the book).
+        *guard(&w.net.state) = m4_state(H4T + 110, false);
+        guard(&held).clear();
+        guard(&w.net.history_from).clear();
+        block(overview_of(&w.state)).unwrap();
+        // Two requests per question, one to each API.
+        let questions = guard(&w.net.history_from).len() / 2;
+        assert_eq!(questions, 2);
+        assert_eq!(guard(&held).iter().filter(|h| **h).count(), questions);
+    }
+
+    #[test]
+    fn a_refresh_during_another_operation_on_the_book_skips_its_history_check() {
+        for during_scan in [true, false] {
+            let w = wallet("skip", words(0x65), false, m4_state(H4T + 100, false));
+            block(scan_pq2(&w.state, false)).unwrap();
+            *guard(&w.net.state) = m4_state(H4T + 110, false);
+            // Reserved index 6 was paid at H4T + 105.
+            guard(&w.net.history).insert(pq2_address(&w, 0, 6), H4T + 105);
+            let asked = w.net.history_from.clone();
+            let inner: Arc<Mutex<Option<(bool, usize)>>> = Arc::new(Mutex::new(None));
+            let seen = inner.clone();
+            // At the first answer of a scan, or of a refresh's history check, another refresh runs.
+            *guard(&w.state.after_network_answer) = Some(Box::new(move |state: &AppState| {
+                if guard(&seen).is_some() || state.book_ops.try_lock().is_ok() {
+                    return;
+                }
+                let before = guard(&asked).len();
+                let p = std::thread::scope(|s| s.spawn(|| block(overview_of(state))).join().unwrap()).unwrap().pq2.unwrap();
+                *guard(&seen) = Some((p.complete, guard(&asked).len() - before));
+            }));
+            if during_scan {
+                block(scan_pq2(&w.state, false)).unwrap();
+            } else {
+                block(overview_of(&w.state)).unwrap();
+            }
+            *guard(&w.state.after_network_answer) = None;
+            // The inner refresh asked nothing about history and says it is not complete.
+            assert_eq!(*guard(&inner), Some((false, 0)), "during a scan: {during_scan}");
+            let book = w.state.book().unwrap();
+            assert!(book.chains[0].used.contains(&6), "during a scan: {during_scan}");
+            assert_eq!(watermarks(&book), vec![H4T + 110], "during a scan: {during_scan}");
+        }
+    }
+
+    #[test]
+    fn each_reserved_address_keeps_its_own_watermark() {
+        let w = wallet("own-watermark", words(0x66), false, m4_state(H4T + 100, false));
+        block(scan_pq2(&w.state, false)).unwrap();
+        // The change chain's addresses were never checked (as after a scan that reserved them without an
+        // answer about their history); the receiving chain's were, to H4T + 100. Change index 3 was paid
+        // at H4T + 50, receiving index 4 at H4T + 102.
+        w.state.edit_book(|b| b.chains[1].checked.clear()).unwrap();
+        guard(&w.net.history).insert(pq2_address(&w, 1, 3), H4T + 50);
+        guard(&w.net.history).insert(pq2_address(&w, 0, 4), H4T + 102);
+        *guard(&w.net.state) = m4_state(H4T + 110, false);
+        // The site answers the first question only: the change chain's, from block 0.
+        *guard(&w.net.history_ok) = Some(2);
+        guard(&w.net.history_from).clear();
+        let p = block(overview_of(&w.state)).unwrap().pq2.unwrap();
+        assert!(!p.complete);
+        assert_eq!(guard(&w.net.history_from)[..2], [0, 0]);
+        let book = w.state.book().unwrap();
+        // Only the addresses asked about moved, and what they had was found.
+        assert!(book.chains[1].used.contains(&3) && !book.chains[0].used.contains(&4));
+        assert!(book.chains[1].checked.values().all(|h| *h == H4T + 110));
+        assert!(book.chains[0].checked.values().all(|h| *h == H4T + 100));
+        // The next check asks each group from its own watermark, and finds the receiving payment.
+        *guard(&w.net.history_ok) = None;
+        guard(&w.net.history_from).clear();
+        let p = block(overview_of(&w.state)).unwrap().pq2.unwrap();
+        assert!(p.complete);
+        let mut asked = guard(&w.net.history_from).clone();
+        asked.dedup();
+        assert_eq!(asked, vec![H4T + 94, H4T + 104]);
+        let book = w.state.book().unwrap();
+        assert!(book.chains[0].used.contains(&4));
+        assert_eq!(watermarks(&book), vec![H4T + 110]);
+    }
+
+    #[test]
+    fn a_book_with_one_watermark_for_all_is_checked_from_block_0() {
+        let w = wallet("old-watermark", words(0x67), false, m4_state(H4T + 100, false));
+        block(scan_pq2(&w.state, false)).unwrap();
+        // The book as the version with one watermark wrote it: that watermark, and none per address.
+        let mut old = serde_json::to_value(w.state.book().unwrap()).unwrap();
+        for c in old["chains"].as_array_mut().unwrap() {
+            c.as_object_mut().unwrap().remove("checked");
+        }
+        old["history_tip"] = json!(H4T + 100);
+        std::fs::write(w.state.pq2_path(), old.to_string()).unwrap();
+        w.state.lock();
+        w.state.open_session(&words(0x67), w.state.generation(), false).unwrap();
+        // Reserved index 5 was paid at H4T + 50, below that watermark.
+        guard(&w.net.history).insert(pq2_address(&w, 0, 5), H4T + 50);
+        guard(&w.net.history_from).clear();
+        let p = block(overview_of(&w.state)).unwrap().pq2.unwrap();
+        assert!(p.complete);
+        assert!(guard(&w.net.history_from).iter().all(|f| *f == 0));
+        let book = w.state.book().unwrap();
+        assert!(book.chains[0].used.contains(&5));
+        assert_eq!(watermarks(&book), vec![H4T + 100]);
+    }
+
+    #[test]
+    fn an_address_two_copies_showed_is_watched_for_every_payment_to_it() {
+        // This copy showed receiving index 0; another copy of the wallet showed it too. Both payers pay it.
+        let w = wallet("two-copies", words(0x68), true, m4_state(H4T + 10, false));
+        let address = block(new_pq2_address(&w.state)).unwrap().address;
+        guard(&w.net.utxos).insert(address.clone(), vec![utxo('a', 0, 4_000, H4T + 8), utxo('b', 1, 6_000, H4T + 9)]);
+        let p = block(overview_of(&w.state)).unwrap().pq2.unwrap();
+        assert!(p.addresses.iter().any(|a| a.address == address && a.spendable == 10_000 && a.coins.len() == 2));
+        // A use of an index this device showed does not stop it showing addresses.
+        let book = w.state.book().unwrap();
+        assert!(book.chains[0].used.contains(&0) && !book.scan_needed && book.chains[0].issued == 1);
+        assert_eq!(block(new_pq2_address(&w.state)).unwrap().index, 1);
     }
 
     #[test]
@@ -5802,7 +5965,7 @@ mod pq2_tests {
             *guard(&w.state.after_network_answer) = None;
             let book = w.state.book().unwrap();
             assert_eq!(book.wallet, pq2_address(&w, 0, 0));
-            assert!(book.scan_needed && book.history_tip.is_none(), "answer {at_answer}: no watermark of A");
+            assert!(book.scan_needed && watermarks(&book).is_empty(), "answer {at_answer}: no watermark of A");
             assert!(book.chains.iter().all(|c| c.addresses.is_empty() && c.used.is_empty()), "answer {at_answer}: nothing of A");
         }
     }
@@ -6294,6 +6457,37 @@ mod pq2_tests {
         assert_eq!(result.unwrap_err().code, "pq2_scan_needed");
         assert!(guard(&w.net.broadcasts).is_empty());
         assert!(w.state.book().unwrap().chains[1].handed_out.is_empty());
+    }
+
+    #[test]
+    fn a_change_address_waits_for_an_operation_on_the_book_in_progress() {
+        let (w, address) = funded("change-waits");
+        let view = block(plan_pq2_payment(&w.state, address, elsewhere(), "0.001".into(), None, None)).unwrap();
+        assert!(view.change > 0);
+        let reached = Arc::new(AtomicBool::new(false));
+        let r = reached.clone();
+        *guard(&w.state.before_commit) = Some(Box::new(move |_: &AppState| r.store(true, Ordering::SeqCst)));
+        // Another operation on the book (a scan, say) holds it while the payment is confirmed.
+        let held = w.state.book_ops.try_lock().unwrap();
+        std::thread::scope(|s| {
+            let state = &w.state;
+            let id = view.id.clone();
+            let send = s.spawn(move || block(send_plan(state, &id, Some("en"), |_| std::future::ready(true))));
+            let started = Instant::now();
+            while !reached.load(Ordering::SeqCst) {
+                assert!(started.elapsed() < Duration::from_secs(120));
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            std::thread::sleep(Duration::from_millis(200));
+            // Signed and through its last check on the network, it waits: nothing handed out or sent.
+            assert!(!send.is_finished());
+            assert!(guard(&w.net.broadcasts).is_empty());
+            assert!(w.state.book().unwrap().chains[1].handed_out.is_empty());
+            drop(held);
+            send.join().unwrap().unwrap();
+        });
+        assert!(!guard(&w.net.broadcasts).is_empty());
+        assert!(w.state.book().unwrap().chains[1].handed_out.contains(&0));
     }
 
     /// An ML-DSA-44 payment of the wallet's, recorded with this status and these inputs.
