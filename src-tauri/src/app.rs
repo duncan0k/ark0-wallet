@@ -19,6 +19,8 @@ use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::future::{poll_fn, Future};
 use std::path::PathBuf;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::Poll;
@@ -223,6 +225,9 @@ pub struct AppState {
     sent_ops: Mutex<()>,
     /// Held while the pq2 book is read, changed and saved (`edit_book`).
     pq2_ops: Mutex<()>,
+    /// Tests: this many next saves of the pq2 book fail.
+    #[cfg(test)]
+    fail_book_writes: AtomicUsize,
     /// Lookups started by any refresh, until their results have been saved.
     sent_lookups: Mutex<HashSet<String>>,
     /// Counts locks. Work that began before a lock (an unlock's key derivation, a send waiting on the
@@ -249,6 +254,8 @@ impl AppState {
             vault_ops: Mutex::new(()),
             sent_ops: Mutex::new(()),
             pq2_ops: Mutex::new(()),
+            #[cfg(test)]
+            fail_book_writes: AtomicUsize::new(0),
             sent_lookups: Mutex::new(HashSet::new()),
             generation: AtomicU64::new(0),
             locked: watch::channel(()).0,
@@ -361,6 +368,10 @@ impl AppState {
         let result = change(&mut book);
         if book != before {
             if let Some(b) = &book {
+                #[cfg(test)]
+                if self.fail_book_writes.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok() {
+                    return Err(std::io::Error::other("a failing disk (test)"));
+                }
                 store::save(&path, b)?;
             }
         }
@@ -1210,6 +1221,7 @@ async fn check_reserved(state: &AppState, sources: &Sources, flags: &mut Flags) 
     }
     let from = book.history_tip.unwrap_or(0).saturating_sub(HISTORY_OVERLAP);
     let mut tip = u32::MAX;
+    let mut found = Vec::new();
     for part in reserved.chunks(crate::api::MAX_HISTORY_ADDRESSES) {
         let addresses: Vec<String> = part.iter().map(|(_, _, a)| a.clone()).collect();
         let Some(history) = history_since(sources, &addresses, from, flags).await else { return false };
@@ -1217,12 +1229,20 @@ async fn check_reserved(state: &AppState, sources: &Sources, flags: &mut Flags) 
         for ((c, i, a), used) in part.iter().zip(history.used) {
             // Only an address the wallet's own keys give at that index.
             if used && state.pq2_template(*c, *i).is_ok_and(|t| &t.address == a) {
-                let _ = state.edit_book(|b| b.chains[*c as usize].mark_used(*i, a));
+                found.push((*c, *i, a.clone()));
             }
         }
     }
-    let _ = state.edit_book(|b| b.history_tip = Some(tip));
-    true
+    // Every address found used and the new watermark go into the book in one save: when that fails, none
+    // of it is kept, and the next check asks about the same blocks again.
+    state
+        .edit_book(|b| {
+            for (c, i, a) in &found {
+                b.chains[*c as usize].mark_used(*i, a);
+            }
+            b.history_tip = Some(tip);
+        })
+        .is_ok()
 }
 
 /// What the review shows of a payment from a pq2 address.
@@ -5381,6 +5401,27 @@ mod pq2_tests {
         let book = w.state.book().unwrap();
         assert!(!book.chains[0].used.contains(&7));
         assert_eq!(book.history_tip, Some(H4T + 100));
+    }
+
+    #[test]
+    fn the_history_watermark_waits_until_a_payment_found_is_saved() {
+        let w = wallet("watermark", words(0x5d), false, m4_state(H4T + 100, false));
+        block(scan_pq2(&w.state, false)).unwrap();
+        // Reserved index 3 is paid at H4T + 101; the check finds it, but saving that fails once.
+        *guard(&w.net.state) = m4_state(H4T + 110, false);
+        guard(&w.net.history).insert(pq2_address(&w, 0, 3), H4T + 101);
+        w.state.fail_book_writes.store(1, Ordering::SeqCst);
+        let p = block(overview_of(&w.state)).unwrap().pq2.unwrap();
+        assert!(!p.complete);
+        let book = w.state.book().unwrap();
+        assert_eq!(book.history_tip, Some(H4T + 100), "the watermark did not move past the unsaved payment");
+        assert!(!book.chains[0].used.contains(&3));
+        // The next check still covers H4T + 101 and saves it.
+        *guard(&w.net.state) = m4_state(H4T + 120, false);
+        block(overview_of(&w.state)).unwrap();
+        let book = w.state.book().unwrap();
+        assert!(book.chains[0].used.contains(&3));
+        assert_eq!(book.history_tip, Some(H4T + 120));
     }
 
     #[test]
