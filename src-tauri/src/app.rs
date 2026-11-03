@@ -1888,17 +1888,26 @@ pub async fn plan_rebuild(state: State<'_, AppState>, txid: String) -> Res<SendP
 }
 
 async fn rebuild_plan(state: &AppState, txid: &str) -> Res<SendPlan> {
+    let snapshot = state.snapshot()?;
+    rebuild_plan_in(state, &snapshot, txid).await
+}
+
+/// `rebuild_plan` for the wallet and session of `snapshot`, taken before the first wait (or the
+/// confirmation's own, for the rebuild that follows a refused broadcast): the book read and both planning
+/// attempts are of that session, and a changed one ends `locked` with nothing saved.
+async fn rebuild_plan_in(state: &AppState, snapshot: &Snapshot, txid: &str) -> Res<SendPlan> {
     let sent: Vec<Sent> = store::load(&state.sent_path());
     let old = sent.iter().find(|s| s.txid == txid).cloned().ok_or_else(|| Failure::new("no_plan"))?;
-    let chain = current_chain(&state.sources, &mut Flags::default()).await?;
-    if !needs_rebuild(&old, &chain) {
+    let chain = current_chain(&state.sources, &mut Flags::default()).await;
+    state.current(snapshot)?;
+    if !needs_rebuild(&old, &chain?) {
         return Err(Failure::new("no_rebuild"));
     }
     let amount = format_coins(old.send);
-    let rebuild = Rebuild::of(&state.book()?, &old);
-    match plan_pq2_payment(state, old.address.clone(), old.to.clone(), amount, Some(Path::Slhdsa128s), Some(rebuild.clone())).await {
+    let rebuild = Rebuild::of(&state.edit_book_for(snapshot, |b| b.clone())?, &old);
+    match plan_pq2_payment_in(state, snapshot.clone(), old.address.clone(), old.to.clone(), amount, Some(Path::Slhdsa128s), Some(rebuild.clone())).await {
         Err(f) if f.code == "insufficient" || f.code == "pq2_change_limit" => {
-            plan_pq2_payment(state, old.address.clone(), old.to.clone(), "all".into(), Some(Path::Slhdsa128s), Some(rebuild)).await
+            plan_pq2_payment_in(state, snapshot.clone(), old.address.clone(), old.to.clone(), "all".into(), Some(Path::Slhdsa128s), Some(rebuild)).await
         }
         other => other,
     }
@@ -2104,7 +2113,7 @@ async fn send_plan<F: Future<Output = bool>>(
             Err(_) => true,
         };
         if flipped {
-            rebuilt = rebuild_plan(state, &signed.txid).await.ok();
+            rebuilt = rebuild_plan_in(state, &snapshot, &signed.txid).await.ok();
         }
     }
     Ok(SendResult { result, txid: signed.txid, sign_ms, rebuilt })
@@ -6449,6 +6458,48 @@ mod pq2_tests {
         assert_eq!(result.err().map(|f| f.code), Some("locked".to_string()));
         assert!(guard(&w.state.pending).is_none(), "no plan kept for the new wallet");
         assert!(guard(&w.net.broadcasts).is_empty());
+    }
+
+    #[test]
+    fn a_rebuild_plan_stays_with_the_session_it_began_in() {
+        // The wallet is locked and unlocked again while the plan waits for the node's state: the plan
+        // begun before the lock is not saved into the new session.
+        let (w, address) = funded("rebuild-relock");
+        let t = ml_record(&w, &address, &"81".repeat(32), "rejected", &[format!("{}:0", "d".repeat(64))]);
+        *guard(&w.net.state) = m4_state(H4T + 12, true);
+        let mut fired = false;
+        *guard(&w.state.after_network_answer) = Some(Box::new(move |state: &AppState| {
+            if !std::mem::replace(&mut fired, true) {
+                state.lock();
+                state.open_session(&words(0x33), state.generation(), true).unwrap();
+            }
+        }));
+        assert_eq!(block(rebuild_plan(&w.state, &t.txid)).unwrap_err().code, "locked");
+        *guard(&w.state.after_network_answer) = None;
+        assert!(guard(&w.state.pending).is_none());
+        // Unchanged, the same rebuild is planned.
+        assert!(block(rebuild_plan(&w.state, &t.txid)).is_ok());
+        // The rebuild after a refused broadcast keeps the confirmation's snapshot: relocked meanwhile,
+        // no rebuild is offered and nothing is saved.
+        let (w, address) = funded("refused-relock");
+        let view = block(plan_pq2_payment(&w.state, address, elsewhere(), "0.001".into(), Some(Path::Mldsa44), None)).unwrap();
+        *guard(&w.net.refuse) = Some("refused".into());
+        *guard(&w.net.on_broadcast) = Some(m4_state(H4T + 11, true));
+        // Armed once the payment is committed, so that it fires in the rebuild that follows.
+        *guard(&w.state.before_commit) = Some(Box::new(|state: &AppState| {
+            let mut fired = false;
+            *guard(&state.after_network_answer) = Some(Box::new(move |state: &AppState| {
+                if !std::mem::replace(&mut fired, true) {
+                    state.lock();
+                    state.open_session(&words(0x33), state.generation(), true).unwrap();
+                }
+            }));
+        }));
+        let result = block(send_plan(&w.state, &view.id, Some("en"), |_| std::future::ready(true))).unwrap();
+        *guard(&w.state.after_network_answer) = None;
+        assert!(matches!(result.result, BroadcastResult::Rejected { .. }));
+        assert!(result.rebuilt.is_none());
+        assert!(guard(&w.state.pending).is_none());
     }
 
     #[test]
