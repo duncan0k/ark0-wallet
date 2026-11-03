@@ -240,16 +240,44 @@ fn bip39_seed(entropy: &[u8; 32]) -> Result<Zeroizing<[u8; 64]>, KeyError> {
     Ok(Zeroizing::new(mnemonic.to_seed_normalized("")))
 }
 
-/// HMAC-SHA-512 of `parts` under `key`, into `out`. The keyed state is wiped when it is dropped (the
-/// zeroize features of hmac and sha2), and the result goes from the MAC's own output, which is wiped on
-/// drop too, straight into `out`.
-fn hmac_sha512_into(key: &[u8], parts: &[&[u8]], out: &mut [u8; 64]) {
-    let mut mac = <Hmac<Sha512> as KeyInit>::new_from_slice(key).expect("HMAC takes a key of any length");
+/// SHA-512 of `parts`, written straight into `out`; the hash state is wiped when it is dropped (sha2's
+/// zeroize feature).
+fn sha512_into(parts: &[&[u8]], out: &mut [u8; 64]) {
+    let mut h = Sha512::new();
     for p in parts {
-        mac.update(p);
+        Digest::update(&mut h, p);
     }
-    let tag = mac.finalize();
-    out.copy_from_slice(&tag.as_bytes()[..]);
+    let out: &mut sha2::digest::Output<Sha512> = (&mut out[..]).try_into().expect("64 bytes");
+    h.finalize_into(out);
+}
+
+/// HMAC-SHA-512 (RFC 2104) of `parts` under `key`, into `out`, computed here over sha2 so that every
+/// intermediate is wiped: the key block, both pads (key xor ipad, key xor opad) and the inner hash live in
+/// buffers wiped on drop, and both hash states are wiped when they are dropped.
+fn hmac_sha512_into(key: &[u8], parts: &[&[u8]], out: &mut [u8; 64]) {
+    const BLOCK: usize = 128;
+    let mut block = Zeroizing::new([0u8; BLOCK]);
+    if key.len() > BLOCK {
+        let mut hashed = Zeroizing::new([0u8; 64]);
+        sha512_into(&[key], &mut hashed);
+        block[..64].copy_from_slice(&hashed[..]);
+    } else {
+        block[..key.len()].copy_from_slice(key);
+    }
+    let mut pad = Zeroizing::new([0u8; BLOCK]);
+    for (p, k) in pad.iter_mut().zip(block.iter()) {
+        *p = k ^ 0x36;
+    }
+    let mut inner = Zeroizing::new([0u8; 64]);
+    let mut inner_parts: Vec<&[u8]> = Vec::with_capacity(parts.len() + 1);
+    inner_parts.push(&pad[..]);
+    inner_parts.extend_from_slice(parts);
+    sha512_into(&inner_parts, &mut inner);
+    drop(inner_parts);
+    for (p, k) in pad.iter_mut().zip(block.iter()) {
+        *p = k ^ 0x5c;
+    }
+    sha512_into(&[&pad[..], &inner[..]], out);
 }
 
 /// HKDF-SHA-512 (RFC 5869) under the wallet's salt, filling `out` (at most 255 blocks of 64 bytes). The
@@ -677,6 +705,23 @@ mod tests {
 
     /// The hash and MAC states and outputs the derivation goes through are wiped when they are dropped:
     /// this only builds with the zeroize features of sha2 and hmac enabled.
+    /// RFC 4231's HMAC-SHA-512 test cases 1, 2, 3, 6 and 7 (a key longer than the block is hashed first).
+    #[test]
+    fn hmac_sha512_matches_rfc_4231() {
+        let cases: [(Vec<u8>, Vec<u8>, &str); 5] = [
+            (vec![0x0b; 20], b"Hi There".to_vec(), "87aa7cdea5ef619d4ff0b4241a1d6cb02379f4e2ce4ec2787ad0b30545e17cdedaa833b7d6b8a702038b274eaea3f4e4be9d914eeb61f1702e696c203a126854"),
+            (b"Jefe".to_vec(), b"what do ya want for nothing?".to_vec(), "164b7a7bfcf819e2e395fbe73b56e0a387bd64222e831fd610270cd7ea2505549758bf75c05a994a6d034f65f8f0e6fdcaeab1a34d4a6b4b636e070a38bce737"),
+            (vec![0xaa; 20], vec![0xdd; 50], "fa73b0089d56a284efb0f0756c890be9b1b5dbdd8ee81a3655f83e33b2279d39bf3e848279a722c806b485a47e67c807b946a337bee8942674278859e13292fb"),
+            (vec![0xaa; 131], b"Test Using Larger Than Block-Size Key - Hash Key First".to_vec(), "80b24263c7c1a3ebb71493c1dd7be8b49b46d1f41b4aeec1121b013783f8f3526b56d037e05f2598bd0fd2215d6a1e5295e64f73f63f0aec8b915a985d786598"),
+            (vec![0xaa; 131], b"This is a test using a larger than block-size key and a larger than block-size data. The key needs to be hashed before being used by the HMAC algorithm.".to_vec(), "e37b6a775dc87dbaa4dfa9f96e5e3ffddebd71f8867289865df5a32d20cdc944b6022cac3c4982b10d5eeb55c3e4de15134676fb6de0446065c97440fa8c6a58"),
+        ];
+        for (key, data, want) in cases {
+            let mut out = [0u8; 64];
+            hmac_sha512_into(&key, &[&data[..3.min(data.len())], &data[3.min(data.len())..]], &mut out);
+            assert_eq!(hex::encode(out), want);
+        }
+    }
+
     #[test]
     fn derivation_states_wipe_themselves() {
         fn wiped_on_drop<T: zeroize::ZeroizeOnDrop>() {}
