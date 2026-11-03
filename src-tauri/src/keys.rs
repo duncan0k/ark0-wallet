@@ -240,15 +240,19 @@ fn bip39_seed(entropy: &[u8; 32]) -> Result<Zeroizing<[u8; 64]>, KeyError> {
     Ok(Zeroizing::new(mnemonic.to_seed_normalized("")))
 }
 
-/// SHA-512 of `parts`, written straight into `out`; the hash state is wiped when it is dropped (sha2's
-/// zeroize feature).
+/// SHA-512 of `parts`, over sha2's core type itself, its output written straight into `out`. The core
+/// state and the block buffer are wiped when they are dropped (sha2's zeroize feature). The `Sha512`
+/// wrapper is not used: it finalises into a plain array of its own and copies that out.
 fn sha512_into(parts: &[&[u8]], out: &mut [u8; 64]) {
-    let mut h = Sha512::new();
+    use sha2::block_api::Sha512VarCore;
+    use sha2::digest::block_api::{Buffer, UpdateCore, VariableOutputCore};
+    let mut core = Sha512VarCore::new(64).expect("SHA-512 has a 64-byte output");
+    let mut buffer = Buffer::<Sha512VarCore>::default();
     for p in parts {
-        Digest::update(&mut h, p);
+        buffer.digest_blocks(p, |blocks| core.update_blocks(blocks));
     }
-    let out: &mut sha2::digest::Output<Sha512> = (&mut out[..]).try_into().expect("64 bytes");
-    h.finalize_into(out);
+    let out: &mut sha2::digest::Output<Sha512VarCore> = (&mut out[..]).try_into().expect("64 bytes");
+    core.finalize_variable_core(&mut buffer, out);
 }
 
 /// HMAC-SHA-512 (RFC 2104) of `parts` under `key`, into `out`, computed here over sha2 so that every
@@ -703,9 +707,18 @@ mod tests {
         assert!(mldsa::verify(&p.sign_mldsa44(&message).unwrap(), &message, MLDSA44_CONTEXT, p.mldsa44_public_key()));
     }
 
-    /// The hash and MAC states and outputs the derivation goes through are wiped when they are dropped:
-    /// this only builds with the zeroize features of sha2 and hmac enabled.
     /// RFC 4231's HMAC-SHA-512 test cases 1, 2, 3, 6 and 7 (a key longer than the block is hashed first).
+    /// SHA-512 over the core type is SHA-512, at every length around the block boundaries.
+    #[test]
+    fn sha512_over_the_core_is_sha512() {
+        let data: Vec<u8> = (0..400u32).map(|i| (i * 7 + 3) as u8).collect();
+        for n in [0, 1, 111, 112, 127, 128, 129, 255, 256, 257, 400] {
+            let mut out = [0u8; 64];
+            sha512_into(&[&data[..n / 3], &data[n / 3..n]], &mut out);
+            assert_eq!(out[..], Sha512::digest(&data[..n])[..], "{n} bytes");
+        }
+    }
+
     #[test]
     fn hmac_sha512_matches_rfc_4231() {
         let cases: [(Vec<u8>, Vec<u8>, &str); 5] = [
@@ -722,9 +735,12 @@ mod tests {
         }
     }
 
+    /// The hash and MAC states and outputs the derivation goes through are wiped when they are dropped:
+    /// this only builds with the zeroize features of sha2 and hmac enabled.
     #[test]
     fn derivation_states_wipe_themselves() {
         fn wiped_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        wiped_on_drop::<sha2::block_api::Sha512VarCore>();
         wiped_on_drop::<<Sha512 as hmac::digest::block_api::CoreProxy>::Core>();
         wiped_on_drop::<<Sha256 as hmac::digest::block_api::CoreProxy>::Core>();
         wiped_on_drop::<hmac::digest::CtOutput<Hmac<Sha512>>>();
