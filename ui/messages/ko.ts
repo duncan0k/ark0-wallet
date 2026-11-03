@@ -398,6 +398,7 @@ export const ko: Messages = {
     no_rebuild: '이 지불은 지금 다시 만들 수 없습니다',
     rebuild_original_went_out: '원래 지불이 결국 나갔으므로(확인되었거나 블록을 기다리는 중) 다시 지불하지 않습니다',
     rebuild_inputs_spent: '원래 지불의 코인이 더 이상 없으므로 다른 코인으로 다시 지불하지 않습니다',
+    rebuild_anchor_unavailable: '이 지불은 첫 번째 코인이 다시 사용 가능해질 때까지 다시 만들 수 없습니다',
     rebuild_no_common_input: '원래 지불의 코인을 하나도 쓰지 않아 둘 다 처리될 수 있으므로 중지했습니다',
     history_unavailable: '사이트가 아직 어떤 pq2 주소가 쓰였는지 알려 주지 못해 확인을 마치지 못했습니다. 나중에 다시 시도하세요. 그때까지 새 pq2 주소는 표시되지 않습니다.',
     rebuild_lineage_changed: '그 사이에 이 지불의 다른 버전이 만들어져 이것은 보내지 않았습니다. 다시 검토하세요',

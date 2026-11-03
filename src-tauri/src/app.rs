@@ -201,9 +201,12 @@ struct PendingSend {
     rebuild: Option<Rebuild>,
 }
 
-/// A rebuild is bound to the lineage of the payment it replaces (the original and every version made
-/// from it, kept in the book): it spends at least one input of every version that could still confirm,
-/// so that no two can both confirm, and it is not made once any version is confirmed or in the mempool.
+/// A rebuild is bound to the payment it replaces through one anchor input: the original's first input,
+/// fixed when the original was recorded. Every version of the payment spends the anchor, so any two
+/// versions conflict and at most one can confirm. A rebuild is planned only while the anchor is spendable
+/// (unspent, held by no transaction in the mempool), and none is made once a version of the payment is in
+/// the mempool or confirmed. The lineage (the versions made so far, kept in the book) is a record for the
+/// lookups before broadcast and for display; it decides nothing about safety.
 #[derive(Clone, Debug)]
 struct Rebuild {
     /// The original asked to be rebuilt, with its inputs; its txid is empty when it was dropped before it
@@ -229,55 +232,17 @@ impl Rebuild {
     fn bound(&self) -> bool {
         !self.root.txid.is_empty()
     }
-}
 
-/// How the versions of a lineage stand, by the wallet's records and a snapshot of the address's coins read
-/// after every one of them joined the lineage.
-enum LineageState {
-    /// A version is confirmed or in the mempool: no more rebuilds.
-    WentOut,
-    /// The versions that could still confirm: all but those whose record says replaced (by a proven
-    /// payment) and those with an input that is gone (spent by a confirmed transaction that is not this
-    /// version).
-    Live(Vec<Version>),
-}
-
-fn lineage_state(versions: &[Version], sent: &[Sent], coins: &Coins) -> LineageState {
-    let present: HashSet<String> = coins.spendable.iter().chain(&coins.pending).map(Coin::outpoint).collect();
-    let mut live = Vec::new();
-    for v in versions {
-        let record = sent.iter().find(|s| s.txid == v.txid);
-        if record.is_some_and(|r| original_went_out(r) && r.status != "replaced") {
-            return LineageState::WentOut;
-        }
-        // Dead only when its record says replaced, or one of its inputs is absent from `coins` (read after
-        // the version joined the lineage). A version without a record is judged by its inputs too.
-        if record.is_some_and(|r| r.status == "replaced") || !v.inputs.iter().all(|o| present.contains(o)) {
-            continue;
-        }
-        live.push(v.clone());
+    /// The anchor: the original's first input, which every version spends.
+    fn anchor(&self) -> Option<&str> {
+        self.root.inputs.first().map(String::as_str)
     }
-    LineageState::Live(live)
 }
 
-/// Coins among `usable` that give a conflict with every live version: for each version not yet covered,
-/// the usable input that covers most of the others still uncovered (the larger first among equals). None
-/// when a live version has no usable input (every one held by a transaction in the mempool).
-fn conflict_set(live: &[Version], usable: &[Coin]) -> Option<Vec<Coin>> {
-    let mut chosen: Vec<Coin> = Vec::new();
-    let mut uncovered: Vec<&Version> = live.iter().collect();
-    while !uncovered.is_empty() {
-        let best = usable
-            .iter()
-            .filter(|c| !chosen.contains(c))
-            .map(|c| (uncovered.iter().filter(|v| v.inputs.contains(&c.outpoint())).count(), c.sats, c))
-            .filter(|(n, _, _)| *n > 0)
-            .max_by_key(|(n, sats, _)| (*n, *sats))?;
-        let coin = best.2.clone();
-        uncovered.retain(|v| !v.inputs.contains(&coin.outpoint()));
-        chosen.push(coin);
-    }
-    Some(chosen)
+/// Whether a version of the payment is in the mempool or confirmed, by the wallet's records: then no more
+/// rebuilds of it.
+fn lineage_went_out(versions: &[Version], sent: &[Sent]) -> bool {
+    versions.iter().any(|v| sent.iter().any(|s| s.txid == v.txid && original_went_out(s) && s.status != "replaced"))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -399,6 +364,8 @@ impl AppState {
     }
 
     fn lock(&self) {
+        // A commit in progress finishes first (`commit_ops` is always taken before the session).
+        let _commit = guard(&self.commit_ops);
         // Serialize locking with the final session check and mutation of a confirmed wallet change.
         self.lock_session(guard(&self.session));
     }
@@ -903,6 +870,8 @@ async fn remove_wallet<F: Future<Output = bool>>(
     confirm_unlocked(state, generation, crate::confirm::removal(state.dialog_locale(locale)), ask).await?;
     {
         let _one_at_a_time = guard(&state.vault_ops);
+        // A commit in progress finishes first.
+        let _commit = guard(&state.commit_ops);
         let session = guard(&state.session);
         if session.is_none() || state.generation() != generation {
             return Err(Failure::new("locked"));
@@ -953,6 +922,8 @@ async fn forget_locked_wallet<F: Future<Output = bool>>(
     }
     {
         let _one_at_a_time = guard(&state.vault_ops);
+        // A commit in progress finishes first.
+        let _commit = guard(&state.commit_ops);
         let session = guard(&state.session);
         if state.generation() != generation {
             return Err(Failure::new("cancelled"));
@@ -1700,14 +1671,16 @@ async fn plan_pq2_payment_in(state: &AppState, snapshot: Snapshot, address: Stri
     if sent.iter().any(|s| s.status == "submitting") {
         return Err(Failure::new("sending"));
     }
-    // A rebuild is decided again from its lineage's state as the refresh found it.
-    let live = match &rebuild {
-        Some(r) if r.bound() => match lineage_state(&r.versions, &sent, &coins) {
-            LineageState::WentOut => return Err(Failure::new("rebuild_original_went_out")),
-            LineageState::Live(live) if live.is_empty() => return Err(Failure::new("rebuild_inputs_spent")),
-            LineageState::Live(live) => live,
-        },
-        _ => Vec::new(),
+    // A rebuild is decided again as the refresh found its versions: none once one of them is in the
+    // mempool or confirmed.
+    let anchor: Option<String> = match &rebuild {
+        Some(r) if r.bound() => {
+            if lineage_went_out(&r.versions, &sent) {
+                return Err(Failure::new("rebuild_original_went_out"));
+            }
+            Some(r.anchor().ok_or_else(|| Failure::new("rebuild_anchor_unavailable"))?.to_string())
+        }
+        _ => None,
     };
     let pending = pending_everywhere(&sources, &coins, &own, &template.address, &mut flags).await;
     state.current(&snapshot)?;
@@ -1728,20 +1701,9 @@ async fn plan_pq2_payment_in(state: &AppState, snapshot: Snapshot, address: Stri
     let path = if mldsa44_fits { chain.pq2_path(wanted) } else { Path::Slhdsa128s };
     let account = Account::new(template, path).ok_or_else(|| Failure::new("address_not_ready"))?;
     // Through the SLH-DSA leaf, the fewest coins that pay (largest first), or as many as fit for "all";
-    // the coins earlier payments require, and for a rebuild only the coins it needs to conflict with every
-    // version of its lineage that could still confirm, go first; the rest by amount and size.
-    // For a rebuild, the payments of its lineage need one small set of inputs that conflicts with each of
-    // them (every live version, and every version the retry rules would otherwise cover one by one), not
-    // a coin per payment; other payments still waiting keep their own requirement.
+    // the coins other payments still waiting require go first, and for a rebuild its anchor, which must be
+    // spendable now. The versions of the rebuild's own payment need nothing more: they all spend the anchor.
     let lineage: HashSet<&str> = rebuild.iter().filter(|r| r.bound()).flat_map(|r| r.versions.iter().map(|v| v.txid.as_str())).collect();
-    let mut targets = live.clone();
-    if let Some(r) = rebuild.as_ref().filter(|r| r.bound()) {
-        for v in &r.versions {
-            if earlier.replaces.contains(&v.txid) && !targets.iter().any(|t| t.txid == v.txid) {
-                targets.push(v.clone());
-            }
-        }
-    }
     let others_required = if lineage.is_empty() {
         earlier.required.clone()
     } else {
@@ -1749,13 +1711,10 @@ async fn plan_pq2_payment_in(state: &AppState, snapshot: Snapshot, address: Stri
         earlier_payments(&others, &name, &coins.spendable, &pending).required
     };
     let mut required = if path == Path::Mldsa44 { earlier.usable.clone() } else { others_required };
-    // Versions the forced inputs already conflict with need nothing more; the cover is for the rest.
-    targets.retain(|v| !required.iter().any(|c| v.inputs.contains(&c.outpoint())));
-    if !targets.is_empty() {
-        for c in conflict_set(&targets, &earlier.usable).ok_or_else(|| Failure::new("rebuild_inputs_spent"))? {
-            if !required.contains(&c) {
-                required.push(c);
-            }
+    if let Some(anchor) = &anchor {
+        let coin = earlier.usable.iter().find(|c| &c.outpoint() == anchor).ok_or_else(|| Failure::new("rebuild_anchor_unavailable"))?;
+        if !required.contains(coin) {
+            required.insert(0, coin.clone());
         }
     }
     // nLockTime H4T when the payment creates a pq2 output: its change, or one of the wallet's own pq2
@@ -1763,8 +1722,8 @@ async fn plan_pq2_payment_in(state: &AppState, snapshot: Snapshot, address: Stri
     let to_own_pq2 = own_pq2(state).contains(&destination.address);
     let mut plan = wallet::plan_spend_to(&account, &earlier.usable, &required, &destination, amount, chain.lock_time(), change.as_ref().map(|t| &t.script_pubkey))
         .map_err(|e| if e == PlanError::NeedsChange { Failure::new("pq2_change_limit") } else { e.into() })?;
-    if !live.iter().all(|v| plan.coins.iter().any(|c| v.inputs.contains(&c.outpoint()))) {
-        return Err(Failure::new("rebuild_no_common_input"));
+    if anchor.as_ref().is_some_and(|a| !plan.coins.iter().any(|c| &c.outpoint() == a)) {
+        return Err(Failure::new("rebuild_anchor_unavailable"));
     }
     let change_used = plan.change > 0;
     let creates_pq2 = change_used || to_own_pq2;
@@ -1994,12 +1953,6 @@ async fn send_plan<F: Future<Output = bool>>(
             Some(versions)
         }
     };
-    // The coins that decide which versions could still confirm, read after every version was looked up:
-    // the last step on the network before the commit.
-    let fresh: Option<Coins> = match &looked_up {
-        Some(_) => Some(state.sources.coins(&pending.plan_address).await.value?),
-        None => None,
-    };
     #[cfg(test)]
     {
         let hook = guard(&state.before_commit).take();
@@ -2008,72 +1961,44 @@ async fn send_plan<F: Future<Output = bool>>(
         }
     }
     {
-        // One section, with no wait on the network. First every check, with nothing written: the wallet
-        // and session the confirmation began in; for a rebuild, its lineage as it is now (the one whose
-        // versions were looked up and judged with the fresh coins) and its conflict with every version that
-        // could still confirm; the change index still free; every precondition of the record. Then the
-        // writes: the pq2 book in one write (the version joins the lineage, the change index is handed
-        // out), then the record as submitting; if that fails, the book write is undone. Another
-        // confirmation waits here.
+        // One section, with no wait on the network, in this order and with no rollback: the checks (the
+        // wallet and session the confirmation began in; for a rebuild, its anchor among the coins it
+        // spends; every precondition of the record); then the change index, checked and handed out in one
+        // write of the pq2 book (if it cannot be, nothing else is written); then the record as submitting;
+        // then the version joins its payment's lineage. A change index handed out for a payment whose
+        // record then fails stays unused (a gap); a version missing from the lineage after a failed write
+        // decides nothing, since the anchor does. Locking the wallet waits for this section.
         let _commit = guard(&state.commit_ops);
         state.still_current(&snapshot)?;
-        let record_coins = fresh.as_ref().unwrap_or(&coins);
-        let mut version = None;
-        if let (Some(r), Some(versions), Some(fresh)) = (pending.rebuild.as_ref().filter(|r| r.bound()), &looked_up, &fresh) {
-            let now = state.edit_book_for(&snapshot, |b| b.clone())?.lineage_of(&r.root.txid).map_or_else(|| vec![r.root.clone()], |l| l.versions.clone());
-            if now != *versions {
-                return Err(Failure::new("rebuild_lineage_changed"));
+        let rebuild = pending.rebuild.as_ref().filter(|r| r.bound());
+        if let Some(r) = rebuild {
+            if !r.anchor().is_some_and(|a| pending.plan.coins.iter().any(|c| c.outpoint() == a)) {
+                return Err(Failure::new("rebuild_anchor_unavailable"));
             }
-            let recorded: Vec<Sent> = store::load_existing(&state.sent_path()).map_err(|_| Failure::new("io"))?;
-            let LineageState::Live(live) = lineage_state(&now, &recorded, fresh) else {
-                return Err(Failure::new("rebuild_original_went_out"));
-            };
-            if !live.iter().all(|v| pending.plan.coins.iter().any(|c| v.inputs.contains(&c.outpoint()))) {
-                return Err(Failure::new("rebuild_no_common_input"));
-            }
-            version = Some((r.root.clone(), Version { txid: signed.txid.clone(), inputs: pending.plan.coins.iter().map(Coin::outpoint).collect() }));
-        }
-        let mut change = None;
-        if let Some(Pq2Pending { change: Some(index), .. }) = pending.pq2 {
-            let book = state.edit_book_for(&snapshot, |b| b.clone())?;
-            if book.scan_needed {
-                return Err(Failure::new("pq2_scan_needed"));
-            }
-            if book.chains[CHANGE_CHAIN as usize].next() != Some(index) {
-                return Err(Failure::new("coins_changed"));
-            }
-            let bound = snapshot.bound.as_ref().ok_or_else(|| Failure::new("pq2_unavailable"))?;
-            change = Some((index, state.pq2_template_of(&bound.wallet, bound.generation, CHANGE_CHAIN, index)?.address));
         }
         let record = signed_record(&pending, &signed, sign_ms);
         {
             let recorded: Vec<Sent> = store::load_existing(&state.sent_path()).map_err(|_| Failure::new("io"))?;
-            record_allowed(state, &recorded, &pending, record_coins, &spending, generation, &record)?;
+            record_allowed(state, &recorded, &pending, &coins, &spending, generation, &record)?;
         }
-        let book_write = version.is_some() || change.is_some();
-        if book_write {
+        if let Some(Pq2Pending { change: Some(index), .. }) = pending.pq2 {
+            let bound = snapshot.bound.as_ref().ok_or_else(|| Failure::new("pq2_unavailable"))?;
+            let address = state.pq2_template_of(&bound.wallet, bound.generation, CHANGE_CHAIN, index)?.address;
             state.edit_book_for(&snapshot, |b| {
-                if let Some((root, v)) = &version {
-                    b.add_version(root, v.clone());
+                if b.scan_needed {
+                    return Err(Failure::new("pq2_scan_needed"));
                 }
-                if let Some((index, address)) = &change {
-                    b.chains[CHANGE_CHAIN as usize].issue(*index, address);
+                if !b.chains[CHANGE_CHAIN as usize].issue(index, &address) {
+                    return Err(Failure::new("coins_changed"));
                 }
-            })?;
+                Ok(())
+            })??;
         }
-        // Recorded before the API sees it. Not sent at all when that fails; then the book is as it was.
-        if let Err(e) = record_payment(state, &pending, record_coins, &spending, generation, record) {
-            if book_write {
-                let _ = state.edit_book_for(&snapshot, |b| {
-                    if let Some((_, v)) = &version {
-                        b.remove_version(&v.txid);
-                    }
-                    if let Some((index, _)) = &change {
-                        b.chains[CHANGE_CHAIN as usize].release(*index);
-                    }
-                });
-            }
-            return Err(e);
+        // Recorded before the API sees it. Not sent at all when that fails.
+        record_payment(state, &pending, &coins, &spending, generation, record)?;
+        if let (Some(r), Some(_)) = (rebuild, &looked_up) {
+            let version = Version { txid: signed.txid.clone(), inputs: pending.plan.coins.iter().map(Coin::outpoint).collect() };
+            let _ = state.edit_book_for(&snapshot, |b| b.add_version(&r.root, version));
         }
     }
     let result = state.sources.broadcast(&signed.hex, &signed.txid).await.value;
@@ -6308,7 +6233,7 @@ mod pq2_tests {
         let old = unclear_mldsa_payment(&w, &address);
         *guard(&w.net.state) = m4_state(H4T + 12, true);
         guard(&w.net.utxos).insert(address.clone(), vec![utxo('5', 0, 400_000, H4T + 11)]);
-        assert_eq!(block(rebuild_plan(&w.state, &old.txid)).unwrap_err().code, "rebuild_inputs_spent");
+        assert_eq!(block(rebuild_plan(&w.state, &old.txid)).unwrap_err().code, "rebuild_anchor_unavailable");
     }
 
     #[test]
@@ -6430,110 +6355,106 @@ mod pq2_tests {
         assert_eq!(block(rebuild_plan(&w.state, &t.txid)).unwrap_err().code, "rebuild_original_went_out");
     }
 
+    /// The inputs of every transaction broadcast so far.
+    fn broadcast_inputs(w: &Wallet) -> Vec<Vec<String>> {
+        guard(&w.net.broadcasts).iter().map(|hex| {
+            decode(&hex::decode(hex).unwrap()).inputs.iter().map(|i| format!("{}:{}", crate::tx::display_hex(&i.prevout.txid), i.prevout.vout)).collect()
+        }).collect()
+    }
+
     #[test]
-    fn concurrent_rebuilds_of_one_payment_cannot_both_go_out() {
-        let (w, address) = funded("concurrent");
+    fn a_rebuild_is_planned_only_while_its_anchor_is_free() {
+        let (w, address) = funded("anchor-held");
         let (a, b) = (format!("{}:0", "d".repeat(64)), format!("{}:2", "e".repeat(64)));
+        // T spent {A, B}: A, its first input, is the anchor.
         let t = ml_record(&w, &address, &"74".repeat(32), "rejected", &[a.clone(), b.clone()]);
         *guard(&w.net.state) = m4_state(H4T + 12, true);
-        // B is held by another transaction: the first rebuild R1 spends A. Its confirmation is put aside.
-        guard(&w.net.utxos).insert(address.clone(), vec![utxo('d', 0, 150_000, H4T + 7), held_by('e', 2, 60_000, 'f')]);
-        let r1 = block(rebuild_plan(&w.state, &t.txid)).unwrap();
-        let r1_pending = guard(&w.state.pending).take().unwrap();
-        assert_eq!(r1_pending.plan.coins.iter().map(Coin::outpoint).collect::<Vec<_>>(), vec![a.clone()]);
-        // Now A is held and B is free: the second rebuild R2 spends B.
-        guard(&w.net.utxos).insert(address.clone(), vec![held_by('d', 0, 150_000, '9'), utxo('e', 2, 60_000, H4T + 7)]);
-        let r2 = block(rebuild_plan(&w.state, &t.txid)).unwrap();
-        assert_eq!(guard(&w.state.pending).as_ref().unwrap().plan.coins.iter().map(Coin::outpoint).collect::<Vec<_>>(), vec![b.clone()]);
-        // R2's confirmation has read the lineage (T alone) and waits on the network; meanwhile R1's
-        // confirmation goes all the way: R1 joins the lineage and is sent, and comes back unclear.
-        let net = w.net.clone();
-        let address_in = address.clone();
-        let r1_id = r1.id.clone();
-        let mut r1_pending = Some(r1_pending);
-        *guard(&w.state.before_commit) = Some(Box::new(move |state: &AppState| {
-            let Some(pending) = r1_pending.take() else { return };
-            let r2_pending = guard(&state.pending).replace(pending);
-            guard(&net.utxos).insert(address_in.clone(), vec![utxo('d', 0, 150_000, H4T + 7), utxo('e', 2, 60_000, H4T + 7)]);
-            let r1_id = r1_id.clone();
-            let sent = std::thread::scope(|scope| scope.spawn(|| block(send_plan(state, &r1_id, Some("en"), |_| std::future::ready(true)))).join().unwrap());
-            let sent = sent.unwrap();
-            assert!(matches!(sent.result, BroadcastResult::Sent { .. }));
-            edit_sent(state, |all| {
-                if let Some(s) = all.iter_mut().find(|s| s.txid == sent.txid) {
-                    s.status = "unknown".into();
-                }
-            }).unwrap();
-            guard(&net.utxos).insert(address_in.clone(), vec![held_by('d', 0, 150_000, '6'), utxo('e', 2, 60_000, H4T + 7)]);
-            *guard(&state.pending) = r2_pending;
-        }));
-        let result = block(send_plan(&w.state, &r2.id, Some("en"), |_| std::future::ready(true)));
-        *guard(&w.state.before_commit) = None;
-        // R2 shares no input with R1, which could still confirm: it must not go out.
-        assert_eq!(result.err().map(|f| f.code), Some("rebuild_lineage_changed".to_string()), "R2 must not go out beside R1");
-        let broadcasts = guard(&w.net.broadcasts).clone();
-        assert_eq!(broadcasts.len(), 2, "only R1, sent to both APIs");
-        let lineage = w.state.book().unwrap().lineage_of(&t.txid).unwrap().clone();
-        assert_eq!(lineage.versions.len(), 2, "T and R1 only");
+        // A held by a transaction in the mempool, B free: no rebuild from B alone.
+        guard(&w.net.utxos).insert(address.clone(), vec![held_by('d', 0, 150_000, 'f'), utxo('e', 2, 60_000, H4T + 7)]);
+        assert_eq!(block(rebuild_plan(&w.state, &t.txid)).unwrap_err().code, "rebuild_anchor_unavailable");
+        // A spent for good (gone from the address): no rebuild either.
+        guard(&w.net.utxos).insert(address.clone(), vec![utxo('e', 2, 60_000, H4T + 7)]);
+        assert_eq!(block(rebuild_plan(&w.state, &t.txid)).unwrap_err().code, "rebuild_anchor_unavailable");
+        // A free again: the rebuild spends it, whatever else it takes.
+        guard(&w.net.utxos).insert(address.clone(), vec![utxo('d', 0, 150_000, H4T + 7), utxo('e', 2, 60_000, H4T + 7)]);
+        block(rebuild_plan(&w.state, &t.txid)).unwrap();
+        assert!(guard(&w.state.pending).as_ref().unwrap().plan.coins.iter().any(|c| c.outpoint() == a));
     }
 
     #[test]
-    fn the_commit_judges_the_lineage_with_coins_read_after_it() {
-        let w = wallet("fresh-coins", words(0x6c), true, m4_state(H4T + 10, false));
-        let address = block(new_pq2_address(&w.state)).unwrap().address;
-        let (a, b) = (format!("{}:0", "d".repeat(64)), format!("{}:2", "e".repeat(64)));
-        // T spent {A, B} (98,000 and 104,176) to pay 100,000 and was refused.
-        let mut t = ml_record(&w, &address, &"77".repeat(32), "rejected", &[a.clone(), b.clone()]);
-        let mut all: Vec<Sent> = store::load(&w.state.sent_path());
-        all[0].send = 100_000;
-        t.send = 100_000;
-        store::save(&w.state.sent_path(), &all).unwrap();
-        *guard(&w.net.state) = m4_state(H4T + 12, true);
-        // A is held by another transaction: R2 spends B alone.
-        guard(&w.net.utxos).insert(address.clone(), vec![held_by('d', 0, 98_000, 'f'), utxo('e', 2, 104_176, H4T + 7)]);
-        let r2 = block(rebuild_plan(&w.state, &t.txid)).unwrap();
-        assert_eq!(guard(&w.state.pending).as_ref().unwrap().plan.coins.iter().map(Coin::outpoint).collect::<Vec<_>>(), vec![b.clone()]);
-        // While R2's dialog is open: A comes back, a new coin C confirms, B is held; R1 spends {A, C}, goes
-        // out and comes back unclear; then B comes back, and A and C are held by R1.
-        let net = w.net.clone();
-        let (address_in, t_txid) = (address.clone(), t.txid.clone());
-        let state = &w.state;
-        let result = block(send_plan(state, &r2.id, Some("en"), move |_| {
-            guard(&net.utxos).insert(address_in.clone(), vec![utxo('d', 0, 98_000, H4T + 7), utxo('c', 0, 10_400, H4T + 11), held_by('e', 2, 104_176, 'f')]);
-            let sent = std::thread::scope(|scope| {
-                scope.spawn(|| {
-                    let r1 = block(rebuild_plan(state, &t_txid)).unwrap();
-                    block(send_plan(state, &r1.id, Some("en"), |_| std::future::ready(true)))
-                }).join().unwrap()
-            }).unwrap();
-            edit_sent(state, |all| {
-                if let Some(s) = all.iter_mut().find(|s| s.txid == sent.txid) {
-                    s.status = "unknown".into();
-                    assert_eq!(s.outpoints.len(), 2);
+    fn two_rebuilds_of_one_payment_never_both_go_out_without_the_anchor() {
+        // Two interleavings: a second rebuild planned while the first waits in its dialog, then
+        // committed after the first went out and came back unclear, with coins moving in between.
+        for case in 0..2 {
+            let w = wallet(&format!("anchor-pair-{case}"), words(0x70 + case), true, m4_state(H4T + 10, false));
+            let address = block(new_pq2_address(&w.state)).unwrap().address;
+            let (a, b) = (format!("{}:0", "d".repeat(64)), format!("{}:2", "e".repeat(64)));
+            let mut all = vec![ml_record(&w, &address, &"77".repeat(32), "rejected", &[a.clone(), b.clone()])];
+            all[0].send = 100_000;
+            store::save(&w.state.sent_path(), &all).unwrap();
+            let t = all[0].clone();
+            *guard(&w.net.state) = m4_state(H4T + 12, true);
+            guard(&w.net.utxos).insert(address.clone(), vec![utxo('d', 0, 98_000, H4T + 7), utxo('e', 2, 104_176, H4T + 7), utxo('c', 0, 10_400, H4T + 11)]);
+            let r2 = block(rebuild_plan(&w.state, &t.txid)).unwrap();
+            let net = w.net.clone();
+            let (address_in, t_txid) = (address.clone(), t.txid.clone());
+            let state = &w.state;
+            let result = block(send_plan(state, &r2.id, Some("en"), move |_| {
+                let sent = std::thread::scope(|scope| {
+                    scope.spawn(|| {
+                        let r1 = block(rebuild_plan(state, &t_txid)).unwrap();
+                        block(send_plan(state, &r1.id, Some("en"), |_| std::future::ready(true)))
+                    }).join().unwrap()
+                }).unwrap();
+                if case == 1 {
+                    // R1 comes back unclear and leaves the mempool; its coins are free again.
+                    edit_sent(state, |all| {
+                        if let Some(s) = all.iter_mut().find(|s| s.txid == sent.txid) {
+                            s.status = "unknown".into();
+                        }
+                    }).unwrap();
+                } else {
+                    guard(&net.utxos).insert(address_in.clone(), vec![held_by('d', 0, 98_000, '6'), utxo('e', 2, 104_176, H4T + 7), utxo('c', 0, 10_400, H4T + 11)]);
                 }
-            }).unwrap();
-            guard(&net.utxos).insert(address_in.clone(), vec![held_by('d', 0, 98_000, '6'), held_by('c', 0, 10_400, '6'), utxo('e', 2, 104_176, H4T + 7)]);
-            std::future::ready(true)
-        }));
-        // R1 can still confirm and R2 shares no input with it: R2 must not go out.
-        assert_eq!(result.err().map(|f| f.code), Some("rebuild_no_common_input".to_string()));
-        assert_eq!(guard(&w.net.broadcasts).len(), 2, "only R1, sent to both APIs");
+                std::future::ready(true)
+            }));
+            // Whatever happened to R2, everything broadcast spends the anchor A: at most one confirms.
+            let inputs = broadcast_inputs(&w);
+            assert!(!inputs.is_empty());
+            assert!(inputs.iter().all(|i| i.contains(&a)), "case {case}: {inputs:?} ({result:?})");
+        }
     }
 
     #[test]
-    fn a_failed_commit_leaves_nothing_behind() {
-        // The record cannot be saved: the change address handed out in the same commit is released.
+    fn a_commit_writes_in_order_and_a_failed_record_leaves_no_version() {
+        // The record cannot be saved: the change index handed out first stays handed out, unused (a gap);
+        // nothing is recorded or broadcast.
         let (w, address) = funded("commit-io");
         let view = block(plan_pq2_payment(&w.state, address.clone(), elsewhere(), "0.001".into(), None, None)).unwrap();
         assert!(view.change > 0);
         w.state.fail_sent_writes.store(1, Ordering::SeqCst);
         assert_eq!(block(send_plan(&w.state, &view.id, Some("en"), |_| std::future::ready(true))).err().map(|f| f.code), Some("io".to_string()));
-        let book = w.state.book().unwrap();
-        assert!(book.chains[1].handed_out.is_empty() && book.chains[1].issued == 0, "the change index is free again");
-        assert!(guard(&w.net.broadcasts).is_empty());
-        // A rebuild whose change index another payment takes meanwhile does not join the lineage.
-        let (w, address) = funded("commit-index");
+        assert_eq!(w.state.book().unwrap().chains[1].handed_out.iter().copied().collect::<Vec<_>>(), vec![0]);
+        assert!(guard(&w.net.broadcasts).is_empty() && store::load::<Vec<Sent>>(&w.state.sent_path()).is_empty());
+        // A rebuild whose record fails does not join the lineage, and an earlier version with the same txid
+        // (the same plan signed before) stays where it was.
+        let (w, address) = funded("commit-rebuild-io");
         let t = ml_record(&w, &address, &"78".repeat(32), "rejected", &[format!("{}:0", "d".repeat(64))]);
+        *guard(&w.net.state) = m4_state(H4T + 12, true);
+        let r = block(rebuild_plan(&w.state, &t.txid)).unwrap();
+        let plan = guard(&w.state.pending).as_ref().unwrap().plan.clone();
+        let txid = crate::tx::display_hex(&wallet::unsigned_transaction(&plan.coins, &plan.outputs, plan.lock_time).txid());
+        let root = Version { txid: t.txid.clone(), inputs: t.outpoints.clone() };
+        let earlier = Version { txid: txid.clone(), inputs: plan.coins.iter().map(Coin::outpoint).collect() };
+        w.state.edit_book(|b| b.add_version(&root, earlier.clone())).unwrap();
+        // The next save of the record fails: armed right before the commit (the lookups save it before).
+        *guard(&w.state.before_commit) = Some(Box::new(|state: &AppState| state.fail_sent_writes.store(1, Ordering::SeqCst)));
+        assert_eq!(block(send_plan(&w.state, &r.id, Some("en"), |_| std::future::ready(true))).err().map(|f| f.code), Some("io".to_string()));
+        let lineage = w.state.book().unwrap().lineage_of(&t.txid).unwrap().clone();
+        assert_eq!(lineage.versions, vec![root, earlier], "the earlier version with the same txid is still there");
+        // A change index another payment took meanwhile stops the commit before anything is written.
+        let (w, address) = funded("commit-index");
+        let t = ml_record(&w, &address, &"79".repeat(32), "rejected", &[format!("{}:0", "d".repeat(64))]);
         *guard(&w.net.state) = m4_state(H4T + 12, true);
         let r = block(rebuild_plan(&w.state, &t.txid)).unwrap();
         assert!(r.change > 0);
@@ -6542,10 +6463,11 @@ mod pq2_tests {
             assert!(state.edit_book(|b| b.chains[1].issue(0, &address)).unwrap());
         }));
         assert_eq!(block(send_plan(&w.state, &r.id, Some("en"), |_| std::future::ready(true))).err().map(|f| f.code), Some("coins_changed".to_string()));
-        assert!(w.state.book().unwrap().lineage_of(&t.txid).is_none(), "no version joined the lineage");
+        assert!(w.state.book().unwrap().lineage_of(&t.txid).is_none());
+        assert_eq!(store::load::<Vec<Sent>>(&w.state.sent_path()).len(), 1, "no record");
         // The wallet is replaced while the versions are looked up: the commit writes nothing anywhere.
         let (w, address) = funded("commit-session");
-        let t = ml_record(&w, &address, &"79".repeat(32), "rejected", &[format!("{}:0", "d".repeat(64))]);
+        let t = ml_record(&w, &address, &"7a".repeat(32), "rejected", &[format!("{}:0", "d".repeat(64))]);
         *guard(&w.net.state) = m4_state(H4T + 12, true);
         let r = block(rebuild_plan(&w.state, &t.txid)).unwrap();
         *guard(&w.state.before_commit) = Some(Box::new(|state: &AppState| {
@@ -6554,7 +6476,36 @@ mod pq2_tests {
         }));
         assert_eq!(block(send_plan(&w.state, &r.id, Some("en"), |_| std::future::ready(true))).err().map(|f| f.code), Some("locked".to_string()));
         let book = w.state.book().unwrap();
-        assert!(book.lineages.is_empty() && book.chains[1].handed_out.is_empty(), "nothing written into the new wallet's book");
+        assert!(book.lineages.is_empty() && book.chains[1].handed_out.is_empty());
+    }
+
+    #[test]
+    fn the_anchor_is_spent_with_whatever_other_payments_force() {
+        // T spent {X, C1} with X (3,000,000) first: X is the anchor. Twelve other unclear payments each
+        // force their Ci. The rebuild must spend X and all twelve: 13 inputs through SLH-DSA do not fit,
+        // and the rebuild is refused rather than made without its anchor.
+        let w = wallet("anchor-forced", words(0x69), true, m4_state(H4T + 10, false));
+        let address = block(new_pq2_address(&w.state)).unwrap().address;
+        let x = format!("{}:0", "9".repeat(64));
+        let cs: Vec<String> = (1..=12).map(|i| format!("{}:{i}", "8".repeat(64))).collect();
+        let mut utxos = vec![utxo('9', 0, 3_000_000, H4T + 7)];
+        utxos.extend((1..=12u32).map(|i| utxo('8', i, 200_000 + u64::from(i), H4T + 7)));
+        guard(&w.net.utxos).insert(address.clone(), utxos);
+        let t = ml_record(&w, &address, &"75".repeat(32), "rejected", &[x.clone(), cs[0].clone()]);
+        let mut all: Vec<Sent> = store::load(&w.state.sent_path());
+        all[0].send = 250_000;
+        for (i, c) in cs.iter().enumerate() {
+            all.push(Sent { txid: format!("{:064x}", 0x6000 + i), signature: "slhdsa128s".into(), status: "unknown".into(), outpoints: vec![c.clone()], ..all[0].clone() });
+        }
+        store::save(&w.state.sent_path(), &all).unwrap();
+        *guard(&w.net.state) = m4_state(H4T + 12, true);
+        assert_eq!(block(rebuild_plan(&w.state, &t.txid)).unwrap_err().code, "too_large");
+        // With fewer payments waiting, the anchor and their coins pay.
+        all.truncate(6);
+        store::save(&w.state.sent_path(), &all).unwrap();
+        let view = block(rebuild_plan(&w.state, &t.txid)).unwrap();
+        let coins: Vec<String> = guard(&w.state.pending).as_ref().unwrap().plan.coins.iter().map(Coin::outpoint).collect();
+        assert!(coins.contains(&x) && cs[..5].iter().all(|c| coins.contains(c)) && view.inputs == 6);
     }
 
     #[test]
@@ -6607,34 +6558,6 @@ mod pq2_tests {
         // It passes the record's retry rules (it shares an input with every one of them) and goes out.
         let sent = block(send_plan(&w.state, &view.id, Some("en"), |_| std::future::ready(true))).unwrap();
         assert!(matches!(sent.result, BroadcastResult::Sent { .. }), "{sent:?}");
-    }
-
-    #[test]
-    fn the_cover_counts_the_inputs_other_payments_already_force() {
-        let w = wallet("cover-forced", words(0x69), true, m4_state(H4T + 10, false));
-        let address = block(new_pq2_address(&w.state)).unwrap().address;
-        // X of 3,000,000 and C1..C12 of 200,000 + i.
-        let x = format!("{}:0", "9".repeat(64));
-        let cs: Vec<String> = (1..=12).map(|i| format!("{}:{i}", "8".repeat(64))).collect();
-        let mut utxos = vec![utxo('9', 0, 3_000_000, H4T + 7)];
-        utxos.extend((1..=12u32).map(|i| utxo('8', i, 200_000 + u64::from(i), H4T + 7)));
-        guard(&w.net.utxos).insert(address.clone(), utxos);
-        // T spent {X, C1} through ML-DSA-44 and was refused; twelve other unclear payments of the address
-        // each spent one Ci, which the retry rules force.
-        let t = ml_record(&w, &address, &"75".repeat(32), "rejected", &[x.clone(), cs[0].clone()]);
-        let mut all: Vec<Sent> = store::load(&w.state.sent_path());
-        all[0].send = 250_000;
-        for (i, c) in cs.iter().enumerate() {
-            all.push(Sent { txid: format!("{:064x}", 0x6000 + i), signature: "slhdsa128s".into(), status: "unknown".into(), outpoints: vec![c.clone()], ..all[0].clone() });
-        }
-        store::save(&w.state.sent_path(), &all).unwrap();
-        *guard(&w.net.state) = m4_state(H4T + 12, true);
-        // C1, forced for its own payment, already conflicts with T: X is not added.
-        let view = block(rebuild_plan(&w.state, &t.txid)).unwrap();
-        assert_eq!((view.signature, view.inputs), (Path::Slhdsa128s, 12));
-        assert!(view.size <= wallet::MAX_TX_BYTES && view.change > 0);
-        let coins: Vec<String> = guard(&w.state.pending).as_ref().unwrap().plan.coins.iter().map(Coin::outpoint).collect();
-        assert!(!coins.contains(&x) && cs.iter().all(|c| coins.contains(c)));
     }
 
     #[test]

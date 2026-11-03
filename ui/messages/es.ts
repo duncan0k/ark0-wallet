@@ -398,6 +398,7 @@ export const es: Messages = {
     no_rebuild: 'Este pago no se puede rehacer ahora',
     rebuild_original_went_out: 'El pago original salió al final (está confirmado o espera un bloque), así que no se paga de nuevo',
     rebuild_inputs_spent: 'Las monedas del pago original ya no están, así que no se paga de nuevo con otras monedas',
+    rebuild_anchor_unavailable: 'Este pago no se puede rehacer hasta que su primera moneda vuelva a estar libre',
     rebuild_no_common_input: 'Esto no gastaría ninguna moneda del pago original, así que ambos podrían salir; se detuvo',
     history_unavailable: 'El sitio aún no puede decir qué direcciones pq2 se usaron, así que la comprobación no terminó. Inténtalo más tarde; hasta entonces no se muestra ninguna dirección pq2 nueva.',
     rebuild_lineage_changed: 'Mientras tanto se hizo otra versión de este pago, así que esta no se envió; revísala de nuevo',
