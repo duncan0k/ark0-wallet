@@ -77,6 +77,19 @@ impl ChainBook {
         self.used.insert(index)
     }
 
+    /// Records a use found by a history check of reserved addresses. When it lies within a gap of the end
+    /// of the reserved range, the range is extended to a full gap past it (another copy of the wallet may
+    /// now hand out addresses up to there), and true is returned: a scan must then look further.
+    pub fn mark_found(&mut self, index: u32, address: &str) -> bool {
+        self.mark_used(index, address);
+        let top = index.saturating_add(GAP_LIMIT + 1);
+        if self.issued < top {
+            self.issued = top;
+            return true;
+        }
+        false
+    }
+
     /// The indices whose coins the wallet looks up: those it handed out and those it has seen used.
     pub fn watched(&self) -> Vec<u32> {
         self.handed_out.union(&self.used).copied().collect()

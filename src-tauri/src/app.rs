@@ -1270,7 +1270,12 @@ async fn scan_pq2(state: &AppState, wider: bool) -> Res<ScanResult> {
     // the network, and before each write to the book, both are checked again.
     let generation = state.generation();
     let wallet = guard(&state.session).as_ref().ok_or_else(|| Failure::new("locked"))?.pq2_wallet.clone().ok_or_else(|| Failure::new("pq2_unavailable"))?;
-    let book = state.edit_book_of(&wallet, generation, |b| b.clone())?;
+    // A scan needs to be finished before addresses are handed out again: set before the first use it finds
+    // is saved, cleared only after both chains and their reserved addresses are.
+    let book = state.edit_book_of(&wallet, generation, |b| {
+        b.scan_needed = true;
+        b.clone()
+    })?;
     let bound = Bound { wallet: wallet.clone(), generation };
     let answered = |state: &AppState| state.answered(&bound);
     let mut found = 0;
@@ -1389,7 +1394,9 @@ async fn check_reserved(state: &AppState, bound: &Bound, sources: &Sources, flag
     Ok(state
         .edit_book_of(&bound.wallet, bound.generation, |b| {
             for (c, i, a) in &found {
-                b.chains[*c as usize].mark_used(*i, a);
+                if b.chains[*c as usize].mark_found(*i, a) {
+                    b.scan_needed = true;
+                }
             }
             b.history_tip = Some(tip);
         })
@@ -5673,6 +5680,42 @@ mod pq2_tests {
             assert!(book.scan_needed && book.history_tip.is_none(), "answer {at_answer}: no watermark of A");
             assert!(book.chains.iter().all(|c| c.addresses.is_empty() && c.used.is_empty()), "answer {at_answer}: nothing of A");
         }
+    }
+
+    #[test]
+    fn a_use_found_later_extends_the_reserved_range_and_asks_for_a_scan() {
+        let w = wallet("extend", words(0x63), false, m4_state(H4T + 100, false));
+        // Restored with nothing found: 0 to 19 reserved, as the original wallet may have handed them out.
+        block(scan_pq2(&w.state, false)).unwrap();
+        assert_eq!(w.state.book().unwrap().chains[0].issued, 20);
+        // Index 0 is paid later: the original wallet may now hand out 20.
+        *guard(&w.net.state) = m4_state(H4T + 110, false);
+        guard(&w.net.history).insert(pq2_address(&w, 0, 0), H4T + 105);
+        block(overview_of(&w.state)).unwrap();
+        let book = w.state.book().unwrap();
+        assert!(book.chains[0].used.contains(&0));
+        assert_eq!(book.chains[0].issued, 21, "a full gap past the highest used index");
+        assert!(book.scan_needed);
+        assert_eq!(block(new_pq2_address(&w.state)).unwrap_err().code, "pq2_scan_needed");
+        block(scan_pq2(&w.state, false)).unwrap();
+        assert_eq!(block(new_pq2_address(&w.state)).unwrap().index, 21);
+    }
+
+    #[test]
+    fn a_wider_scan_cut_short_leaves_a_scan_needed() {
+        let w = wallet("wider-short", words(0x64), true, m4_state(H4T + 100, false));
+        assert!(!w.state.book().unwrap().scan_needed);
+        // The wider scan finds index 5 used on the receiving chain, then the site stops answering.
+        guard(&w.net.history).insert(pq2_address(&w, 0, 5), H4T + 50);
+        *guard(&w.net.history_ok) = Some(6);
+        assert_eq!(block(scan_pq2(&w.state, true)).unwrap_err().code, "history_unavailable");
+        let book = w.state.book().unwrap();
+        assert!(book.chains[0].used.contains(&5));
+        assert!(book.scan_needed, "no address while the use at 5 has no full gap after it");
+        assert_eq!(block(new_pq2_address(&w.state)).unwrap_err().code, "pq2_scan_needed");
+        *guard(&w.net.history_ok) = None;
+        block(scan_pq2(&w.state, true)).unwrap();
+        assert_eq!(block(new_pq2_address(&w.state)).unwrap().index, 26);
     }
 
     #[test]
