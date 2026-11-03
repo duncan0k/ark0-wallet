@@ -23,9 +23,10 @@ serde_json = "1.0.151"
 # libsecp256k1 (Bitcoin Core's library) for BIP-340 Schnorr.
 secp256k1 = { version = "=0.33.1", features = ["global-context"] }
 getrandom = "=0.4.3"
-sha2 = "=0.11.0"
-hmac = "=0.13.0"
-hkdf = "=0.13.0"
+# HKDF-SHA-512 is computed in keys.rs over hmac, so that every intermediate is wiped; the zeroize features
+# wipe the hash and MAC states and outputs when they are dropped.
+sha2 = { version = "=0.11.0", features = ["zeroize"] }
+hmac = { version = "=0.13.0", features = ["zeroize"] }
 hex = "=0.4.3"
 zeroize = "=1.9.0"
 bech32 = "=0.11.1"

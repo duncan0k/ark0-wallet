@@ -25,7 +25,6 @@
 //! index, and every pq2 output needs keys of its own.
 use crate::p2mr::{Kind, Template, MLDSA44_CONTEXT, SLHDSA128S_CONTEXT};
 use crate::{mldsa, slhdsa};
-use hkdf::Hkdf;
 use hmac::{Hmac, KeyInit, Mac};
 use secp256k1::{schnorr, Keypair, XOnlyPublicKey};
 use sha2::{Digest, Sha256, Sha512};
@@ -241,19 +240,45 @@ fn bip39_seed(entropy: &[u8; 32]) -> Result<Zeroizing<[u8; 64]>, KeyError> {
     Ok(Zeroizing::new(mnemonic.to_seed_normalized("")))
 }
 
+/// HMAC-SHA-512 of `parts` under `key`, into `out`. The keyed state is wiped when it is dropped (the
+/// zeroize features of hmac and sha2), and the result goes from the MAC's own output, which is wiped on
+/// drop too, straight into `out`.
+fn hmac_sha512_into(key: &[u8], parts: &[&[u8]], out: &mut [u8; 64]) {
+    let mut mac = <Hmac<Sha512> as KeyInit>::new_from_slice(key).expect("HMAC takes a key of any length");
+    for p in parts {
+        mac.update(p);
+    }
+    let tag = mac.finalize();
+    out.copy_from_slice(&tag.as_bytes()[..]);
+}
+
+/// HKDF-SHA-512 (RFC 5869) under the wallet's salt, filling `out` (at most 255 blocks of 64 bytes). The
+/// pseudorandom key and every block of Expand are kept in buffers that are wiped when they are dropped.
+fn hkdf_sha512(seed: &[u8; 64], info: &[u8], out: &mut [u8]) {
+    assert!(out.len() <= 255 * 64, "HKDF-SHA-512 gives at most 255 blocks");
+    let mut prk = Zeroizing::new([0u8; 64]);
+    hmac_sha512_into(HKDF_SALT, &[seed], &mut prk);
+    let mut block = Zeroizing::new([0u8; 64]);
+    for (i, chunk) in out.chunks_mut(64).enumerate() {
+        let counter = [(i + 1) as u8];
+        let previous = Zeroizing::new(*block);
+        let parts: [&[u8]; 3] = if i == 0 { [&[], info, &counter] } else { [&previous[..], info, &counter] };
+        hmac_sha512_into(prk.as_ref(), &parts, &mut block);
+        chunk.copy_from_slice(&block[..chunk.len()]);
+    }
+}
+
 /// 32 bytes for one key.
 fn hkdf32(seed: &[u8; 64], label: &[u8]) -> Zeroizing<[u8; 32]> {
-    let hk = Hkdf::<Sha512>::new(Some(HKDF_SALT), seed);
     let mut out = Zeroizing::new([0u8; 32]);
-    hk.expand(label, out.as_mut()).expect("32 bytes is a valid HKDF-SHA-512 length");
+    hkdf_sha512(seed, label, out.as_mut());
     out
 }
 
 /// 48 bytes for one SLH-DSA-SHA2-128s key.
 fn hkdf48(seed: &[u8; 64], label: &[u8]) -> Zeroizing<[u8; 48]> {
-    let hk = Hkdf::<Sha512>::new(Some(HKDF_SALT), seed);
     let mut out = Zeroizing::new([0u8; 48]);
-    hk.expand(label, out.as_mut()).expect("48 bytes is a valid HKDF-SHA-512 length");
+    hkdf_sha512(seed, label, out.as_mut());
     out
 }
 
@@ -287,7 +312,8 @@ fn legacy_material(seed: &[u8; 32]) -> Result<(Keypair, Zeroizing<[u8; 32]>), Ke
             mac.update(p);
         }
         let mut out = Zeroizing::new([0u8; 32]);
-        out.copy_from_slice(&mac.finalize().into_bytes());
+        let tag = mac.finalize();
+        out.copy_from_slice(&tag.as_bytes()[..]);
         out
     };
     let schnorr = (0..=255u8)
@@ -647,6 +673,23 @@ mod tests {
         let message = [9u8; 32];
         assert!(slhdsa::verify(&p.sign_slhdsa128s(&message).unwrap(), &message, SLHDSA128S_CONTEXT, p.slhdsa128s_public_key()));
         assert!(mldsa::verify(&p.sign_mldsa44(&message).unwrap(), &message, MLDSA44_CONTEXT, p.mldsa44_public_key()));
+    }
+
+    /// The hash and MAC states and outputs the derivation goes through are wiped when they are dropped:
+    /// this only builds with the zeroize features of sha2 and hmac enabled.
+    #[test]
+    fn derivation_states_wipe_themselves() {
+        fn wiped_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        wiped_on_drop::<<Sha512 as hmac::digest::block_api::CoreProxy>::Core>();
+        wiped_on_drop::<<Sha256 as hmac::digest::block_api::CoreProxy>::Core>();
+        wiped_on_drop::<hmac::digest::CtOutput<Hmac<Sha512>>>();
+        wiped_on_drop::<hmac::digest::block_api::Buffer<<Sha512 as hmac::digest::block_api::CoreProxy>::Core>>();
+        // Several blocks of Expand (RFC 5869 T(1) || T(2) || ...) agree with one long output's prefix.
+        let seed = [3u8; 64];
+        let (mut long, mut short) = ([0u8; 200], [0u8; 48]);
+        hkdf_sha512(&seed, b"info", &mut long);
+        hkdf_sha512(&seed, b"info", &mut short);
+        assert_eq!(long[..48], short);
     }
 
     #[test]
