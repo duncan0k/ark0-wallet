@@ -1636,9 +1636,27 @@ async fn plan_pq2_payment(state: &AppState, address: String, to: String, amount:
     // Through the SLH-DSA leaf, the fewest coins that pay (largest first), or as many as fit for "all";
     // the coins earlier payments require, and for a rebuild only the coins it needs to conflict with every
     // version of its lineage that could still confirm, go first; the rest by amount and size.
-    let mut required = if path == Path::Mldsa44 { earlier.usable.clone() } else { earlier.required.clone() };
-    if !live.is_empty() {
-        for c in conflict_set(&live, &earlier.usable).ok_or_else(|| Failure::new("rebuild_inputs_spent"))? {
+    // For a rebuild, the payments of its lineage need one small set of inputs that conflicts with each of
+    // them (every live version, and every version the retry rules would otherwise cover one by one), not
+    // a coin per payment; other payments still waiting keep their own requirement.
+    let lineage: HashSet<&str> = rebuild.iter().filter(|r| r.bound()).flat_map(|r| r.versions.iter().map(|v| v.txid.as_str())).collect();
+    let mut targets = live.clone();
+    if let Some(r) = rebuild.as_ref().filter(|r| r.bound()) {
+        for v in &r.versions {
+            if earlier.replaces.contains(&v.txid) && !targets.iter().any(|t| t.txid == v.txid) {
+                targets.push(v.clone());
+            }
+        }
+    }
+    let others_required = if lineage.is_empty() {
+        earlier.required.clone()
+    } else {
+        let others: Vec<Sent> = sent.iter().filter(|s| !lineage.contains(s.txid.as_str())).cloned().collect();
+        earlier_payments(&others, &name, &coins.spendable, &pending).required
+    };
+    let mut required = if path == Path::Mldsa44 { earlier.usable.clone() } else { others_required };
+    if !targets.is_empty() {
+        for c in conflict_set(&targets, &earlier.usable).ok_or_else(|| Failure::new("rebuild_inputs_spent"))? {
             if !required.contains(&c) {
                 required.push(c);
             }
@@ -6138,6 +6156,42 @@ mod pq2_tests {
         assert!(view.size <= wallet::MAX_TX_BYTES);
         let p = view.pq2.unwrap();
         assert_eq!(p.staying_coins, 12);
+    }
+
+    #[test]
+    fn a_rebuild_forces_one_small_conflict_set_not_a_coin_per_version() {
+        let w = wallet("cover", words(0x65), true, m4_state(H4T + 10, false));
+        let address = block(new_pq2_address(&w.state)).unwrap().address;
+        // X of 100,000 and Y1..Y13 of 200,000 + i, all usable.
+        let x = format!("{}:0", "9".repeat(64));
+        let ys: Vec<String> = (1..=13).map(|i| format!("{}:{i}", "8".repeat(64))).collect();
+        let mut utxos = vec![utxo('9', 0, 100_000, H4T + 7)];
+        utxos.extend((1..=13u32).map(|i| utxo('8', i, 200_000 + u64::from(i), H4T + 7)));
+        guard(&w.net.utxos).insert(address.clone(), utxos);
+        // T spent X and every Yi through ML-DSA-44 and was refused; 13 versions {X, Yi} are unclear.
+        let mut inputs = vec![x.clone()];
+        inputs.extend(ys.iter().cloned());
+        let mut t = ml_record(&w, &address, &"73".repeat(32), "rejected", &inputs);
+        t.send = 250_000;
+        let mut all: Vec<Sent> = store::load(&w.state.sent_path());
+        all[0].send = 250_000;
+        let root = Version { txid: t.txid.clone(), inputs: t.outpoints.clone() };
+        for (i, y) in ys.iter().enumerate() {
+            let txid = format!("{:064x}", 0x5000 + i);
+            all.push(Sent { txid: txid.clone(), signature: "slhdsa128s".into(), status: "unknown".into(), outpoints: vec![x.clone(), y.clone()], ..all[0].clone() });
+            w.state.edit_book(|b| b.add_version(&root, Version { txid, inputs: vec![x.clone(), y.clone()] })).unwrap();
+        }
+        store::save(&w.state.sent_path(), &all).unwrap();
+        *guard(&w.net.state) = m4_state(H4T + 12, true);
+        // {X, Y13} conflicts with every version and pays 250,000 with change.
+        let view = block(rebuild_plan(&w.state, &t.txid)).unwrap();
+        assert_eq!((view.signature, view.inputs, view.size), (Path::Slhdsa128s, 2, 16_124));
+        assert!(view.change > 0);
+        let coins: Vec<String> = guard(&w.state.pending).as_ref().unwrap().plan.coins.iter().map(Coin::outpoint).collect();
+        assert!(coins.contains(&x) && coins.contains(&ys[12]), "{coins:?}");
+        // It passes the record's retry rules (it shares an input with every one of them) and goes out.
+        let sent = block(send_plan(&w.state, &view.id, Some("en"), |_| std::future::ready(true))).unwrap();
+        assert!(matches!(sent.result, BroadcastResult::Sent { .. }), "{sent:?}");
     }
 
     #[test]
