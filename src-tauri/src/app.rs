@@ -199,8 +199,6 @@ struct Pq2Pending {
     index: u32,
     /// The change chain index the change goes to, handed out when the payment is recorded.
     change: Option<u32>,
-    /// The leaf the user asked for (None: the default, SLH-DSA).
-    wanted: Option<Path>,
 }
 
 /// A new wallet's words, between showing them and saving the vault.
@@ -1439,7 +1437,9 @@ async fn plan_pq2_payment(state: &AppState, address: String, to: String, amount:
     let name = account_name(Kind::Pq2, Some(&address));
     let earlier = earlier_payments(&sent, &name, &coins.spendable, &pending);
     let went_out = earlier.spent || surfaced(&sent);
-    let change_index = state.book()?.chains[CHANGE_CHAIN as usize].next().filter(|_| chain.pq2_allowed);
+    // No new address, change included, while a recovery scan is incomplete: only payments without change.
+    let book_now = state.book()?;
+    let change_index = book_now.chains[CHANGE_CHAIN as usize].next().filter(|_| chain.pq2_allowed && !book_now.scan_needed);
     let change = match change_index {
         Some(i) => Some(state.pq2_template(CHANGE_CHAIN, i)?),
         None => None,
@@ -1526,7 +1526,7 @@ async fn plan_pq2_payment(state: &AppState, address: String, to: String, amount:
     *guard(&state.pending) = Some(PendingSend {
         id: view.id.clone(), created: Instant::now(), kind: Kind::Pq2, path: account.path, destination, plan, caution, sources: flags,
         creates_pq2,
-        pq2: Some(Pq2Pending { chain: chain_index, index, change: change_index.filter(|_| change_used), wanted }),
+        pq2: Some(Pq2Pending { chain: chain_index, index, change: change_index.filter(|_| change_used) }),
         plan_address: address,
         rebuild,
     });
@@ -1698,8 +1698,10 @@ async fn send_plan<F: Future<Output = bool>>(
     // The change address is handed out before the payment is recorded: it is never given to another.
     if let Some(Pq2Pending { change: Some(index), .. }) = pending.pq2 {
         let address = state.pq2_template(CHANGE_CHAIN, index)?.address;
-        if !state.edit_book(|b| b.chains[CHANGE_CHAIN as usize].issue(index, &address))? {
-            return Err(Failure::new("coins_changed"));
+        match state.edit_book(|b| if b.scan_needed { None } else { Some(b.chains[CHANGE_CHAIN as usize].issue(index, &address)) })? {
+            None => return Err(Failure::new("pq2_scan_needed")),
+            Some(false) => return Err(Failure::new("coins_changed")),
+            Some(true) => {}
         }
     }
     let record = signed_record(&pending, &signed, sign_ms);
@@ -1800,12 +1802,15 @@ async fn recheck_payment(state: &AppState, pending: &mut PendingSend) -> Res<(Ac
             if pending.path == Path::Mldsa44 && !chain.pq2_mldsa44_allowed() {
                 return Err(Failure::new("mldsa44_disabled"));
             }
-            if chain.pq2_path(p.wanted) != pending.path {
-                return Err(Failure::new("chain_changed"));
-            }
-            // The change address is still the next one to hand out.
+            // The plan's own leaf is what is checked (pending.path): ML-DSA-44 above, and its all-coins rule
+            // below; SLH-DSA, the default or a fallback, needs nothing more.
+            // The change address is still the next one to hand out, and no scan is waiting.
             if let Some(index) = p.change {
-                if state.book()?.chains[CHANGE_CHAIN as usize].next() != Some(index) {
+                let book = state.book()?;
+                if book.scan_needed {
+                    return Err(Failure::new("pq2_scan_needed"));
+                }
+                if book.chains[CHANGE_CHAIN as usize].next() != Some(index) {
                     return Err(Failure::new("coins_changed"));
                 }
             }
@@ -5021,6 +5026,8 @@ mod pq2_tests {
         history_from: Arc<Mutex<Vec<u32>>>,
         /// Tips the history answers give, one per request, before falling back to the state's `blocks`.
         history_tips: Arc<Mutex<std::collections::VecDeque<u32>>>,
+        /// When set, history requests beyond this many fail (503 busy).
+        history_ok: Arc<Mutex<Option<usize>>>,
     }
 
     struct Wallet {
@@ -5056,6 +5063,12 @@ mod pq2_tests {
         if let Some(query) = path.strip_prefix("/api/history?") {
             if let Some((status, body)) = guard(&net.history_fails).clone() {
                 return response(status, &body);
+            }
+            if let Some(left) = guard(&net.history_ok).as_mut() {
+                if *left == 0 {
+                    return response(503, r#"{"error":"busy"}"#);
+                }
+                *left -= 1;
             }
             let mut from = 0;
             let mut addresses = Vec::new();
@@ -5676,6 +5689,45 @@ mod pq2_tests {
         assert!(guard(&w.net.broadcasts).is_empty());
         let records: Vec<Sent> = store::load(&w.state.sent_path());
         assert_eq!((records.len(), records[0].status.as_str()), (1, "mempool"));
+    }
+
+    #[test]
+    fn a_plan_that_fell_back_to_slh_can_be_confirmed() {
+        let (w, address) = dusted("fallback-confirm", 30);
+        // ML-DSA-44 asked for, but the 31 coins do not fit: the plan goes through SLH-DSA.
+        let view = block(plan_pq2_payment(&w.state, address, elsewhere(), "0.001".into(), Some(Path::Mldsa44), None)).unwrap();
+        assert_eq!(view.signature, Path::Slhdsa128s);
+        let sent = block(send_plan(&w.state, &view.id, Some("en"), |_| std::future::ready(true))).unwrap();
+        assert!(matches!(sent.result, BroadcastResult::Sent { .. }), "{sent:?}");
+    }
+
+    #[test]
+    fn no_change_address_while_a_scan_is_needed() {
+        let w = wallet("scan-change", words(0x5c), false, m4_state(H4T + 100, false));
+        // The scan finds coins at receiving index 2, then the site stops answering about history.
+        guard(&w.net.utxos).insert(pq2_address(&w, 0, 2), vec![utxo('a', 0, 300_000, H4T + 50)]);
+        *guard(&w.net.history_ok) = Some(1);
+        assert_eq!(block(scan_pq2(&w.state, false)).unwrap_err().code, "history_unavailable");
+        let book = w.state.book().unwrap();
+        assert!(book.scan_needed && book.chains[0].used.contains(&2));
+        let address = pq2_address(&w, 0, 2);
+        // The coins can be spent, but only without change: no new address while the scan is incomplete.
+        assert_eq!(block(plan_pq2_payment(&w.state, address.clone(), elsewhere(), "0.001".into(), None, None)).unwrap_err().code, "pq2_change_limit");
+        let view = block(plan_pq2_payment(&w.state, address.clone(), elsewhere(), "all".into(), None, None)).unwrap();
+        assert!(view.change == 0 && view.pq2.unwrap().change_blocked);
+        // A plan with change made before the scan became needed is refused at the final issue.
+        *guard(&w.net.history_ok) = None;
+        block(scan_pq2(&w.state, false)).unwrap();
+        let view = block(plan_pq2_payment(&w.state, address, elsewhere(), "0.001".into(), None, None)).unwrap();
+        assert!(view.change > 0);
+        let state = &w.state;
+        let result = block(send_plan(state, &view.id, Some("en"), |_| {
+            state.edit_book(|b| b.scan_needed = true).unwrap();
+            std::future::ready(true)
+        }));
+        assert_eq!(result.unwrap_err().code, "pq2_scan_needed");
+        assert!(guard(&w.net.broadcasts).is_empty());
+        assert!(w.state.book().unwrap().chains[1].handed_out.is_empty());
     }
 
     #[test]
