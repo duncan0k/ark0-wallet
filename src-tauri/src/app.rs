@@ -230,12 +230,14 @@ impl Rebuild {
     }
 }
 
-/// How the versions of a lineage stand, by the wallet's records and the address's coins now.
+/// How the versions of a lineage stand, by the wallet's records and a snapshot of the address's coins read
+/// after every one of them joined the lineage.
 enum LineageState {
     /// A version is confirmed or in the mempool: no more rebuilds.
     WentOut,
-    /// The versions that could still confirm: not replaced by a proven payment, never-sent, or with an
-    /// input that is gone (spent by a confirmed transaction that is not this version).
+    /// The versions that could still confirm: all but those whose record says replaced (by a proven
+    /// payment) and those with an input that is gone (spent by a confirmed transaction that is not this
+    /// version).
     Live(Vec<Version>),
 }
 
@@ -243,11 +245,13 @@ fn lineage_state(versions: &[Version], sent: &[Sent], coins: &Coins) -> LineageS
     let present: HashSet<String> = coins.spendable.iter().chain(&coins.pending).map(Coin::outpoint).collect();
     let mut live = Vec::new();
     for v in versions {
-        let Some(record) = sent.iter().find(|s| s.txid == v.txid) else { continue };
-        if original_went_out(record) && record.status != "replaced" {
+        let record = sent.iter().find(|s| s.txid == v.txid);
+        if record.is_some_and(|r| original_went_out(r) && r.status != "replaced") {
             return LineageState::WentOut;
         }
-        if record.status == "replaced" || !v.inputs.iter().all(|o| present.contains(o)) {
+        // Dead only when its record says replaced, or one of its inputs is absent from `coins` (read after
+        // the version joined the lineage). A version without a record is judged by its inputs too.
+        if record.is_some_and(|r| r.status == "replaced") || !v.inputs.iter().all(|o| present.contains(o)) {
             continue;
         }
         live.push(v.clone());
@@ -312,6 +316,9 @@ pub struct AppState {
     /// Tests: this many next saves of the pq2 book fail.
     #[cfg(test)]
     fail_book_writes: AtomicUsize,
+    /// Tests: this many next saves of the record of payments fail.
+    #[cfg(test)]
+    fail_sent_writes: AtomicUsize,
     /// Tests: run in a confirmation after its last wait on the network, before it commits the payment.
     #[cfg(test)]
     before_commit: Mutex<Option<Box<dyn FnMut(&AppState) + Send>>>,
@@ -347,6 +354,8 @@ impl AppState {
             commit_ops: Mutex::new(()),
             #[cfg(test)]
             fail_book_writes: AtomicUsize::new(0),
+            #[cfg(test)]
+            fail_sent_writes: AtomicUsize::new(0),
             #[cfg(test)]
             after_network_answer: Mutex::new(None),
             #[cfg(test)]
@@ -564,6 +573,17 @@ impl AppState {
                 *guard(&self.after_network_answer) = Some(hook);
             }
         }
+        self.still_current(snapshot)
+    }
+
+    /// The pq2 book of the snapshot's wallet, changed only while it is still open in the same session.
+    fn edit_book_for<R>(&self, snapshot: &Snapshot, change: impl FnOnce(&mut Book) -> R) -> Res<R> {
+        let b = snapshot.bound.as_ref().ok_or_else(|| Failure::new("pq2_unavailable"))?;
+        self.edit_book_of(&b.wallet, b.generation, change)
+    }
+
+    /// The check of `current`, alone.
+    fn still_current(&self, snapshot: &Snapshot) -> Res<()> {
         let session = guard(&self.session);
         let same = session.as_ref().is_some_and(|s| s.pq2_wallet == snapshot.bound.as_ref().map(|b| b.wallet.clone()));
         if !same || self.generation() != snapshot.generation {
@@ -1885,7 +1905,8 @@ async fn send_plan<F: Future<Output = bool>>(
     ask: impl FnOnce(crate::confirm::Dialog) -> F,
 ) -> Res<SendResult> {
     state.touch();
-    let generation = state.generation();
+    let snapshot = state.snapshot()?;
+    let generation = snapshot.generation;
     let mut pending = guard(&state.pending).take().ok_or_else(|| Failure::new("no_plan"))?;
     if pending.id != id || pending.created.elapsed() > PLAN_LIFETIME {
         return Err(Failure::new("no_plan"));
@@ -1939,7 +1960,7 @@ async fn send_plan<F: Future<Output = bool>>(
     let looked_up: Option<Vec<Version>> = match pending.rebuild.as_ref().filter(|r| r.bound()) {
         None => None,
         Some(r) => {
-            let versions = state.book()?.lineage_of(&r.root.txid).map_or_else(|| vec![r.root.clone()], |l| l.versions.clone());
+            let versions = state.edit_book_for(&snapshot, |b| b.clone())?.lineage_of(&r.root.txid).map_or_else(|| vec![r.root.clone()], |l| l.versions.clone());
             for v in &versions {
                 let status = state.sources.tx_status(&v.txid).await.value?;
                 if matches!(status, TxStatus::Confirmed { .. } | TxStatus::Mempool) {
@@ -1960,6 +1981,12 @@ async fn send_plan<F: Future<Output = bool>>(
             Some(versions)
         }
     };
+    // The coins that decide which versions could still confirm, read after every version was looked up:
+    // the last step on the network before the commit.
+    let fresh: Option<Coins> = match &looked_up {
+        Some(_) => Some(state.sources.coins(&pending.plan_address).await.value?),
+        None => None,
+    };
     #[cfg(test)]
     {
         let hook = guard(&state.before_commit).take();
@@ -1968,39 +1995,73 @@ async fn send_plan<F: Future<Output = bool>>(
         }
     }
     {
-        // One section, with no wait on the network: the rebuild's lineage as it is now (it must be the one
-        // whose versions were just looked up; a version added meanwhile means another review), the rebuild
-        // conflicting with every version that could still confirm, its joining the lineage, the change
-        // address, and the record as submitting. Another confirmation of the same payment waits here.
+        // One section, with no wait on the network. First every check, with nothing written: the wallet
+        // and session the confirmation began in; for a rebuild, its lineage as it is now (the one whose
+        // versions were looked up and judged with the fresh coins) and its conflict with every version that
+        // could still confirm; the change index still free; every precondition of the record. Then the
+        // writes: the pq2 book in one write (the version joins the lineage, the change index is handed
+        // out), then the record as submitting; if that fails, the book write is undone. Another
+        // confirmation waits here.
         let _commit = guard(&state.commit_ops);
-        if let (Some(r), Some(versions)) = (pending.rebuild.as_ref().filter(|r| r.bound()), &looked_up) {
-            let now = state.book()?.lineage_of(&r.root.txid).map_or_else(|| vec![r.root.clone()], |l| l.versions.clone());
+        state.still_current(&snapshot)?;
+        let record_coins = fresh.as_ref().unwrap_or(&coins);
+        let mut version = None;
+        if let (Some(r), Some(versions), Some(fresh)) = (pending.rebuild.as_ref().filter(|r| r.bound()), &looked_up, &fresh) {
+            let now = state.edit_book_for(&snapshot, |b| b.clone())?.lineage_of(&r.root.txid).map_or_else(|| vec![r.root.clone()], |l| l.versions.clone());
             if now != *versions {
                 return Err(Failure::new("rebuild_lineage_changed"));
             }
             let recorded: Vec<Sent> = store::load_existing(&state.sent_path()).map_err(|_| Failure::new("io"))?;
-            let LineageState::Live(live) = lineage_state(&now, &recorded, &coins) else {
+            let LineageState::Live(live) = lineage_state(&now, &recorded, fresh) else {
                 return Err(Failure::new("rebuild_original_went_out"));
             };
             if !live.iter().all(|v| pending.plan.coins.iter().any(|c| v.inputs.contains(&c.outpoint()))) {
                 return Err(Failure::new("rebuild_no_common_input"));
             }
-            let version = Version { txid: signed.txid.clone(), inputs: pending.plan.coins.iter().map(Coin::outpoint).collect() };
-            state.edit_book(|b| b.add_version(&r.root, version))?;
+            version = Some((r.root.clone(), Version { txid: signed.txid.clone(), inputs: pending.plan.coins.iter().map(Coin::outpoint).collect() }));
         }
-        // The change address is handed out before the payment is recorded: it is never given to another.
+        let mut change = None;
         if let Some(Pq2Pending { change: Some(index), .. }) = pending.pq2 {
-            let address = state.pq2_template(CHANGE_CHAIN, index)?.address;
-            match state.edit_book(|b| if b.scan_needed { None } else { Some(b.chains[CHANGE_CHAIN as usize].issue(index, &address)) })? {
-                None => return Err(Failure::new("pq2_scan_needed")),
-                Some(false) => return Err(Failure::new("coins_changed")),
-                Some(true) => {}
+            let book = state.edit_book_for(&snapshot, |b| b.clone())?;
+            if book.scan_needed {
+                return Err(Failure::new("pq2_scan_needed"));
             }
+            if book.chains[CHANGE_CHAIN as usize].next() != Some(index) {
+                return Err(Failure::new("coins_changed"));
+            }
+            let bound = snapshot.bound.as_ref().ok_or_else(|| Failure::new("pq2_unavailable"))?;
+            change = Some((index, state.pq2_template_of(&bound.wallet, bound.generation, CHANGE_CHAIN, index)?.address));
         }
         let record = signed_record(&pending, &signed, sign_ms);
-        // Recorded before the API sees it. Not sent at all when that fails, when the wallet was locked or
-        // removed meanwhile, or when another of its payments on the way spends one of the same coins.
-        record_payment(state, &pending, &coins, &spending, generation, record)?;
+        {
+            let recorded: Vec<Sent> = store::load_existing(&state.sent_path()).map_err(|_| Failure::new("io"))?;
+            record_allowed(state, &recorded, &pending, record_coins, &spending, generation, &record)?;
+        }
+        let book_write = version.is_some() || change.is_some();
+        if book_write {
+            state.edit_book_for(&snapshot, |b| {
+                if let Some((root, v)) = &version {
+                    b.add_version(root, v.clone());
+                }
+                if let Some((index, address)) = &change {
+                    b.chains[CHANGE_CHAIN as usize].issue(*index, address);
+                }
+            })?;
+        }
+        // Recorded before the API sees it. Not sent at all when that fails; then the book is as it was.
+        if let Err(e) = record_payment(state, &pending, record_coins, &spending, generation, record) {
+            if book_write {
+                let _ = state.edit_book_for(&snapshot, |b| {
+                    if let Some((_, v)) = &version {
+                        b.remove_version(&v.txid);
+                    }
+                    if let Some((index, _)) = &change {
+                        b.chains[CHANGE_CHAIN as usize].release(*index);
+                    }
+                });
+            }
+            return Err(e);
+        }
     }
     let result = state.sources.broadcast(&signed.hex, &signed.txid).await.value;
     // What the API answered; a refusal is kept too, and looked up again later (activity), because only
@@ -2155,28 +2216,35 @@ fn pending_account(pending: &PendingSend) -> String {
     }
 }
 
+/// Whether a payment may be recorded now, by the record as it is (`sent`): every precondition of
+/// `record_payment`, with nothing written.
+fn record_allowed(state: &AppState, sent: &[Sent], pending: &PendingSend, coins: &Coins, spending: &PendingCoins, generation: u64, record: &Sent) -> Res<()> {
+    if state.generation() != generation {
+        return Err(Failure::new("locked"));
+    }
+    let shared = |s: &Sent| s.outpoints.iter().any(|o| record.outpoints.contains(o));
+    let same = |s: &Sent| s.txid == record.txid;
+    if sent.iter().any(|s| s.status == "submitting") {
+        return Err(Failure::new("sending"));
+    }
+    if sent.iter().any(|s| s.status == "mempool" && !same(s) && shared(s)) {
+        return Err(Failure::new("coins_changed"));
+    }
+    // The wallet's other payments as they are now, after the dialog: one still being sent when the plan
+    // was made may since need covering (this payment must spend one of its coins), or a warning the
+    // plan was made without. Then the payment is reviewed again.
+    let earlier = earlier_payments(sent, &pending_account(pending), &coins.spendable, spending);
+    let covered = earlier.replaces.iter().all(|txid| sent.iter().any(|s| &s.txid == txid && shared(s)));
+    if !covered || (!pending.caution && (earlier.spent || earlier.elsewhere || earlier.unrecorded || surfaced(sent))) {
+        return Err(Failure::new("coins_changed"));
+    }
+    Ok(())
+}
+
 fn record_payment(state: &AppState, pending: &PendingSend, coins: &Coins, spending: &PendingCoins, generation: u64, record: Sent) -> Res<()> {
-    let account_name = pending_account(pending);
     edit_sent(state, |sent| {
-        if state.generation() != generation {
-            return Err(Failure::new("locked"));
-        }
-        let shared = |s: &Sent| s.outpoints.iter().any(|o| record.outpoints.contains(o));
+        record_allowed(state, sent, pending, coins, spending, generation, &record)?;
         let same = |s: &Sent| s.txid == record.txid;
-        if sent.iter().any(|s| s.status == "submitting") {
-            return Err(Failure::new("sending"));
-        }
-        if sent.iter().any(|s| s.status == "mempool" && !same(s) && shared(s)) {
-            return Err(Failure::new("coins_changed"));
-        }
-        // The wallet's other payments as they are now, after the dialog: one still being sent when the plan
-        // was made may since need covering (this payment must spend one of its coins), or a warning the
-        // plan was made without. Then the payment is reviewed again.
-        let earlier = earlier_payments(sent, &account_name, &coins.spendable, spending);
-        let covered = earlier.replaces.iter().all(|txid| sent.iter().any(|s| &s.txid == txid && shared(s)));
-        if !covered || (!pending.caution && (earlier.spent || earlier.elsewhere || earlier.unrecorded || surfaced(sent))) {
-            return Err(Failure::new("coins_changed"));
-        }
         // The same transaction again (an identical retry) keeps its doubt and lookup mark.
         let doubted = record.doubted || sent.iter().any(|s| same(s) && s.doubted);
         let lookup_mark = sent.iter().filter(|s| same(s)).map(|s| s.lookup_mark).max().unwrap_or(0).max(record.lookup_mark);
@@ -2212,6 +2280,10 @@ fn edit_sent<R>(state: &AppState, change: impl FnOnce(&mut Vec<Sent>) -> R) -> s
         // Never a file the wallet could not read back: the change is refused instead.
         if bytes.len() as u64 > store::MAX_FILE_BYTES {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "the record of payments is full"));
+        }
+        #[cfg(test)]
+        if state.fail_sent_writes.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok() {
+            return Err(std::io::Error::other("a failing disk (test)"));
         }
         store::write_atomic(&state.sent_path(), &bytes)?;
     }
@@ -6362,6 +6434,86 @@ mod pq2_tests {
         assert_eq!(broadcasts.len(), 2, "only R1, sent to both APIs");
         let lineage = w.state.book().unwrap().lineage_of(&t.txid).unwrap().clone();
         assert_eq!(lineage.versions.len(), 2, "T and R1 only");
+    }
+
+    #[test]
+    fn the_commit_judges_the_lineage_with_coins_read_after_it() {
+        let w = wallet("fresh-coins", words(0x6c), true, m4_state(H4T + 10, false));
+        let address = block(new_pq2_address(&w.state)).unwrap().address;
+        let (a, b) = (format!("{}:0", "d".repeat(64)), format!("{}:2", "e".repeat(64)));
+        // T spent {A, B} (98,000 and 104,176) to pay 100,000 and was refused.
+        let mut t = ml_record(&w, &address, &"77".repeat(32), "rejected", &[a.clone(), b.clone()]);
+        let mut all: Vec<Sent> = store::load(&w.state.sent_path());
+        all[0].send = 100_000;
+        t.send = 100_000;
+        store::save(&w.state.sent_path(), &all).unwrap();
+        *guard(&w.net.state) = m4_state(H4T + 12, true);
+        // A is held by another transaction: R2 spends B alone.
+        guard(&w.net.utxos).insert(address.clone(), vec![held_by('d', 0, 98_000, 'f'), utxo('e', 2, 104_176, H4T + 7)]);
+        let r2 = block(rebuild_plan(&w.state, &t.txid)).unwrap();
+        assert_eq!(guard(&w.state.pending).as_ref().unwrap().plan.coins.iter().map(Coin::outpoint).collect::<Vec<_>>(), vec![b.clone()]);
+        // While R2's dialog is open: A comes back, a new coin C confirms, B is held; R1 spends {A, C}, goes
+        // out and comes back unclear; then B comes back, and A and C are held by R1.
+        let net = w.net.clone();
+        let (address_in, t_txid) = (address.clone(), t.txid.clone());
+        let state = &w.state;
+        let result = block(send_plan(state, &r2.id, Some("en"), move |_| {
+            guard(&net.utxos).insert(address_in.clone(), vec![utxo('d', 0, 98_000, H4T + 7), utxo('c', 0, 10_400, H4T + 11), held_by('e', 2, 104_176, 'f')]);
+            let sent = std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    let r1 = block(rebuild_plan(state, &t_txid)).unwrap();
+                    block(send_plan(state, &r1.id, Some("en"), |_| std::future::ready(true)))
+                }).join().unwrap()
+            }).unwrap();
+            edit_sent(state, |all| {
+                if let Some(s) = all.iter_mut().find(|s| s.txid == sent.txid) {
+                    s.status = "unknown".into();
+                    assert_eq!(s.outpoints.len(), 2);
+                }
+            }).unwrap();
+            guard(&net.utxos).insert(address_in.clone(), vec![held_by('d', 0, 98_000, '6'), held_by('c', 0, 10_400, '6'), utxo('e', 2, 104_176, H4T + 7)]);
+            std::future::ready(true)
+        }));
+        // R1 can still confirm and R2 shares no input with it: R2 must not go out.
+        assert_eq!(result.err().map(|f| f.code), Some("rebuild_no_common_input".to_string()));
+        assert_eq!(guard(&w.net.broadcasts).len(), 2, "only R1, sent to both APIs");
+    }
+
+    #[test]
+    fn a_failed_commit_leaves_nothing_behind() {
+        // The record cannot be saved: the change address handed out in the same commit is released.
+        let (w, address) = funded("commit-io");
+        let view = block(plan_pq2_payment(&w.state, address.clone(), elsewhere(), "0.001".into(), None, None)).unwrap();
+        assert!(view.change > 0);
+        w.state.fail_sent_writes.store(1, Ordering::SeqCst);
+        assert_eq!(block(send_plan(&w.state, &view.id, Some("en"), |_| std::future::ready(true))).err().map(|f| f.code), Some("io".to_string()));
+        let book = w.state.book().unwrap();
+        assert!(book.chains[1].handed_out.is_empty() && book.chains[1].issued == 0, "the change index is free again");
+        assert!(guard(&w.net.broadcasts).is_empty());
+        // A rebuild whose change index another payment takes meanwhile does not join the lineage.
+        let (w, address) = funded("commit-index");
+        let t = ml_record(&w, &address, &"78".repeat(32), "rejected", &[format!("{}:0", "d".repeat(64))]);
+        *guard(&w.net.state) = m4_state(H4T + 12, true);
+        let r = block(rebuild_plan(&w.state, &t.txid)).unwrap();
+        assert!(r.change > 0);
+        *guard(&w.state.before_commit) = Some(Box::new(|state: &AppState| {
+            let address = state.pq2_template(1, 0).unwrap().address;
+            assert!(state.edit_book(|b| b.chains[1].issue(0, &address)).unwrap());
+        }));
+        assert_eq!(block(send_plan(&w.state, &r.id, Some("en"), |_| std::future::ready(true))).err().map(|f| f.code), Some("coins_changed".to_string()));
+        assert!(w.state.book().unwrap().lineage_of(&t.txid).is_none(), "no version joined the lineage");
+        // The wallet is replaced while the versions are looked up: the commit writes nothing anywhere.
+        let (w, address) = funded("commit-session");
+        let t = ml_record(&w, &address, &"79".repeat(32), "rejected", &[format!("{}:0", "d".repeat(64))]);
+        *guard(&w.net.state) = m4_state(H4T + 12, true);
+        let r = block(rebuild_plan(&w.state, &t.txid)).unwrap();
+        *guard(&w.state.before_commit) = Some(Box::new(|state: &AppState| {
+            state.lock();
+            state.open_session(&words(0x6d), state.generation(), true).unwrap();
+        }));
+        assert_eq!(block(send_plan(&w.state, &r.id, Some("en"), |_| std::future::ready(true))).err().map(|f| f.code), Some("locked".to_string()));
+        let book = w.state.book().unwrap();
+        assert!(book.lineages.is_empty() && book.chains[1].handed_out.is_empty(), "nothing written into the new wallet's book");
     }
 
     #[test]

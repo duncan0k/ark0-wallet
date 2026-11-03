@@ -77,6 +77,18 @@ impl ChainBook {
         self.used.insert(index)
     }
 
+    /// Gives back the index just handed out, when a payment that took it as change could not be recorded.
+    pub fn release(&mut self, index: u32) {
+        if self.handed_out.remove(&index) {
+            if !self.used.contains(&index) {
+                self.addresses.remove(&index);
+            }
+            if self.issued == index.saturating_add(1) {
+                self.issued = index;
+            }
+        }
+    }
+
     /// The indices whose coins the wallet looks up: those it handed out and those it has seen used.
     pub fn watched(&self) -> Vec<u32> {
         self.handed_out.union(&self.used).copied().collect()
@@ -148,6 +160,17 @@ impl Book {
     /// The lineage a payment belongs to, if it has been rebuilt before.
     pub fn lineage_of(&self, txid: &str) -> Option<&Lineage> {
         self.lineages.iter().find(|l| l.versions.iter().any(|v| v.txid == txid))
+    }
+
+    /// Takes a version back out of its lineage (its payment could not be recorded); a lineage left with its
+    /// original alone goes.
+    pub fn remove_version(&mut self, txid: &str) {
+        for l in &mut self.lineages {
+            if l.versions.len() > 1 && l.versions[0].txid != txid {
+                l.versions.retain(|v| v.txid != txid);
+            }
+        }
+        self.lineages.retain(|l| l.versions.len() > 1);
     }
 
     /// Records `version` as a new version of the lineage of `root` (made of `root` alone so far when it has
