@@ -11,11 +11,13 @@ use std::time::Duration;
 pub const DEFAULT_BASE: &str = "https://wallet.ark0.si";
 const TIMEOUT: Duration = Duration::from_secs(20);
 /// A GET the site answers "too many requests" or "try later" is asked again after its Retry-After seconds
-/// (RETRY_DEFAULT when it gives none it can read, at least 1 and at most RETRY_MAX), for at most RETRY_BUDGET
-/// seconds of waiting in all; then its answer stands as before. A POST is never asked again.
+/// (RETRY_DEFAULT when it gives none it can read, at least 1 and at most RETRY_MAX). The whole call, every
+/// request and every wait, ends CALL_DEADLINE seconds after it starts: a request still running then is
+/// unreachable, and a wait that would end past it is not taken (the answer then stands as before). A POST is
+/// never asked again.
 const RETRY_DEFAULT: u64 = 5;
 const RETRY_MAX: u64 = 30;
-const RETRY_BUDGET: u64 = 60;
+const CALL_DEADLINE: u64 = 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -273,10 +275,10 @@ fn try_later(status: u16, body: &Value) -> bool {
 pub struct Api {
     base: String,
     client: reqwest::Client,
-    /// One second of Retry-After (shorter in tests).
+    /// One second of Retry-After and of CALL_DEADLINE (shorter in tests).
     unit: Duration,
-    /// Seconds of waiting a GET may spend in all before its answer stands (0: none).
-    budget: u64,
+    /// Whether a GET is asked again (tests that script one answer per request turn it off).
+    retry: bool,
 }
 
 /// The seconds an answer asks to wait: its Retry-After as a number of seconds, RETRY_DEFAULT otherwise, from
@@ -315,26 +317,31 @@ impl Api {
         #[cfg(not(feature = "privnet"))]
         let builder = client_builder();
         let client = builder.build().expect("an HTTP client");
-        Api { base: base.trim_end_matches('/').to_string(), client, unit: Duration::from_secs(1), budget: RETRY_BUDGET }
+        Api { base: base.trim_end_matches('/').to_string(), client, unit: Duration::from_secs(1), retry: true }
     }
 
     pub fn base(&self) -> &str {
         &self.base
     }
 
-    /// A GET, asked again while the site says to try later (`ask_again`), within the budget. The wait holds
+    /// A GET, asked again while the site says to try later (`ask_again`), within the call's deadline. The wait holds
     /// nothing: every caller asks with no lock of the wallet's held but the address book's (app.rs), and checks
     /// after the answer that its wallet is still the open one.
     async fn get(&self, path: &str) -> Result<(u16, Value), ApiError> {
-        let mut waited = 0;
+        let deadline = tokio::time::Instant::now() + self.unit * CALL_DEADLINE as u32;
         loop {
-            let response = self.client.get(format!("{}{path}", self.base)).send().await.map_err(|_| ApiError::Unreachable)?;
-            let status = response.status().as_u16();
-            let wait = retry_after(response.headers());
-            let body: Value = serde_json::from_slice(&body_of(response).await?).map_err(|_| ApiError::Malformed)?;
-            if ask_again(status, &body) && waited + wait <= self.budget {
-                tokio::time::sleep(self.unit * wait as u32).await;
-                waited += wait;
+            // Each attempt, from connecting to the end of the body, gets only the time left.
+            let attempt = async {
+                let response = self.client.get(format!("{}{path}", self.base)).send().await.map_err(|_| ApiError::Unreachable)?;
+                let status = response.status().as_u16();
+                let wait = retry_after(response.headers());
+                let body: Value = serde_json::from_slice(&body_of(response).await?).map_err(|_| ApiError::Malformed)?;
+                Ok::<_, ApiError>((status, wait, body))
+            };
+            let (status, wait, body) = tokio::time::timeout_at(deadline, attempt).await.map_err(|_| ApiError::Unreachable)??;
+            let pause = self.unit * wait as u32;
+            if self.retry && ask_again(status, &body) && tokio::time::Instant::now() + pause < deadline {
+                tokio::time::sleep(pause).await;
                 continue;
             }
             if status == 429 {
@@ -495,7 +502,7 @@ pub(crate) mod tests {
         let mut api = Api::new(&format!("http://{}", listener.local_addr().unwrap()));
         api.client = client_builder().https_only(false).no_proxy().build().unwrap();
         // Asked once, as each test's list of answers expects; the waits have tests of their own.
-        api.budget = 0;
+        api.retry = false;
         api
     }
 
@@ -504,19 +511,17 @@ pub(crate) mod tests {
         format!("HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
     }
 
-    /// This API, waiting `unit` per second asked, with the real budget.
+    /// This API, asking again and waiting `unit` per second (of Retry-After and of the call's deadline).
     pub(crate) fn waiting(mut api: Api, unit: Duration) -> Api {
         api.unit = unit;
-        api.budget = RETRY_BUDGET;
+        api.retry = true;
         api
     }
 
-    /// The test's answers, with waits of `unit` per second asked and the real budget.
+    /// The test's answers, asked again with waits of `unit` per second.
     fn serve_waiting(responses: Vec<String>, unit: Duration) -> (Api, JoinHandle<Vec<String>>) {
-        let (mut api, server) = serve(responses);
-        api.unit = unit;
-        api.budget = RETRY_BUDGET;
-        (api, server)
+        let (api, server) = serve(responses);
+        (waiting(api, unit), server)
     }
 
     #[test]
@@ -538,19 +543,43 @@ pub(crate) mod tests {
         assert_eq!(tauri::async_runtime::block_on(api.tx_status(&"a".repeat(64))), Ok(TxStatus::Mempool));
         assert!(started.elapsed() >= unit * 35 && started.elapsed() < unit * 60);
         assert_eq!(server.join().unwrap().len(), 3);
-        // At most 60 seconds of waiting per call: 30 + 30, then the answer stands as before.
-        let (api, server) = serve_waiting(vec![limit("Retry-After: 30\r\n"); 3], unit);
+        // The call ends 60 seconds after it starts: a wait of 30, then a second that would end past 60 is not
+        // taken, and the answer stands as before.
+        let (api, server) = serve_waiting(vec![limit("Retry-After: 30\r\n"); 2], unit);
         assert_eq!(tauri::async_runtime::block_on(api.coins("tb1zaa")).map(|_| ()), Err(ApiError::Limit));
-        assert_eq!(server.join().unwrap().len(), 3);
-        let (api, server) = serve_waiting(vec![busy("Retry-After: 30\r\n"); 3], unit);
+        assert_eq!(server.join().unwrap().len(), 2);
+        let (api, server) = serve_waiting(vec![busy("Retry-After: 30\r\n"); 2], unit);
         assert_eq!(tauri::async_runtime::block_on(api.history(&["tb1zaa".to_string()], 0)), Err(ApiError::Unreachable));
-        assert_eq!(server.join().unwrap().len(), 3);
+        assert_eq!(server.join().unwrap().len(), 2);
         // Other refusals are not asked again: a 429 without "limit", a 503 of another kind, a 400.
         for other in [response(429, r#"{"error":"other"}"#), response(503, r#"{"error":"down"}"#), response(400, r#"{"error":"request"}"#)] {
             let (api, server) = serve_waiting(vec![other], unit);
             let _ = tauri::async_runtime::block_on(api.proof(&"a".repeat(64)));
             assert_eq!(server.join().unwrap().len(), 1);
         }
+    }
+
+    #[test]
+    fn a_get_ends_sixty_seconds_after_it_starts_however_slow_its_requests() {
+        // The review's case on a clock of 20 ms a second: each answer takes 19 seconds, the first two are 429
+        // with Retry-After 30, the third would succeed. Asked again only while the wait ends before the deadline,
+        // the call ends at 60 seconds: the third request is cut off by it.
+        let unit = Duration::from_millis(20);
+        let slow = move || thread::sleep(unit * 19);
+        let limit = response_with(429, "Retry-After: 30\r\n", r#"{"error":"limit"}"#);
+        let (api, _server) = serve_with(vec![limit.clone(), limit, response(200, r#"{"chain":"signet"}"#)], slow);
+        let api = waiting(api, unit);
+        let started = Instant::now();
+        let answer = tauri::async_runtime::block_on(api.state());
+        let took = started.elapsed();
+        assert!(answer.is_err(), "{answer:?}");
+        assert!(took <= unit * 60 + Duration::from_millis(150), "the call took {took:?}, past its 60 seconds");
+        // A request that does not answer at all is cut off by the deadline too.
+        let (api, _listener) = idle();
+        let api = waiting(api, unit);
+        let started = Instant::now();
+        assert_eq!(tauri::async_runtime::block_on(api.state()), Err(ApiError::Unreachable));
+        assert!(started.elapsed() <= unit * 60 + Duration::from_millis(150));
     }
 
     #[test]
