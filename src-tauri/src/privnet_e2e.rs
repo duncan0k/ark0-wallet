@@ -121,9 +121,18 @@ fn step(state: &AppState, name: &str, args: &Value) -> Value {
             let sent = tauri::async_runtime::block_on(send_plan(state, &id, Some("en"), |_| std::future::ready(true)));
             let records: Vec<Sent> = store::load(&state.sent_path());
             let mut out = json!({"plan": view, "send": now_json(sent.as_ref().map(|r| r).map_err(|f| Failure::new(&f.code))), "records": records});
-            if let Ok(SendResult { rebuilt: Some(rebuilt), .. }) = &sent {
-                review();
-                out["rebuilt_send"] = confirm(state, &rebuilt.id);
+            match &sent {
+                Ok(SendResult { rebuilt: Some(rebuilt), .. }) => {
+                    review();
+                    out["rebuilt_send"] = confirm(state, &rebuilt.id);
+                }
+                // No rebuild came with the refusal (send_plan keeps no reason): the same request again at
+                // once, to see why.
+                Ok(SendResult { rebuilt: None, txid, .. }) => {
+                    out["rebuild_at_once"] = run(rebuild_plan(state, txid));
+                    *guard(&state.pending) = None;
+                }
+                Err(_) => {}
             }
             out
         }

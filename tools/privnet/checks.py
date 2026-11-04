@@ -208,15 +208,18 @@ def check6():
     # possible without its hex; the API passed the node's reason on.
     mined = mine(1) if rebuilt_txid else None
     confirmed = {n: confirmations(n, rebuilt_txid) for n in ("n1", "n2")} if rebuilt_txid else {}
-    offers = step("plan", "c6-offers-plan", to=to, amount="0.0005", path="mldsa44", **{"from": addresses_of_check2()[1]})
+    offers = step("plan", "c6-offers-plan", to=to, amount="0.0005", path="mldsa44", **{"from": a2})
     overview = step("overview", "c6-offers-overview")
     reason = result.get("reason") if isinstance(result, dict) and result.get("kind") == "rejected" else None
+    # The node adds the input and the transaction after its message.
     expected = "mempool-script-verify-flag-failed (ML-DSA-44 signature checks are disabled in this leaf)"
+    reason_ok = bool(reason) and (reason == expected or reason.startswith(expected + ", "))
     no_ml = overview["ok"]["pq2"]["mldsa44_allowed"] is False and offers.get("ok", {}).get("signature") == "slhdsa128s"
-    ok = (reason == expected and no_ml and bool(rebuilt_txid) and all(c == 1 for c in confirmed.values()))
+    # A rebuild that came with the refusal must confirm; without one, check 6b takes it from the activity view.
+    ok = reason_ok and no_ml and (not rebuilt_txid or all(c == 1 for c in confirmed.values()))
     record("6", ok, f"drill {drill_txid} at {drill_block}; held leaf-A spend {held_txid}: {result}; ML-DSA-44 offered after: "
            f"{overview['ok']['pq2']['mldsa44_allowed']} (plan asked for it: {offers.get('ok', {}).get('signature')}, reason {offers.get('ok', {}).get('pq2', {}).get('mldsa44_reason')}); "
-           f"leaf-B spend of the same coin {rebuilt_txid}, mempool {accepted}, confirmed at {mined} {confirmed}",
+           f"rebuild with the refusal: {rebuilt_txid or held.get('rebuild_at_once')}, mempool {accepted}, confirmed at {mined} {confirmed}",
            drill=drill_txid, drill_block=drill_block, lattice_before=state_before, lattice_after=state_after, held=held,
            offers=offers, overview_pq2=pq2(overview))
 
@@ -247,7 +250,35 @@ def check8():
            below=pq2(below), above=pq2(above))
 
 
-CHECKS = {"1": check1, "3": check3, "2": check2, "4": check4, "5": check5, "6": check6, "7": check7, "8": check8}
+def check6b():
+    """After check 6, when the wallet offered no rebuild with the refusal: the activity view's offer, and the
+    rebuild through leaf B of the same coin, confirmed."""
+    held = RESULTS["6"]["held"]
+    if held.get("rebuilt_send"):
+        return record("6b", True, "the rebuild came with the refusal and was confirmed in check 6")
+    held_txid = held["send"]["ok"]["txid"]
+    coin = next(r["outpoints"] for r in held["records"] if r["txid"] == held_txid)
+    activity = step("activity", "c6b-activity")
+    item = next(a for a in activity["ok"] if a["txid"] == held_txid)
+    offers = step("plan", "c6b-offers-plan", to=node_address(), amount="0.0005", path="mldsa44", **{"from": item["address"]})
+    rebuild = step("rebuild", "c6b-rebuild", txid=held_txid, confirm=True)
+    sent = rebuild.get("send", {}).get("ok", {})
+    txid = sent.get("txid")
+    spent = cli("n1", "getrawtransaction", txid, 1)["vin"] if txid else []
+    same_coin = [f"{i['txid']}:{i['vout']}" for i in spent] == coin
+    accepted = {n: mempool_has(n, txid) for n in ("n1", "n2")} if txid else {}
+    mined = mine(1) if txid else None
+    confirmed = {n: confirmations(n, txid) for n in ("n1", "n2")} if txid else {}
+    ok = (item["rebuild"] is True and offers.get("ok", {}).get("signature") == "slhdsa128s"
+          and offers["ok"]["pq2"]["mldsa44_reason"] == "disabled" and rebuild["plan"].get("signature") == "slhdsa128s"
+          and same_coin and sent.get("result", {}).get("kind") == "sent" and all(c == 1 for c in confirmed.values()))
+    record("6b", ok, f"activity offers a rebuild of {held_txid}: {item['rebuild']}; a plan asking for ML-DSA-44 from {item['address'][:16]}...: "
+           f"{offers.get('ok', {}).get('signature')} ({offers.get('ok', {}).get('pq2', {}).get('mldsa44_reason')}); the rebuild through leaf B "
+           f"{txid} spends the same coin {coin}: {same_coin}; mempool {accepted}; confirmed at {mined} {confirmed}",
+           activity_item=item, offers=offers, rebuild=rebuild, txid=txid)
+
+
+CHECKS = {"1": check1, "3": check3, "2": check2, "4": check4, "5": check5, "6": check6, "6b": check6b, "7": check7, "8": check8}
 
 
 def main():
