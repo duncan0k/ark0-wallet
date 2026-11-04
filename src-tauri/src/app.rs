@@ -2024,7 +2024,7 @@ async fn rebuild_plan_in(state: &AppState, snapshot: &Snapshot, txid: &str) -> R
     let amount = format_coins(old.send);
     let rebuild = Rebuild::of(&state.edit_book_for(snapshot, |b| b.clone())?, &old);
     match plan_pq2_payment_in(state, snapshot.clone(), old.address.clone(), old.to.clone(), amount, Some(Path::Slhdsa128s), Some(rebuild.clone())).await {
-        Err(f) if f.code == "insufficient" || f.code == "pq2_change_limit" => {
+        Err(f) if f.code == "insufficient" || f.code == "pq2_change_limit" || f.code == "too_large" => {
             plan_pq2_payment_in(state, snapshot.clone(), old.address.clone(), old.to.clone(), "all".into(), Some(Path::Slhdsa128s), Some(rebuild)).await
         }
         other => other,
@@ -2268,7 +2268,7 @@ async fn rebuild_unsent(state: &AppState, pending: &PendingSend, snapshot: &Snap
     let to = pending.destination.address.clone();
     let rebuild = Rebuild::unsent();
     let mut plan = plan_pq2_payment_in(state, snapshot.clone(), address.clone(), to.clone(), format_coins(pending.plan.send), Some(Path::Slhdsa128s), Some(rebuild.clone())).await;
-    if matches!(&plan, Err(f) if f.code == "insufficient" || f.code == "pq2_change_limit") {
+    if matches!(&plan, Err(f) if f.code == "insufficient" || f.code == "pq2_change_limit" || f.code == "too_large") {
         plan = plan_pq2_payment_in(state, snapshot.clone(), address, to, "all".into(), Some(Path::Slhdsa128s), Some(rebuild)).await;
     }
     let plan = plan?;
@@ -6624,6 +6624,38 @@ mod pq2_tests {
         let p = block(overview_of(&w.state)).unwrap().pq2.unwrap();
         assert_eq!(p.spendable, 100_000);
         assert!(p.complete);
+    }
+
+    #[test]
+    fn a_rebuild_too_large_for_slh_dsa_pays_what_fits_keeping_its_anchor() {
+        // One pq2 address with 13 outputs of 100,000 sat, all sent through ML-DSA-44.
+        let w = wallet("too-large", words(0x7f), true, m4_state(H4T + 10, false));
+        let address = block(new_pq2_address(&w.state)).unwrap().address;
+        guard(&w.net.utxos).insert(address.clone(), (0..13).map(|v| utxo('a', v, 100_000, H4T + 7)).collect());
+        let view = block(plan_pq2_payment(&w.state, address.clone(), elsewhere(), "all".into(), Some(Path::Mldsa44), None)).unwrap();
+        assert_eq!((view.signature, view.inputs), (Path::Mldsa44, 13));
+        // Never sent: ML-DSA-44 is disabled while the dialog is open; the rebuild through SLH-DSA, 13 inputs too
+        // large, pays what 12 fit, for the user to confirm with its new amount.
+        let net = w.net.clone();
+        let result = block(send_plan(&w.state, &view.id, Some("en"), move |_| {
+            *guard(&net.state) = m4_state(H4T + 11, true);
+            std::future::ready(true)
+        })).unwrap();
+        let rebuilt = result.rebuilt.expect("a rebuild through SLH-DSA");
+        assert_eq!((rebuilt.signature, rebuilt.inputs), (Path::Slhdsa128s, 12));
+        assert!(rebuilt.send < view.send);
+        guard(&w.state.pending).take();
+        // Refused: the rebuild keeps the original's anchor among the 12.
+        let all: Vec<String> = (0..13).map(|v| format!("{}:{v}", "a".repeat(64))).collect();
+        let t = ml_record(&w, &address, &"7f".repeat(32), "rejected", &all);
+        let mut records: Vec<Sent> = store::load(&w.state.sent_path());
+        records.last_mut().unwrap().send = view.send;
+        store::save(&w.state.sent_path(), &records).unwrap();
+        let r = block(rebuild_plan(&w.state, &t.txid)).unwrap();
+        assert_eq!((r.signature, r.inputs), (Path::Slhdsa128s, 12));
+        assert!(r.send < view.send);
+        let coins: Vec<String> = guard(&w.state.pending).as_ref().unwrap().plan.coins.iter().map(Coin::outpoint).collect();
+        assert!(coins.contains(&all[0]), "the anchor is spent");
     }
 
     #[test]
