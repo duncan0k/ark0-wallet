@@ -10,6 +10,12 @@ use std::time::Duration;
 
 pub const DEFAULT_BASE: &str = "https://wallet.ark0.si";
 const TIMEOUT: Duration = Duration::from_secs(20);
+/// A GET the site answers "too many requests" or "try later" is asked again after its Retry-After seconds
+/// (RETRY_DEFAULT when it gives none it can read, at least 1 and at most RETRY_MAX), for at most RETRY_BUDGET
+/// seconds of waiting in all; then its answer stands as before. A POST is never asked again.
+const RETRY_DEFAULT: u64 = 5;
+const RETRY_MAX: u64 = 30;
+const RETRY_BUDGET: u64 = 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -267,6 +273,26 @@ fn try_later(status: u16, body: &Value) -> bool {
 pub struct Api {
     base: String,
     client: reqwest::Client,
+    /// One second of Retry-After (shorter in tests).
+    unit: Duration,
+    /// Seconds of waiting a GET may spend in all before its answer stands (0: none).
+    budget: u64,
+}
+
+/// The seconds an answer asks to wait: its Retry-After as a number of seconds, RETRY_DEFAULT otherwise, from
+/// 1 to RETRY_MAX.
+fn retry_after(headers: &reqwest::header::HeaderMap) -> u64 {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(RETRY_DEFAULT)
+        .clamp(1, RETRY_MAX)
+}
+
+/// An answer to ask again after a wait: 429 with "limit", or 503 with "busy" or "unavailable".
+fn ask_again(status: u16, body: &Value) -> bool {
+    (status == 429 && body.get("error").and_then(Value::as_str) == Some("limit")) || try_later(status, body)
 }
 
 fn client_builder() -> reqwest::ClientBuilder {
@@ -289,21 +315,33 @@ impl Api {
         #[cfg(not(feature = "privnet"))]
         let builder = client_builder();
         let client = builder.build().expect("an HTTP client");
-        Api { base: base.trim_end_matches('/').to_string(), client }
+        Api { base: base.trim_end_matches('/').to_string(), client, unit: Duration::from_secs(1), budget: RETRY_BUDGET }
     }
 
     pub fn base(&self) -> &str {
         &self.base
     }
 
+    /// A GET, asked again while the site says to try later (`ask_again`), within the budget. The wait holds
+    /// nothing: every caller asks with no lock of the wallet's held but the address book's (app.rs), and checks
+    /// after the answer that its wallet is still the open one.
     async fn get(&self, path: &str) -> Result<(u16, Value), ApiError> {
-        let response = self.client.get(format!("{}{path}", self.base)).send().await.map_err(|_| ApiError::Unreachable)?;
-        let status = response.status().as_u16();
-        let body: Value = serde_json::from_slice(&body_of(response).await?).map_err(|_| ApiError::Malformed)?;
-        if status == 429 {
-            return Err(ApiError::Limit);
+        let mut waited = 0;
+        loop {
+            let response = self.client.get(format!("{}{path}", self.base)).send().await.map_err(|_| ApiError::Unreachable)?;
+            let status = response.status().as_u16();
+            let wait = retry_after(response.headers());
+            let body: Value = serde_json::from_slice(&body_of(response).await?).map_err(|_| ApiError::Malformed)?;
+            if ask_again(status, &body) && waited + wait <= self.budget {
+                tokio::time::sleep(self.unit * wait as u32).await;
+                waited += wait;
+                continue;
+            }
+            if status == 429 {
+                return Err(ApiError::Limit);
+            }
+            return Ok((status, body));
         }
-        Ok((status, body))
     }
 
     /// Posts carry the API's own origin: the service takes posts only from its pages (a browser rule
@@ -456,7 +494,74 @@ pub(crate) mod tests {
     fn loopback(listener: &TcpListener) -> Api {
         let mut api = Api::new(&format!("http://{}", listener.local_addr().unwrap()));
         api.client = client_builder().https_only(false).no_proxy().build().unwrap();
+        // Asked once, as each test's list of answers expects; the waits have tests of their own.
+        api.budget = 0;
         api
+    }
+
+    /// An answer with headers.
+    pub(crate) fn response_with(status: u16, headers: &str, body: &str) -> String {
+        format!("HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+    }
+
+    /// This API, waiting `unit` per second asked, with the real budget.
+    pub(crate) fn waiting(mut api: Api, unit: Duration) -> Api {
+        api.unit = unit;
+        api.budget = RETRY_BUDGET;
+        api
+    }
+
+    /// The test's answers, with waits of `unit` per second asked and the real budget.
+    fn serve_waiting(responses: Vec<String>, unit: Duration) -> (Api, JoinHandle<Vec<String>>) {
+        let (mut api, server) = serve(responses);
+        api.unit = unit;
+        api.budget = RETRY_BUDGET;
+        (api, server)
+    }
+
+    #[test]
+    fn a_get_waits_as_the_site_asks_and_is_asked_again() {
+        let unit = Duration::from_millis(20);
+        let limit = |after: &str| response_with(429, after, r#"{"error":"limit"}"#);
+        let busy = |after: &str| response_with(503, after, r#"{"error":"busy"}"#);
+        let state = response(200, r#"{"chain":"signet"}"#);
+        // Retry-After 2, then none (5), then an unreadable one (5): 12 seconds waited, then the answer.
+        let (api, server) = serve_waiting(vec![limit("Retry-After: 2\r\n"), busy(""), busy("Retry-After: soon\r\n"), state.clone()], unit);
+        let started = Instant::now();
+        assert_eq!(tauri::async_runtime::block_on(api.state()), Ok(json!({"chain": "signet"})));
+        let took = started.elapsed();
+        assert_eq!(server.join().unwrap().len(), 4);
+        assert!(took >= unit * 12 && took < unit * 40, "{took:?}");
+        // A Retry-After above 30 is 30; "unavailable" is asked again too; coins, history, tx and proof as state.
+        let (api, server) = serve_waiting(vec![limit("Retry-After: 600\r\n"), response_with(503, "", r#"{"error":"unavailable"}"#), response(200, r#"{"status":"mempool"}"#)], unit);
+        let started = Instant::now();
+        assert_eq!(tauri::async_runtime::block_on(api.tx_status(&"a".repeat(64))), Ok(TxStatus::Mempool));
+        assert!(started.elapsed() >= unit * 35 && started.elapsed() < unit * 60);
+        assert_eq!(server.join().unwrap().len(), 3);
+        // At most 60 seconds of waiting per call: 30 + 30, then the answer stands as before.
+        let (api, server) = serve_waiting(vec![limit("Retry-After: 30\r\n"); 3], unit);
+        assert_eq!(tauri::async_runtime::block_on(api.coins("tb1zaa")).map(|_| ()), Err(ApiError::Limit));
+        assert_eq!(server.join().unwrap().len(), 3);
+        let (api, server) = serve_waiting(vec![busy("Retry-After: 30\r\n"); 3], unit);
+        assert_eq!(tauri::async_runtime::block_on(api.history(&["tb1zaa".to_string()], 0)), Err(ApiError::Unreachable));
+        assert_eq!(server.join().unwrap().len(), 3);
+        // Other refusals are not asked again: a 429 without "limit", a 503 of another kind, a 400.
+        for other in [response(429, r#"{"error":"other"}"#), response(503, r#"{"error":"down"}"#), response(400, r#"{"error":"request"}"#)] {
+            let (api, server) = serve_waiting(vec![other], unit);
+            let _ = tauri::async_runtime::block_on(api.proof(&"a".repeat(64)));
+            assert_eq!(server.join().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn a_post_is_never_asked_again() {
+        let unit = Duration::from_millis(20);
+        let (api, server) = serve_waiting(vec![response_with(429, "Retry-After: 1\r\n", r#"{"error":"limit"}"#)], unit);
+        assert_eq!(tauri::async_runtime::block_on(api.broadcast("00", &"a".repeat(64))), BroadcastResult::Failed { error: "limit".into() });
+        assert_eq!(server.join().unwrap().len(), 1);
+        let (api, server) = serve_waiting(vec![response_with(503, "Retry-After: 1\r\n", r#"{"error":"unavailable"}"#)], unit);
+        assert_eq!(tauri::async_runtime::block_on(api.broadcast("00", &"a".repeat(64))), BroadcastResult::Failed { error: "unavailable".into() });
+        assert_eq!(server.join().unwrap().len(), 1);
     }
 
     pub(crate) fn serve_with(responses: Vec<String>, before_reply: impl Fn() + Send + 'static) -> (Api, JoinHandle<Vec<String>>) {

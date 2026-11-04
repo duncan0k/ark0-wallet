@@ -5522,6 +5522,8 @@ mod pq2_tests {
         history_tips: Arc<Mutex<std::collections::VecDeque<u32>>>,
         /// When set, history requests beyond this many fail (503 busy).
         history_ok: Arc<Mutex<Option<usize>>>,
+        /// Paths answered once "too many requests" (429 limit, Retry-After 2) before they are answered.
+        limited_once: Arc<Mutex<Vec<String>>>,
     }
 
     struct Wallet {
@@ -5542,6 +5544,13 @@ mod pq2_tests {
 
     fn answer(net: &Net, first: &str, body: &str) -> String {
         let path = first.split(' ').nth(1).unwrap_or("");
+        {
+            let mut limited = guard(&net.limited_once);
+            if let Some(i) = limited.iter().position(|p| path.starts_with(p.as_str())) {
+                limited.remove(i);
+                return crate::api::tests::response_with(429, "Retry-After: 2\r\n", r#"{"error":"limit"}"#);
+            }
+        }
         if path == "/api/state" {
             return response(200, &guard(&net.state).to_string());
         }
@@ -5658,6 +5667,11 @@ mod pq2_tests {
     }
 
     fn wallet(label: &str, secret: Secret, made_here: bool, chain: Value) -> Wallet {
+        wallet_waiting(label, secret, made_here, chain, None)
+    }
+
+    /// A wallet whose two APIs wait `unit` per second a "try later" answer asks (None: they ask once).
+    fn wallet_waiting(label: &str, secret: Secret, made_here: bool, chain: Value, unit: Option<Duration>) -> Wallet {
         let mut nonce = [0; 8];
         getrandom::fill(&mut nonce).unwrap();
         let dir = std::env::temp_dir().join(format!("pqw-pq2-{label}-{}", hex::encode(nonce)));
@@ -5666,6 +5680,10 @@ mod pq2_tests {
         *guard(&net.state) = chain;
         let (a, stop_a) = { let n = net.clone(); routed(move |first, body| answer(&n, first, body)) };
         let (b, stop_b) = { let n = net.clone(); routed(move |first, body| answer(&n, first, body)) };
+        let (a, b) = match unit {
+            Some(unit) => (crate::api::tests::waiting(a, unit), crate::api::tests::waiting(b, unit)),
+            None => (a, b),
+        };
         state.sources = Arc::new(Sources::new(a, b));
         state.open_session(&secret, state.generation(), made_here).unwrap();
         Wallet { state, net, dir, stops: vec![stop_a, stop_b] }
@@ -6154,6 +6172,34 @@ mod pq2_tests {
         assert_eq!(w.state.open_session(&words(0x73), generation, true).unwrap_err().code, "locked");
         assert_eq!(std::fs::read(w.state.pq2_path()).unwrap(), before);
         assert!(guard(&w.state.session).is_none());
+    }
+
+    #[test]
+    fn a_command_waits_for_a_busy_site_and_a_lock_meanwhile_ends_it_locked() {
+        let unit = Duration::from_millis(200);
+        // The node's state is answered "too many requests" once on each source: the command waits 2 x 200 ms
+        // with no lock of the wallet's held, then goes on.
+        let w = wallet_waiting("wait-ok", words(0x78), true, m4_state(H4T + 10, false), Some(unit));
+        guard(&w.net.limited_once).extend(["/api/state".to_string(), "/api/state".to_string()]);
+        let started = Instant::now();
+        assert_eq!(block(new_pq2_address(&w.state)).unwrap().index, 0);
+        assert!(started.elapsed() >= unit * 2);
+        assert!(guard(&w.net.limited_once).is_empty());
+        // Locked while it waits: lock() does not wait for it, and the command ends locked with nothing handed out.
+        let w = wallet_waiting("wait-lock", words(0x79), true, m4_state(H4T + 10, false), Some(unit));
+        guard(&w.net.limited_once).extend(["/api/state".to_string(), "/api/state".to_string()]);
+        std::thread::scope(|s| {
+            let state = &w.state;
+            let command = s.spawn(move || block(new_pq2_address(state)));
+            std::thread::sleep(unit / 2);
+            let locking = Instant::now();
+            state.lock();
+            assert!(locking.elapsed() < unit / 2, "lock() waited {:?}", locking.elapsed());
+            assert!(!command.is_finished());
+            assert_eq!(command.join().unwrap().unwrap_err().code, "locked");
+        });
+        let book: Book = serde_json::from_slice(&std::fs::read(w.state.pq2_path()).unwrap()).unwrap();
+        assert!(book.chains.iter().all(|c| c.handed_out.is_empty() && c.issued == 0));
     }
 
     #[test]
