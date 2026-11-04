@@ -1266,7 +1266,7 @@ async fn pq2_overview(state: &AppState, bound: Option<&Bound>, chain: &Chain, so
             }
             let found = flags.take(sources.coins(&address).await);
             state.answered(bound)?;
-            remember(state, &address, &found);
+            remember(state, bound.generation, &address, &found);
             let Ok(coins) = found else {
                 view.complete = false;
                 continue;
@@ -1338,7 +1338,7 @@ async fn overview_of(state: &AppState) -> Res<Overview> {
         // Coins are looked up for every address, shown or not: the seed alone makes it, and coins may be there.
         let found = flags.take(sources.coins(&t.address).await);
         state.current(&snapshot)?;
-        remember(state, &t.address, &found);
+        remember(state, snapshot.generation, &t.address, &found);
         let sum = |c: &[Coin]| c.iter().map(|c| c.sats).sum::<u64>();
         let (spendable, pending, incoming, n, complete) = match &found {
             Ok(c) => (sum(&c.spendable), sum(&c.pending), c.incoming.iter().map(|i| i.sats).sum(), c.spendable.len(), c.incoming_complete && !c.truncated),
@@ -1700,7 +1700,10 @@ async fn plan_payment(state: &AppState, from: Kind, to: String, amount: String) 
     let amount = parse_amount(&amount)?;
     let sources = state.sources.clone();
     let mut flags = Flags::default();
-    let chain = current_chain(&sources, &mut flags).await?;
+    // After every answer from the network, its session first: a command of a locked one uses nothing of it.
+    let chain = current_chain(&sources, &mut flags).await;
+    state.current(&snapshot)?;
+    let chain = chain?;
     // The wallet does not pay its own address before it hands that out either.
     if own.iter().any(|t| t.address == destination.address && !shown(t.kind, &chain)) {
         return Err(Failure::new("destination_not_ready"));
@@ -1709,18 +1712,23 @@ async fn plan_payment(state: &AppState, from: Kind, to: String, amount: String) 
     let creates_pq2 = own_pq2(state).contains(&destination.address);
     let account = account_for(template, &chain, None)?;
     let view_from_address = account.template.address.clone();
-    let coins = flags.take(sources.coins(&account.template.address).await)?;
-    remember(state, &account.template.address, &Ok(coins.clone()));
+    let coins = flags.take(sources.coins(&account.template.address).await);
+    state.current(&snapshot)?;
+    remember(state, snapshot.generation, &account.template.address, &coins);
+    let coins = coins?;
     // The wallet's own payments that are, or may be, on their way, looked up again first.
     let at = now();
-    let sent = refresh_sent(state, |s| {
+    let sent = refresh_sent(state, snapshot.generation, |s| {
         matches!(s.status.as_str(), "mempool" | "unknown") || (s.status == "confirmed" && !s.proven()) || (refused(s) && recent(s, at))
     }, &mut flags).await;
+    state.current(&snapshot)?;
     // One payment at a time: while one is being handed to the API, its outcome is not known yet.
     if sent.iter().any(|s| s.status == "submitting") {
         return Err(Failure::new("sending"));
     }
-    let pending = pending_everywhere(&sources, &coins, &own, &account.template.address, Some(&state.seen_coins), &mut flags).await?;
+    let pending = pending_everywhere(&sources, &coins, &own, &account.template.address, Some(&state.seen_coins), &mut flags).await;
+    state.current(&snapshot)?;
+    let pending = pending?;
     let earlier = earlier_payments(&sent, &kind_name(from), &coins.spendable, &pending);
     let went_out = earlier.spent || surfaced(&sent);
     let plan = wallet::plan_spend(&account, &earlier.usable, &earlier.required, &destination, amount, chain.lock_time_for(creates_pq2))?;
@@ -1779,7 +1787,9 @@ async fn plan_pq2_payment_in(state: &AppState, snapshot: Snapshot, address: Stri
     let amount = parse_amount(&amount)?;
     let sources = state.sources.clone();
     let mut flags = Flags::default();
-    let chain = current_chain(&sources, &mut flags).await?;
+    let chain = current_chain(&sources, &mut flags).await;
+    state.current(&snapshot)?;
+    let chain = chain?;
     // Spending waits for H4T + 6; with the lattice state unknown it goes through the SLH-DSA leaf, and
     // without change (no new pq2 output then).
     if !chain.pq2_spendable {
@@ -1793,15 +1803,16 @@ async fn plan_pq2_payment_in(state: &AppState, snapshot: Snapshot, address: Stri
     let template = state.pq2_template_of(&bound.wallet, bound.generation, chain_index, index)?;
     let coins = flags.take(sources.coins(&template.address).await);
     state.current(&snapshot)?;
-    remember(state, &template.address, &coins);
+    remember(state, snapshot.generation, &template.address, &coins);
     let coins = coins?;
     if let Some(bound) = &plan_bound {
         note_used(state, bound, chain_index, index, &address, &coins)?;
     }
     let at = now();
-    let sent = refresh_sent(state, |s| {
+    let sent = refresh_sent(state, snapshot.generation, |s| {
         matches!(s.status.as_str(), "mempool" | "unknown") || (s.status == "confirmed" && !s.proven()) || (refused(s) && recent(s, at))
     }, &mut flags).await;
+    state.current(&snapshot)?;
     if sent.iter().any(|s| s.status == "submitting") {
         return Err(Failure::new("sending"));
     }
@@ -2054,7 +2065,7 @@ async fn send_plan<F: Future<Output = bool>>(
     if pending.id != id || pending.created.elapsed() > PLAN_LIFETIME {
         return Err(Failure::new("no_plan"));
     }
-    let (account, coins, spending) = match recheck_payment(state, &mut pending).await {
+    let (account, coins, spending) = match recheck_payment(state, &snapshot, &mut pending).await {
         Err(f) if f.code == "mldsa44_disabled" => return rebuild_unsent(state, &pending, &snapshot).await,
         other => other?,
     };
@@ -2106,9 +2117,11 @@ async fn send_plan<F: Future<Output = bool>>(
         Some(r) => {
             let versions = state.edit_book_for(&snapshot, |b| b.clone())?.lineage_of(&r.root.txid).map_or_else(|| vec![r.root.clone()], |l| l.versions.clone());
             for v in &versions {
-                let status = state.sources.tx_status(&v.txid).await.value?;
+                let status = state.sources.tx_status(&v.txid).await.value;
+                state.current(&snapshot)?;
+                let status = status?;
                 if matches!(status, TxStatus::Confirmed { .. } | TxStatus::Mempool) {
-                    let _ = edit_sent(state, |sent| {
+                    let _ = edit_sent_at(state, generation, |sent| {
                         if let Some(s) = sent.iter_mut().find(|s| s.txid == v.txid) {
                             let (st, n) = match status {
                                 TxStatus::Confirmed { confirmations } => ("confirmed", confirmations.min(REQUIRED_BLOCKS - 1)),
@@ -2184,6 +2197,8 @@ async fn send_plan<F: Future<Output = bool>>(
         }
     }
     let result = state.sources.broadcast(&signed.hex, &signed.txid).await.value;
+    // The answer is written for the session that sent it only: after a lock the record stays submitting, and is
+    // looked up as unknown later.
     // What the API answered; a refusal is kept too, and looked up again later (activity), because only
     // the network can say whether the transaction went out.
     let (status, reason) = match &result {
@@ -2192,7 +2207,7 @@ async fn send_plan<F: Future<Output = bool>>(
         BroadcastResult::Rejected { reason } => ("rejected", reason.clone()),
         BroadcastResult::Failed { error } => ("failed", error.clone()),
     };
-    let _ = edit_sent(state, |sent| {
+    let wrote = edit_sent_at(state, generation, |sent| {
         if let Some(s) = sent.iter_mut().find(|s| s.txid == signed.txid) {
             s.status = status.into();
             s.reason = reason;
@@ -2200,6 +2215,9 @@ async fn send_plan<F: Future<Output = bool>>(
         }
         mark_replaced(sent);
     });
+    if matches!(&wrote, Err(f) if f.code == "locked") {
+        return Err(Failure::new("locked"));
+    }
     // A refused payment through the ML-DSA-44 leaf: whether to rebuild it is decided from the node's state,
     // not from the words of the refusal.
     let mut rebuilt = None;
@@ -2207,6 +2225,7 @@ async fn send_plan<F: Future<Output = bool>>(
     if pending.pq2.is_some() && pending.path == Path::Mldsa44 && matches!(result, BroadcastResult::Rejected { .. } | BroadcastResult::Failed { .. }) {
         let recorded: Vec<Sent> = store::load(&state.sent_path());
         let chain = current_chain(&state.sources, &mut Flags::default()).await;
+        state.current(&snapshot)?;
         let flipped = match &chain {
             Ok(c) => recorded.iter().any(|s| s.txid == signed.txid && needs_rebuild(s, c)),
             // No answer: unknown, and unknown means the SLH-DSA leaf.
@@ -2276,9 +2295,13 @@ fn kind_name_path(path: Path) -> String {
     serde_json::to_value(path).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_default()
 }
 
-async fn recheck_payment(state: &AppState, pending: &mut PendingSend) -> Res<(Account, Coins, PendingCoins)> {
+/// The confirmation's re-read of the chain and the coins, for the session of `snapshot`: after every answer
+/// from the network that session is checked first, and a lock ends it `locked` with nothing written.
+async fn recheck_payment(state: &AppState, snapshot: &Snapshot, pending: &mut PendingSend) -> Res<(Account, Coins, PendingCoins)> {
     let mut flags = pending.sources;
-    let chain = current_chain(&state.sources, &mut flags).await?;
+    let chain = current_chain(&state.sources, &mut flags).await;
+    state.current(snapshot)?;
+    let chain = chain?;
     let account = match pending.pq2 {
         Some(p) => {
             if !chain.pq2_spendable || (pending.creates_pq2 && !chain.pq2_allowed) {
@@ -2314,8 +2337,10 @@ async fn recheck_payment(state: &AppState, pending: &mut PendingSend) -> Res<(Ac
     if chain.lock_time_for(pending.creates_pq2) != pending.plan.lock_time {
         return Err(Failure::new("chain_changed"));
     }
-    let coins = flags.take(state.sources.coins(&account.template.address).await)?;
-    remember(state, &account.template.address, &Ok(coins.clone()));
+    let coins = flags.take(state.sources.coins(&account.template.address).await);
+    state.current(snapshot)?;
+    remember(state, snapshot.generation, &account.template.address, &coins);
+    let coins = coins?;
     let unspent: HashMap<String, u64> = coins.spendable.iter().map(|c| (c.outpoint(), c.sats)).collect();
     if !pending.plan.coins.iter().all(|c| unspent.get(&c.outpoint()) == Some(&c.sats)) {
         return Err(Failure::new("coins_changed"));
@@ -2329,11 +2354,14 @@ async fn recheck_payment(state: &AppState, pending: &mut PendingSend) -> Res<(Ac
         }
     }
     let at = now();
-    let sent = refresh_sent(state, |s| {
+    let sent = refresh_sent(state, snapshot.generation, |s| {
         matches!(s.status.as_str(), "mempool" | "unknown") || (s.status == "confirmed" && !s.proven()) || (refused(s) && recent(s, at))
     }, &mut flags).await;
+    state.current(snapshot)?;
     let own = state.own_templates()?;
-    let spending = pending_everywhere(&state.sources, &coins, &own, &account.template.address, None, &mut flags).await?;
+    let spending = pending_everywhere(&state.sources, &coins, &own, &account.template.address, None, &mut flags).await;
+    state.current(snapshot)?;
+    let spending = spending?;
     let earlier = earlier_payments(&sent, &pending_account(pending), &coins.spendable, &spending);
     pending.sources = flags;
     pending.caution = earlier.spent || earlier.elsewhere || earlier.unrecorded || surfaced(&sent);
@@ -2420,6 +2448,25 @@ fn edit_sent<R>(state: &AppState, change: impl FnOnce(&mut Vec<Sent>) -> R) -> s
         store::write_atomic(&state.sent_path(), &bytes)?;
     }
     Ok(result)
+}
+
+/// Err("locked") once the session of `generation` has been locked.
+fn still_generation(state: &AppState, generation: u64) -> Res<()> {
+    if state.generation() != generation {
+        return Err(Failure::new("locked"));
+    }
+    Ok(())
+}
+
+/// `edit_sent` for a command of the session of `generation`: under the commit lock, which locking also takes,
+/// and only while that is still the session's; Err(locked) otherwise, with nothing written. Not for the commit
+/// section itself, which holds that lock already.
+fn edit_sent_at<R>(state: &AppState, generation: u64, change: impl FnOnce(&mut Vec<Sent>) -> R) -> Res<R> {
+    let _commit = guard(&state.commit_ops);
+    if state.generation() != generation {
+        return Err(Failure::new("locked"));
+    }
+    edit_sent(state, change).map_err(|_| Failure::new("io"))
 }
 
 /// The record is pruned past half the size the wallet reads back.
@@ -2545,10 +2592,15 @@ const SEEN_FOR: Duration = Duration::from_secs(60);
 
 type SeenCoins = Mutex<HashMap<String, (Instant, Coins)>>;
 
-/// Keeps a successful lookup of an address's coins (`AppState::seen_coins`).
-fn remember(state: &AppState, address: &str, found: &Result<Coins, ApiError>) {
+/// Keeps a successful lookup of an address's coins (`AppState::seen_coins`), made under `generation`: only while
+/// that is still the session's. The check and the insert are under the cache's lock, and locking empties the
+/// cache after it moves the generation on, so a lookup of a locked session never stays.
+fn remember(state: &AppState, generation: u64, address: &str, found: &Result<Coins, ApiError>) {
     if let Ok(coins) = found {
-        guard(&state.seen_coins).insert(address.to_string(), (Instant::now(), coins.clone()));
+        let mut seen = guard(&state.seen_coins);
+        if state.generation() == generation {
+            seen.insert(address.to_string(), (Instant::now(), coins.clone()));
+        }
     }
 }
 
@@ -2709,12 +2761,14 @@ impl Drop for SentLookups<'_> {
 /// Looks up again the recorded transactions `due` picks, and uncovered refusals, at most 20 per refresh.
 /// The least recently started lookup goes first, in record order among equals. All refreshes share the
 /// marks and skip each other's unfinished work. One being handed to the API is left to its command.
-async fn refresh_sent(state: &AppState, due: impl Fn(&Sent) -> bool, flags: &mut Flags) -> Vec<Sent> {
-    refresh_sent_with_clock(state, due, flags, Instant::now).await
+async fn refresh_sent(state: &AppState, generation: u64, due: impl Fn(&Sent) -> bool, flags: &mut Flags) -> Vec<Sent> {
+    refresh_sent_with_clock(state, generation, due, flags, Instant::now).await
 }
 
-async fn refresh_sent_with_clock(state: &AppState, due: impl Fn(&Sent) -> bool, flags: &mut Flags, mut clock: impl FnMut() -> Instant) -> Vec<Sent> {
-    let ready = edit_sent(state, |sent| {
+/// Every write is bound to `generation`, the session of the command that refreshes: once the wallet is
+/// locked, no lookup mark and no status is written, and the command ends `locked` at its next check.
+async fn refresh_sent_with_clock(state: &AppState, generation: u64, due: impl Fn(&Sent) -> bool, flags: &mut Flags, mut clock: impl FnMut() -> Instant) -> Vec<Sent> {
+    let ready = edit_sent_at(state, generation, |sent| {
         // Still being handed to the API long after any answer would have come: the send was cut short.
         let at = now();
         for s in sent.iter_mut().filter(|s| s.status == "submitting" && at.saturating_sub(s.created) > SUBMIT_TIMEOUT_SECS) {
@@ -2732,7 +2786,7 @@ async fn refresh_sent_with_clock(state: &AppState, due: impl Fn(&Sent) -> bool, 
         }
         let picked = {
             let mut in_flight = guard(&state.sent_lookups);
-            let picked = edit_sent(state, |sent| {
+            let picked = edit_sent_at(state, generation, |sent| {
                 let taken: HashSet<&str> = sent.iter().filter(|s| s.proven()).flat_map(|s| s.outpoints.iter().map(String::as_str)).collect();
                 let picked = sent.iter().enumerate().filter(|(_, s)| {
                     !in_flight.contains(&s.txid) && s.status != "submitting"
@@ -2754,7 +2808,7 @@ async fn refresh_sent_with_clock(state: &AppState, due: impl Fn(&Sent) -> bool, 
         let status = lookup_sent(&state.sources, &txid, flags).await.ok();
         found.push((txid, was, mark, status));
     }
-    let refreshed = edit_sent(state, |sent| {
+    let refreshed = edit_sent_at(state, generation, |sent| {
         for (txid, was, mark, result) in &found {
             let Some(s) = sent.iter_mut().find(|s| &s.txid == txid) else { continue };
             // A failed lookup or a changed status still keeps the lookup's place in the order.
@@ -2812,7 +2866,7 @@ pub async fn activity(state: State<'_, AppState>) -> Res<Vec<ActivityItem>> {
 async fn activity_of(state: &AppState) -> Res<Vec<ActivityItem>> {
     let snapshot = state.snapshot()?;
     let at = now();
-    let sent = refresh_sent(state, |s| !s.proven() && (!settled(s) || recent(s, at)), &mut Flags::default()).await;
+    let sent = refresh_sent(state, snapshot.generation, |s| !s.proven() && (!settled(s) || recent(s, at)), &mut Flags::default()).await;
     state.current(&snapshot)?;
     // Only when there is a pq2 payment through the ML-DSA-44 leaf that did not go through is the node's
     // state read for it.
@@ -2858,14 +2912,21 @@ async fn run_drill<F: std::future::Future<Output = bool>>(
     let (_, _, mixed) = state.templates()?;
     let sources = state.sources.clone();
     let mut flags = Flags::default();
-    let chain = current_chain(&sources, &mut flags).await?;
+    // After every answer from the network, the session first.
+    let chain = current_chain(&sources, &mut flags).await;
+    still_generation(state, generation)?;
+    let chain = chain?;
     let account = account_for(mixed, &chain, Some(path))?;
-    let coins = flags.take(sources.coins(&account.template.address).await)?;
+    let coins = flags.take(sources.coins(&account.template.address).await);
+    still_generation(state, generation)?;
+    let coins = coins?;
     let largest = coins.spendable.iter().max_by_key(|c| c.sats).cloned().ok_or_else(|| Failure::new("no_coins"))?;
     let destination = parse_destination(&account.template.address)?;
     let plan = wallet::plan_spend(&account, std::slice::from_ref(&largest), &[], &destination, Amount::All, chain.lock_time())?;
     let own = { let (a, b, c) = state.templates()?; vec![a, b, c] };
-    let spending = pending_everywhere(&sources, &coins, &own, &account.template.address, None, &mut flags).await?;
+    let spending = pending_everywhere(&sources, &coins, &own, &account.template.address, None, &mut flags).await;
+    still_generation(state, generation)?;
+    let spending = spending?;
     let pending = PendingSend {
         id: String::new(), created: Instant::now(), kind: Kind::Mixed, path, destination, plan,
         // The drill dialog does not authorize paying in addition to an earlier uncertain payment.
@@ -2895,12 +2956,13 @@ async fn run_drill<F: std::future::Future<Output = bool>>(
     record_payment(state, &pending, &coins, &spending, generation, record)?;
     let verdict = sources.check(&signed.hex).await.value;
     // A check says nothing about broadcasting: keep the input protected even after a refusal or failure.
-    let _ = edit_sent(state, |sent| {
+    let _ = edit_sent_at(state, generation, |sent| {
         if let Some(s) = sent.iter_mut().find(|s| s.txid == signed.txid && s.status == "submitting") {
             s.status = "unknown".into();
         }
         mark_replaced(sent);
     });
+    still_generation(state, generation)?;
     Ok(DrillResult { verdict, signature: path, vsize: signed.sizes.vsize, size: signed.sizes.size, sign_ms })
 }
 
@@ -4030,7 +4092,7 @@ mod tests {
             let (view, mut pending, (_, coins, spending)) = tauri::async_runtime::block_on(async {
                 let view = plan_payment(&state, Kind::Schnorr, to.clone(), "0.0001".into()).await.unwrap();
                 let mut pending = guard(&state.pending).take().unwrap();
-                let checked = recheck_payment(&state, &mut pending).await.unwrap();
+                let checked = recheck_payment(&state, &state.snapshot().unwrap(), &mut pending).await.unwrap();
                 (view, pending, checked)
             });
             assert!(view.went_out && pending.caution);
@@ -4095,7 +4157,7 @@ mod tests {
             let (view, mut pending, (_, coins, spending)) = tauri::async_runtime::block_on(async {
                 let view = plan_payment(&state, Kind::Schnorr, to, "0.0001".into()).await.unwrap();
                 let mut pending = guard(&state.pending).take().unwrap();
-                let checked = recheck_payment(&state, &mut pending).await.unwrap();
+                let checked = recheck_payment(&state, &state.snapshot().unwrap(), &mut pending).await.unwrap();
                 (view, pending, checked)
             });
             assert!(view.went_out && view.unrecorded && pending.caution);
@@ -4159,7 +4221,7 @@ mod tests {
                 let (view, mut pending, (_, coins, spending)) = tauri::async_runtime::block_on(async {
                     let view = plan_payment(&state, Kind::Schnorr, to, "0.0001".into()).await.unwrap();
                     let mut pending = guard(&state.pending).take().unwrap();
-                    let checked = recheck_payment(&state, &mut pending).await.unwrap();
+                    let checked = recheck_payment(&state, &state.snapshot().unwrap(), &mut pending).await.unwrap();
                     (view, pending, checked)
                 });
                 assert!(view.unrecorded && view.sources_disagree && pending.caution);
@@ -4402,7 +4464,7 @@ mod tests {
         let (b, second) = serve(replies);
         state.sources = Arc::new(Sources::new(a, b));
         tauri::async_runtime::block_on(async {
-            for _ in 0..2 { refresh_sent(&state, |_| false, &mut Flags::default()).await; }
+            for _ in 0..2 { refresh_sent(&state, state.generation(), |_| false, &mut Flags::default()).await; }
         });
         let requests = first.join().unwrap();
         let peer_requests = second.join().unwrap();
@@ -4433,17 +4495,17 @@ mod tests {
         let (b, second) = serve(replies);
         state.sources = Arc::new(Sources::new(a, b));
         tauri::async_runtime::block_on(async {
-            refresh_sent(&state, |_| false, &mut Flags::default()).await;
+            refresh_sent(&state, state.generation(), |_| false, &mut Flags::default()).await;
             assert!(store::load_existing::<Vec<Sent>>(&state.sent_path()).unwrap().iter().all(|s| s.lookup_mark == 0));
             let at = Instant::now();
             let mut ticks = [at, at + LOOKUP_BUDGET + Duration::from_secs(1)].into_iter();
-            refresh_sent_with_clock(&state, |_| true, &mut Flags::default(), || ticks.next().unwrap()).await;
+            refresh_sent_with_clock(&state, state.generation(), |_| true, &mut Flags::default(), || ticks.next().unwrap()).await;
             assert!(store::load_existing::<Vec<Sent>>(&state.sent_path()).unwrap().iter().all(|s| s.lookup_mark == 0));
             for started in 1..=2 {
                 let at = Instant::now();
                 // The first lookup consumes the whole budget without a wall-clock delay in the test.
                 let mut ticks = [at, at, at + LOOKUP_BUDGET + Duration::from_secs(1)].into_iter();
-                refresh_sent_with_clock(&state, |_| true, &mut Flags::default(), || ticks.next().unwrap()).await;
+                refresh_sent_with_clock(&state, state.generation(), |_| true, &mut Flags::default(), || ticks.next().unwrap()).await;
                 let saved: Vec<Sent> = store::load_existing(&state.sent_path()).unwrap();
                 assert_eq!(saved.iter().map(|s| s.lookup_mark).collect::<Vec<_>>(), if started == 1 { vec![1, 0] } else { vec![1, 2] });
                 assert!(guard(&state.sent_lookups).is_empty());
@@ -4476,7 +4538,7 @@ mod tests {
         tauri::async_runtime::block_on(async {
             let at = Instant::now();
             for round in 1..=2 {
-                let sent = refresh_sent_with_clock(&state, |_| true, &mut Flags::default(), || at).await;
+                let sent = refresh_sent_with_clock(&state, state.generation(), |_| true, &mut Flags::default(), || at).await;
                 assert_eq!(sent.iter().filter(|s| s.lookup_mark > 0).count(), round * 20);
             }
         });
@@ -4508,7 +4570,7 @@ mod tests {
         tauri::async_runtime::block_on(async {
             let at = Instant::now();
             for round in 0..2 {
-                let sent = refresh_sent_with_clock(&state, |_| true, &mut Flags::default(), || at).await;
+                let sent = refresh_sent_with_clock(&state, state.generation(), |_| true, &mut Flags::default(), || at).await;
                 assert_eq!(sent.iter().map(|s| &s.txid).collect::<Vec<_>>(), records.iter().map(|s| &s.txid).collect::<Vec<_>>());
                 assert_eq!(sent.iter().map(|s| s.lookup_mark).collect::<Vec<_>>(), (round * 4 + 1..=round * 4 + 4).collect::<Vec<_>>());
             }
@@ -4545,7 +4607,7 @@ mod tests {
             for started in 1..=2 {
                 let at = Instant::now();
                 let mut ticks = [at, at, at + LOOKUP_BUDGET + Duration::from_secs(1)].into_iter();
-                let sent = tauri::async_runtime::block_on(refresh_sent_with_clock(&state, |_| true, &mut Flags::default(), || ticks.next().unwrap()));
+                let sent = tauri::async_runtime::block_on(refresh_sent_with_clock(&state, state.generation(), |_| true, &mut Flags::default(), || ticks.next().unwrap()));
                 records[started - 1].lookup_mark = started as u64;
                 assert_eq!(sent, records);
                 assert_eq!(store::load_existing::<Vec<Sent>>(&state.sent_path()).unwrap(), records);
@@ -4582,7 +4644,7 @@ mod tests {
         state.sources = sources.clone();
         let at = Instant::now();
         let mut ticks = [at, at, at + LOOKUP_BUDGET + Duration::from_secs(1)].into_iter();
-        let sent = tauri::async_runtime::block_on(refresh_sent_with_clock(&state, |_| true, &mut Flags::default(), || ticks.next().unwrap()));
+        let sent = tauri::async_runtime::block_on(refresh_sent_with_clock(&state, state.generation(), |_| true, &mut Flags::default(), || ticks.next().unwrap()));
         assert_eq!(sent.iter().map(|s| s.lookup_mark).collect::<Vec<_>>(), vec![1, 0]);
         let dir = state.dir.clone();
         drop(state);
@@ -4590,7 +4652,7 @@ mod tests {
         state.sources = sources;
         let at = Instant::now();
         let mut ticks = [at, at, at + LOOKUP_BUDGET + Duration::from_secs(1)].into_iter();
-        let sent = tauri::async_runtime::block_on(refresh_sent_with_clock(&state, |_| true, &mut Flags::default(), || ticks.next().unwrap()));
+        let sent = tauri::async_runtime::block_on(refresh_sent_with_clock(&state, state.generation(), |_| true, &mut Flags::default(), || ticks.next().unwrap()));
         assert_eq!(sent.iter().map(|s| s.lookup_mark).collect::<Vec<_>>(), vec![1, 2]);
         assert_eq!(store::load_existing::<Vec<Sent>>(&state.sent_path()).unwrap(), sent);
         for requests in [first.join().unwrap(), second.join().unwrap()] {
@@ -4632,14 +4694,14 @@ mod tests {
                 let mut right_ticks = ticks.map(|tick| tick + Duration::from_secs(1)).into_iter();
                 let mut left_flags = Flags::default();
                 let mut right_flags = Flags::default();
-                let mut left = Box::pin(refresh_sent_with_clock(&state, |_| true, &mut left_flags, || {
+                let mut left = Box::pin(refresh_sent_with_clock(&state, state.generation(), |_| true, &mut left_flags, || {
                     if count == 4 { left_ticks.next().unwrap() } else { at }
                 }));
                 poll_fn(|cx| {
                     assert!(left.as_mut().poll(cx).is_pending());
                     Poll::Ready(())
                 }).await;
-                let mut right = Box::pin(refresh_sent_with_clock(&state, |s| same_kind || s.from == "schnorr", &mut right_flags, || {
+                let mut right = Box::pin(refresh_sent_with_clock(&state, state.generation(), |s| same_kind || s.from == "schnorr", &mut right_flags, || {
                     if count == 4 { right_ticks.next().unwrap() } else { at + Duration::from_secs(1) }
                 }));
                 poll_fn(|cx| {
@@ -4667,7 +4729,7 @@ mod tests {
                 if count == 4 {
                     // D must be reached by the next round even when two refreshes started a second apart.
                     let mut next_ticks = ticks.into_iter();
-                    refresh_sent_with_clock(&state, |_| true, &mut Flags::default(), || next_ticks.next().unwrap()).await;
+                    refresh_sent_with_clock(&state, state.generation(), |_| true, &mut Flags::default(), || next_ticks.next().unwrap()).await;
                 }
             });
             for requests in [first.join().unwrap(), second.join().unwrap()] {
@@ -4700,7 +4762,7 @@ mod tests {
                 let at = Instant::now();
                 let mut ticks = [at, at, at + LOOKUP_BUDGET + Duration::from_secs(1)].into_iter();
                 let mut flags = Flags::default();
-                let mut refresh = Box::pin(refresh_sent_with_clock(&state, |s| !s.proven(), &mut flags, || ticks.next().unwrap()));
+                let mut refresh = Box::pin(refresh_sent_with_clock(&state, state.generation(), |s| !s.proven(), &mut flags, || ticks.next().unwrap()));
                 poll_fn(|cx| {
                     assert!(refresh.as_mut().poll(cx).is_pending());
                     Poll::Ready(())
@@ -4736,7 +4798,7 @@ mod tests {
         state.sources = Arc::new(Sources::new(a, b));
         tauri::async_runtime::block_on(async {
             let mut flags = Flags::default();
-            let mut refresh = Box::pin(refresh_sent(&state, |_| true, &mut flags));
+            let mut refresh = Box::pin(refresh_sent(&state, state.generation(), |_| true, &mut flags));
             poll_fn(|cx| {
                 assert!(refresh.as_mut().poll(cx).is_pending());
                 Poll::Ready(())
@@ -4782,13 +4844,13 @@ mod tests {
                 // Each refresh can start only one lookup, without a wall-clock delay in the test.
                 let ticks = [start, start, start + LOOKUP_BUDGET + Duration::from_secs(1)];
                 let mut payment_ticks = ticks.into_iter();
-                let sent = refresh_sent_with_clock(&state, |s| {
+                let sent = refresh_sent_with_clock(&state, state.generation(), |s| {
                     matches!(s.status.as_str(), "mempool" | "unknown") || (s.status == "confirmed" && !s.proven()) || (refused(s) && recent(s, at))
                 }, &mut Flags::default(), || payment_ticks.next().unwrap()).await;
                 assert_eq!(sent[2].proven(), started == 2);
                 assert_eq!(earlier_payments(&sent, "schnorr", &[coin('b', 50_000)], &PendingCoins::default()).elsewhere, started != 2);
                 let mut activity_ticks = ticks.into_iter();
-                let sent = refresh_sent_with_clock(&state,
+                let sent = refresh_sent_with_clock(&state, state.generation(),
                     |s| !s.proven() && (!settled(s) || recent(s, at)),
                     &mut Flags::default(), || activity_ticks.next().unwrap()).await;
                 assert_eq!(sent[2].proven(), started == 2);
@@ -4838,7 +4900,7 @@ mod tests {
             let view = plan_payment(&state, Kind::Schnorr, to, "0.0001".into()).await.unwrap();
             let mut pending = guard(&state.pending).take().unwrap();
             assert!(!pending.caution);
-            let checked = recheck_payment(&state, &mut pending).await.unwrap();
+            let checked = recheck_payment(&state, &state.snapshot().unwrap(), &mut pending).await.unwrap();
             (view, pending, checked)
         });
         assert!(view.one_source && pending.sources.one_source);
@@ -4883,7 +4945,7 @@ mod tests {
                 sent[0].confirmations = REQUIRED_BLOCKS;
                 sent[0].proof_verified = true;
             }).unwrap();
-            let (_, coins, spending) = recheck_payment(&state, &mut pending).await.unwrap();
+            let (_, coins, spending) = recheck_payment(&state, &state.snapshot().unwrap(), &mut pending).await.unwrap();
             assert!(!pending.caution);
             let dialog = crate::confirm::payment("en", pending.plan.send, &pending.destination.address, pending.plan.fee, pending.plan.change, pending.caution, pending.sources);
             assert!(!dialog.body().contains("an earlier payment"));
@@ -4922,7 +4984,7 @@ mod tests {
                 assert!(!view.went_out && !pending.caution);
                 let old = paid('1', "unknown", "schnorr", &['a']);
                 if !during_dialog { store::save(&state.sent_path(), &vec![old.clone()]).unwrap(); }
-                let (_, coins, spending) = recheck_payment(&state, &mut pending).await.unwrap();
+                let (_, coins, spending) = recheck_payment(&state, &state.snapshot().unwrap(), &mut pending).await.unwrap();
                 assert_eq!(pending.caution, !during_dialog);
                 let dialog = crate::confirm::payment("en", pending.plan.send, &pending.destination.address, pending.plan.fee, pending.plan.change, pending.caution, pending.sources);
                 assert_eq!(dialog.body().contains("an earlier payment"), !during_dialog);
@@ -5008,7 +5070,7 @@ mod tests {
                 let (view, mut pending, (_, coins, spending)) = tauri::async_runtime::block_on(async {
                     let view = plan_payment(&state, Kind::Schnorr, to.clone(), "0.0001".into()).await.unwrap();
                     let mut pending = guard(&state.pending).take().unwrap();
-                    let checked = recheck_payment(&state, &mut pending).await.unwrap();
+                    let checked = recheck_payment(&state, &state.snapshot().unwrap(), &mut pending).await.unwrap();
                     (view, pending, checked)
                 });
                 assert!(view.went_out && pending.caution);
@@ -5180,7 +5242,7 @@ mod tests {
         state.sources = Arc::new(Sources::new(api, peer));
         let old = paid('1', "mempool", "mldsa44", &['a']);
         store::save(&state.sent_path(), &vec![old.clone()]).unwrap();
-        let sent = tauri::async_runtime::block_on(refresh_sent(&state, |_| true, &mut Flags::default()));
+        let sent = tauri::async_runtime::block_on(refresh_sent(&state, state.generation(), |_| true, &mut Flags::default()));
         assert_eq!((first.join().unwrap().len(), second.join().unwrap().len()), (2, 2));
         assert_eq!(sent[0].status, "confirmed");
         assert_eq!(sent[0].confirmations, 5);
@@ -5219,7 +5281,7 @@ mod tests {
             let old = Sent { txid: txid.into(), doubted: true, ..paid('1', "mempool", "mldsa44", &['a']) };
             store::save(&state.sent_path(), &vec![old.clone()]).unwrap();
             let mut flags = Flags::default();
-            let sent = tauri::async_runtime::block_on(refresh_sent(&state, |_| true, &mut flags));
+            let sent = tauri::async_runtime::block_on(refresh_sent(&state, state.generation(), |_| true, &mut flags));
             let first = first.join().unwrap();
             let second = second.join().unwrap();
             assert_eq!((first.len(), second.len()), (2, 2));
@@ -5274,7 +5336,7 @@ mod tests {
         store::save(&state.sent_path(), &vec![Sent { txid: txid.clone(), doubted: true, ..record('a', "unknown") }]).unwrap();
         let results = tauri::async_runtime::block_on(async {
             let mut results = Vec::new();
-            for _ in 0..6 { results.push(refresh_sent(&state, |_| true, &mut Flags::default()).await); }
+            for _ in 0..6 { results.push(refresh_sent(&state, state.generation(), |_| true, &mut Flags::default()).await); }
             results
         });
         let requests = server.join().unwrap();
@@ -5365,7 +5427,7 @@ mod tests {
         assert_eq!(store::load_existing::<Vec<Sent>>(&state.sent_path()).unwrap().len(), count);
         assert_eq!(edit_sent(&state, |_| ()).unwrap_err().kind(), std::io::ErrorKind::InvalidData);
         // When the record cannot be written, the fallback read must still restore the protection in memory.
-        let view = tauri::async_runtime::block_on(refresh_sent(&state, |_| false, &mut Flags::default()));
+        let view = tauri::async_runtime::block_on(refresh_sent(&state, state.generation(), |_| false, &mut Flags::default()));
         assert_eq!(view, migrated);
         assert!(surfaced(&view));
         assert_eq!(earlier_payments(&view, "mldsa44", &[coin('a', 5_000)], &PendingCoins::default()).required, vec![coin('a', 5_000)]);
@@ -5429,7 +5491,7 @@ mod tests {
                         let view = plan_payment(&state, Kind::Schnorr, to, "0.0001".into()).await.unwrap();
                         assert_eq!(store::load_existing::<Vec<Sent>>(&state.sent_path()).unwrap()[0].lookup_mark, 1);
                         let mut pending = guard(&state.pending).take().unwrap();
-                        let checked = recheck_payment(&state, &mut pending).await.unwrap();
+                        let checked = recheck_payment(&state, &state.snapshot().unwrap(), &mut pending).await.unwrap();
                         assert_eq!(store::load_existing::<Vec<Sent>>(&state.sent_path()).unwrap()[0].lookup_mark, 2);
                         (view, pending, checked)
                     });
@@ -5475,8 +5537,8 @@ mod tests {
         store::save(&state.sent_path(), &vec![old.clone()]).unwrap();
         let mut flags = Flags::default();
         let results = tauri::async_runtime::block_on(async {
-            let first = refresh_sent(&state, |_| true, &mut flags).await;
-            let second = refresh_sent(&state, |_| true, &mut Flags::default()).await;
+            let first = refresh_sent(&state, state.generation(), |_| true, &mut flags).await;
+            let second = refresh_sent(&state, state.generation(), |_| true, &mut Flags::default()).await;
             (first, second)
         });
         first.join().unwrap();
@@ -6439,6 +6501,42 @@ mod pq2_tests {
     }
 
     #[test]
+    fn a_command_locked_while_it_waits_writes_nothing_and_ends_locked() {
+        for lookup_succeeds in [true, false] {
+            let unit = Duration::from_millis(if lookup_succeeds { 200 } else { 20 });
+            let w = wallet_waiting("locked-wait", words(0x7c), true, m4_state(H4T + 10, false), Some(unit));
+            let from = w.state.templates().unwrap().1.address;
+            guard(&w.net.utxos).insert(from.clone(), vec![utxo('9', 0, 500_000, 9_000)]);
+            // A payment of the wallet's whose outcome is unknown: a plan looks it up again (refresh_sent).
+            let unknown = ml_record(&w, &from, &"7d".repeat(32), "unknown", &[format!("{}:1", "8".repeat(64))]);
+            let mark = |w: &Wallet| store::load::<Vec<Sent>>(&w.state.sent_path()).iter().find(|s| s.txid == unknown.txid).unwrap().lookup_mark;
+            let before = mark(&w);
+            if lookup_succeeds {
+                // The lookup of the address it pays from is refused once on each source, then answered.
+                let path = format!("/api/utxos?address={from}");
+                guard(&w.net.limited_once).extend([path.clone(), path]);
+            } else {
+                // Refused until the call's deadline.
+                let mut limits = SiteLimits::deployed(unit);
+                limits.utxos = Bucket { tokens: 0.0, burst: 0.0, rate: 0.0, at: Instant::now() };
+                *guard(&w.net.limits) = Some(limits);
+            }
+            std::thread::scope(|s| {
+                let state = &w.state;
+                let to = elsewhere();
+                let command = s.spawn(move || block(plan_payment(state, Kind::Mldsa44, to, "0.001".into())));
+                std::thread::sleep(unit / 2);
+                state.lock();
+                assert_eq!(command.join().unwrap().unwrap_err().code, "locked", "lookup succeeds: {lookup_succeeds}");
+            });
+            // Nothing written after the lock: no cached lookup, no lookup mark, no plan.
+            assert!(guard(&w.state.seen_coins).is_empty(), "lookup succeeds: {lookup_succeeds}");
+            assert_eq!(mark(&w), before, "lookup succeeds: {lookup_succeeds}");
+            assert!(guard(&w.state.pending).is_none());
+        }
+    }
+
+    #[test]
     fn a_late_scan_result_never_reaches_another_wallets_book() {
         for at_answer in [1usize, 2, 21, 40] {
             let w = wallet("scan-switch", words(0x5e), false, m4_state(H4T + 100, false));
@@ -6903,11 +7001,14 @@ mod pq2_tests {
                 }
             }));
         }));
-        let result = block(send_plan(&w.state, &view.id, Some("en"), |_| std::future::ready(true))).unwrap();
+        let result = block(send_plan(&w.state, &view.id, Some("en"), |_| std::future::ready(true)));
         *guard(&w.state.after_network_answer) = None;
-        assert!(matches!(result.result, BroadcastResult::Rejected { .. }));
-        assert!(result.rebuilt.is_none());
+        // The confirmation, stale after its first answer since the commit, ends locked: its refusal recorded
+        // before, no rebuild, nothing saved.
+        assert_eq!(result.unwrap_err().code, "locked");
         assert!(guard(&w.state.pending).is_none());
+        let records: Vec<Sent> = store::load(&w.state.sent_path());
+        assert_eq!(records[0].status, "rejected");
     }
 
     #[test]
