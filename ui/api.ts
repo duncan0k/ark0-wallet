@@ -28,7 +28,7 @@ export interface Chain {
 }
 
 export type Pq2Status = 'protected' | 'pending' | 'unprotected';
-export type Pq2Blocked = 'legacy' | 'waiting' | 'unknown_state' | 'scan_needed' | 'gap_limit';
+export type Pq2Blocked = 'legacy' | 'waiting' | 'unknown_state' | 'source_not_upgraded' | 'scan_needed' | 'gap_limit';
 
 export interface Pq2Coin { txid: string; vout: number; sats: number; height: number | null; status: Pq2Status; spending: boolean }
 export interface Pq2Address { chain: number; index: number; address: string; mldsa44_fits: boolean; spendable: number; pending: number; incoming: number; coins: Pq2Coin[]; complete: boolean }

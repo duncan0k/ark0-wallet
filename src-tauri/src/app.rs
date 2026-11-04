@@ -1207,9 +1207,31 @@ fn pq2_blocked(legacy: bool, chain: &Chain, book: Option<&Book>, chain_index: u3
 /// wallet without pq2): after every answer from the network it checks that wallet is still open in the
 /// same session, and it reads and writes that wallet's book only. Err("locked") otherwise.
 async fn pq2_overview(state: &AppState, bound: Option<&Bound>, chain: &Chain, sources: &Sources, flags: &mut Flags) -> Res<Option<Pq2View>> {
-    let Some(h4t) = chain.lattice_height else { return Ok(None) };
     let read_book = || bound.and_then(|b| state.edit_book_of(&b.wallet, b.generation, |x| x.clone()).ok());
     let legacy = bound.is_none();
+    let Some(h4t) = chain.lattice_height else {
+        // One node runs the M4 rules and the other does not: no pq2 yet, and the view says why.
+        if !chain.source_not_upgraded {
+            return Ok(None);
+        }
+        let book = read_book();
+        return Ok(Some(Pq2View {
+            blocked: Some(if legacy { "legacy" } else { "source_not_upgraded" }),
+            allowed: false,
+            spend_allowed: false,
+            opens_at: crate::net::network().h4t.saturating_add(crate::chain::MARGIN),
+            mldsa44_allowed: false,
+            mldsa_disabled: None,
+            addresses: Vec::new(),
+            spendable: 0,
+            pending: 0,
+            incoming: 0,
+            complete: false,
+            change_blocked: true,
+            scanned: book.as_ref().map_or([0, 0], |b| [b.chains[0].scanned, b.chains[1].scanned]),
+            issued: book.as_ref().map_or([0, 0], |b| [b.chains[0].issued, b.chains[1].issued]),
+        }));
+    };
     let book = read_book();
     let mut view = Pq2View {
         blocked: pq2_blocked(legacy, chain, book.as_ref(), RECEIVE_CHAIN),
@@ -1367,6 +1389,9 @@ async fn new_pq2_address(state: &AppState) -> Res<NewAddress> {
     let chain = current_chain(&state.sources, &mut Flags::default()).await;
     state.current(&snapshot)?;
     let chain = chain?;
+    if chain.source_not_upgraded {
+        return Err(Failure::new("pq2_source_not_upgraded"));
+    }
     if chain.lattice_height.is_none() {
         return Err(Failure::new("address_not_ready"));
     }
@@ -5568,6 +5593,8 @@ mod pq2_tests {
         limits: Arc<Mutex<Option<SiteLimits>>>,
         /// The address of every /api/utxos request.
         asked: Arc<Mutex<Vec<String>>>,
+        /// When set, what the second source answers to /api/state (the first answers `state`).
+        state_b: Arc<Mutex<Option<Value>>>,
     }
 
     /// The deployed site's limits (web/ark0web/wallet.py): /api/utxos 20 at once and 1 a second per visitor
@@ -5788,7 +5815,13 @@ mod pq2_tests {
         let net = Net::default();
         *guard(&net.state) = chain;
         let (a, stop_a) = { let n = net.clone(); routed(move |first, body| answer(&n, first, body)) };
-        let (b, stop_b) = { let n = net.clone(); routed(move |first, body| answer(&n, first, body)) };
+        let (b, stop_b) = {
+            let n = net.clone();
+            routed(move |first, body| match guard(&n.state_b).clone() {
+                Some(state) if first.split(' ').nth(1) == Some("/api/state") => response(200, &state.to_string()),
+                _ => answer(&n, first, body),
+            })
+        };
         let (a, b) = match unit {
             Some(unit) => (crate::api::tests::waiting(a, unit), crate::api::tests::waiting(b, unit)),
             None => (a, b),
@@ -6370,6 +6403,33 @@ mod pq2_tests {
         assert_eq!(guard(&w.net.asked).len(), 2 * w.state.own_templates().unwrap().len(), "every address asked again");
         w.state.lock();
         assert!(guard(&w.state.seen_coins).is_empty());
+    }
+
+    #[test]
+    fn a_source_that_has_not_upgraded_is_named_as_the_reason() {
+        let w = wallet("not-upgraded", words(0x7b), true, m4_state(H4T + 10, false));
+        // The second node lists neither M4 deployment, nor the lattice state.
+        let mut old = m4_state(H4T + 10, false);
+        for name in ["p2mr_slhdsa128s", "p2mr_lattice_tripwire"] {
+            old["deployments"].as_object_mut().unwrap().remove(name);
+        }
+        old["tripwire"].as_object_mut().unwrap().remove("lattice");
+        *guard(&w.net.state_b) = Some(old.clone());
+        let p = block(overview_of(&w.state)).unwrap().pq2.expect("a pq2 view that says why");
+        assert_eq!((p.blocked, p.allowed, p.spend_allowed, p.opens_at), (Some("source_not_upgraded"), false, false, H4T + crate::chain::MARGIN));
+        assert!(p.addresses.is_empty() && !p.complete);
+        assert_eq!(block(new_pq2_address(&w.state)).unwrap_err().code, "pq2_source_not_upgraded");
+        // Listing one M4 deployment of the two is not that case: no pq2 view, as before.
+        let mut partial = m4_state(H4T + 10, false);
+        partial["deployments"].as_object_mut().unwrap().remove("p2mr_lattice_tripwire");
+        partial["tripwire"].as_object_mut().unwrap().remove("lattice");
+        *guard(&w.net.state_b) = Some(partial);
+        assert!(block(overview_of(&w.state)).unwrap().pq2.is_none());
+        assert_eq!(block(new_pq2_address(&w.state)).unwrap_err().code, "address_not_ready");
+        // Both upgraded: an address, as before.
+        *guard(&w.net.state_b) = None;
+        assert_eq!(block(overview_of(&w.state)).unwrap().pq2.unwrap().blocked, None);
+        assert_eq!(block(new_pq2_address(&w.state)).unwrap().index, 0);
     }
 
     #[test]

@@ -85,6 +85,7 @@ fn merge_chain(mut a: Chain, mut b: Chain) -> (Chain, bool) {
         _ => None,
     };
     a.lattice_height = a.lattice_height.filter(|h| b.lattice_height == Some(*h));
+    a.source_not_upgraded = matches!((a.m4_listed, b.m4_listed), (Some(true), Some(false)) | (Some(false), Some(true)));
     a.lattice_tip = a.lattice_tip.zip(b.lattice_tip).map(|(x, y)| x.min(y));
     a.pq2_allowed &= b.pq2_allowed && a.lattice_height.is_some();
     a.pq2_spendable &= b.pq2_spendable && a.lattice_height.is_some();

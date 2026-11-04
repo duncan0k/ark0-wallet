@@ -120,6 +120,12 @@ pub struct Chain {
     /// pq2 coins may be spent (through the SLH-DSA leaf when the state is unknown): the tip is at least
     /// H4T + 6.
     pub pq2_spendable: bool,
+    /// What the source lists of the two M4 deployments: Some(true) both, at this network's heights;
+    /// Some(false) neither; None anything else.
+    pub m4_listed: Option<bool>,
+    /// Of the two sources, one lists both M4 deployments and the other neither (`Sources::state`): one node
+    /// has not upgraded, which is why there is no pq2.
+    pub source_not_upgraded: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -299,6 +305,10 @@ pub fn check(state: &Value) -> Result<Chain, ChainProblem> {
     // Both M4 deployments, or no pq2: leaf B needs OP_CHECKSLHDSA128S, the 0xe2 leaves need H4T.
     let slhdsa128s = optional_buried(deployments, "p2mr_slhdsa128s", net.slhdsa128s_height)?;
     let lattice_height = optional_buried(deployments, "p2mr_lattice_tripwire", net.h4t)?.filter(|_| slhdsa128s.is_some());
+    let m4_listed = match (deployments.get("p2mr_slhdsa128s").is_some(), deployments.get("p2mr_lattice_tripwire").is_some()) {
+        (false, false) => Some(false),
+        _ => lattice_height.map(|_| true),
+    };
     // The state counts only for the height and leaf version the mixed address is built for, read at a
     // tip the node has reached.
     let known = state.get("tripwire").and_then(tripwire_state).filter(|(at, h3, leaf, _, _)| {
@@ -339,6 +349,8 @@ pub fn check(state: &Value) -> Result<Chain, ChainProblem> {
         lattice_tripwires: lattice.map(|(_, l)| l.2).unwrap_or_default(),
         pq2_allowed,
         pq2_spendable,
+        m4_listed,
+        source_not_upgraded: false,
     })
 }
 
