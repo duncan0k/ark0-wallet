@@ -127,6 +127,19 @@ fn step(state: &AppState, name: &str, args: &Value) -> Value {
             }
             out
         }
+        // The rebuild the wallet offers for a recorded payment (`txid`), as the activity view asks for it, and
+        // with "confirm" in the arguments, confirmed.
+        "rebuild" => {
+            let txid = args.get("txid").and_then(Value::as_str).unwrap_or_default();
+            match tauri::async_runtime::block_on(rebuild_plan(state, txid)) {
+                Ok(view) if args.get("confirm").is_some() => {
+                    let id = view.id.clone();
+                    review();
+                    json!({"plan": view, "send": confirm(state, &id)})
+                }
+                other => json!({"plan": now_json(other)}),
+            }
+        }
         other => json!({"error": format!("no step {other}")}),
     }
 }
