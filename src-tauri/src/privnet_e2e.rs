@@ -79,7 +79,12 @@ fn step(state: &AppState, name: &str, args: &Value) -> Value {
     match name {
         "overview" => run(overview_of(state)),
         "activity" => run(activity_of(state)),
-        "scan" => run(scan_pq2(state, false)),
+        // A recovery scan, timed.
+        "scan" => {
+            let started = Instant::now();
+            let result = run(scan_pq2(state, false));
+            json!({"scan": result, "seconds": started.elapsed().as_secs_f64()})
+        }
         // A new receiving address, after the scan a restored wallet needs (when it does).
         "address" => {
             let scan = match state.book() {

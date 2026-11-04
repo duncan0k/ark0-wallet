@@ -113,7 +113,8 @@ def check3():
     address = step("address", "c3-address", wallet="wallet-ac", config="wallet-ac.json")
     c_state = json.loads(subprocess.run(["curl", "-s", f"http://127.0.0.1:{privnet.SITES['C'][1]}/api/state"], capture_output=True, text=True).stdout)
     view = overview["ok"]
-    ok = "error" in address["address"] and (view["pq2"] is None or not view["pq2"]["allowed"])
+    ok = (address["address"] == {"error": "pq2_source_not_upgraded"} and view["pq2"] is not None
+          and view["pq2"]["blocked"] == "source_not_upgraded" and not view["pq2"]["allowed"])
     record("3", ok, f"tip {view['chain']['tip'] if view['chain'] else None}; sources A and C: pq2 {view['pq2'] and pq2(overview)}; new address {address['address']}",
            c_deployments=c_state.get("deployments"), c_lattice=(c_state.get("tripwire") or {}).get("lattice"),
            chain=view["chain"], problem=view["problem"], address=address)
@@ -278,7 +279,23 @@ def check6b():
            activity_item=item, offers=offers, rebuild=rebuild, txid=txid)
 
 
-CHECKS = {"1": check1, "3": check3, "2": check2, "4": check4, "5": check5, "6": check6, "6b": check6b, "7": check7, "8": check8}
+def check9():
+    """At H4T + 6, after check 2: the same words restored on another device (not made here). Its recovery scan
+    completes within the site's limits, finds every index check 2 paid, and an address is then issued."""
+    paid = addresses_of_check2()
+    scan = step("scan", "c9-scan", wallet="wallet-restored", restore=True)
+    overview = step("overview", "c9-overview", wallet="wallet-restored", restore=True)
+    address = step("address", "c9-address", wallet="wallet-restored", restore=True)
+    result = scan.get("scan", {}).get("ok", {})
+    seen = {a["address"]: a["spendable"] for a in overview["ok"]["pq2"]["addresses"]}
+    ok = (bool(result) and result.get("found") == len(paid) and all(seen.get(a) == 300_000 for a in paid)
+          and "ok" in address["address"] and address["address"]["ok"]["index"] == result["issued"][0])
+    record("9", ok, f"restored from its words at tip {overview['ok']['chain']['tip']}: scan {result or scan.get('scan')} in "
+           f"{scan.get('seconds', 0):.1f} s; coins seen on {sorted(seen.values())}; then address {address['address']}",
+           seconds=scan.get("seconds"), scan=scan, pq2=pq2(overview), address=address)
+
+
+CHECKS = {"1": check1, "3": check3, "2": check2, "9": check9, "4": check4, "5": check5, "6": check6, "6b": check6b, "7": check7, "8": check8}
 
 
 def main():
