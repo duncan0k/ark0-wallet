@@ -321,6 +321,10 @@ pub struct AppState {
     after_network_answer: Mutex<Option<Box<dyn FnMut(&AppState) + Send>>>,
     /// Lookups started by any refresh, until their results have been saved.
     sent_lookups: Mutex<HashSet<String>>,
+    /// The wallet's addresses' coins as the last lookup of each found them (SEEN_FOR at most): a plan and its
+    /// confirmation take the pending coins of the addresses they do not pay from here (`pending_everywhere`).
+    /// Emptied when the wallet locks.
+    seen_coins: SeenCoins,
     /// Counts locks. Work that began before a lock (an unlock's key derivation, a send waiting on the
     /// network or the user) neither opens a session nor signs after it.
     generation: AtomicU64,
@@ -362,6 +366,7 @@ impl AppState {
             #[cfg(test)]
             before_commit: Mutex::new(None),
             sent_lookups: Mutex::new(HashSet::new()),
+            seen_coins: Mutex::new(HashMap::new()),
             generation: AtomicU64::new(0),
             locked: watch::channel(()).0,
             _wallet_lock: wallet_lock,
@@ -411,6 +416,7 @@ impl AppState {
         *session = None;
         drop(session);
         *guard(&self.pending) = None;
+        guard(&self.seen_coins).clear();
         self.cancel_new_wallet();
     }
 
@@ -1238,6 +1244,7 @@ async fn pq2_overview(state: &AppState, bound: Option<&Bound>, chain: &Chain, so
             }
             let found = flags.take(sources.coins(&address).await);
             state.answered(bound)?;
+            remember(state, &address, &found);
             let Ok(coins) = found else {
                 view.complete = false;
                 continue;
@@ -1309,6 +1316,7 @@ async fn overview_of(state: &AppState) -> Res<Overview> {
         // Coins are looked up for every address, shown or not: the seed alone makes it, and coins may be there.
         let found = flags.take(sources.coins(&t.address).await);
         state.current(&snapshot)?;
+        remember(state, &t.address, &found);
         let sum = |c: &[Coin]| c.iter().map(|c| c.sats).sum::<u64>();
         let (spendable, pending, incoming, n, complete) = match &found {
             Ok(c) => (sum(&c.spendable), sum(&c.pending), c.incoming.iter().map(|i| i.sats).sum(), c.spendable.len(), c.incoming_complete && !c.truncated),
@@ -1677,6 +1685,7 @@ async fn plan_payment(state: &AppState, from: Kind, to: String, amount: String) 
     let account = account_for(template, &chain, None)?;
     let view_from_address = account.template.address.clone();
     let coins = flags.take(sources.coins(&account.template.address).await)?;
+    remember(state, &account.template.address, &Ok(coins.clone()));
     // The wallet's own payments that are, or may be, on their way, looked up again first.
     let at = now();
     let sent = refresh_sent(state, |s| {
@@ -1686,7 +1695,7 @@ async fn plan_payment(state: &AppState, from: Kind, to: String, amount: String) 
     if sent.iter().any(|s| s.status == "submitting") {
         return Err(Failure::new("sending"));
     }
-    let pending = pending_everywhere(&sources, &coins, &own, &account.template.address, &mut flags).await?;
+    let pending = pending_everywhere(&sources, &coins, &own, &account.template.address, Some(&state.seen_coins), &mut flags).await?;
     let earlier = earlier_payments(&sent, &kind_name(from), &coins.spendable, &pending);
     let went_out = earlier.spent || surfaced(&sent);
     let plan = wallet::plan_spend(&account, &earlier.usable, &earlier.required, &destination, amount, chain.lock_time_for(creates_pq2))?;
@@ -1759,6 +1768,7 @@ async fn plan_pq2_payment_in(state: &AppState, snapshot: Snapshot, address: Stri
     let template = state.pq2_template_of(&bound.wallet, bound.generation, chain_index, index)?;
     let coins = flags.take(sources.coins(&template.address).await);
     state.current(&snapshot)?;
+    remember(state, &template.address, &coins);
     let coins = coins?;
     if let Some(bound) = &plan_bound {
         note_used(state, bound, chain_index, index, &address, &coins)?;
@@ -1784,7 +1794,7 @@ async fn plan_pq2_payment_in(state: &AppState, snapshot: Snapshot, address: Stri
         }
         _ => None,
     };
-    let pending = pending_everywhere(&sources, &coins, &own, &template.address, &mut flags).await;
+    let pending = pending_everywhere(&sources, &coins, &own, &template.address, Some(&state.seen_coins), &mut flags).await;
     state.current(&snapshot)?;
     let pending = pending?;
     let name = account_name(Kind::Pq2, Some(&address));
@@ -2273,6 +2283,7 @@ async fn recheck_payment(state: &AppState, pending: &mut PendingSend) -> Res<(Ac
         return Err(Failure::new("chain_changed"));
     }
     let coins = flags.take(state.sources.coins(&account.template.address).await)?;
+    remember(state, &account.template.address, &Ok(coins.clone()));
     let unspent: HashMap<String, u64> = coins.spendable.iter().map(|c| (c.outpoint(), c.sats)).collect();
     if !pending.plan.coins.iter().all(|c| unspent.get(&c.outpoint()) == Some(&c.sats)) {
         return Err(Failure::new("coins_changed"));
@@ -2290,7 +2301,7 @@ async fn recheck_payment(state: &AppState, pending: &mut PendingSend) -> Res<(Ac
         matches!(s.status.as_str(), "mempool" | "unknown") || (s.status == "confirmed" && !s.proven()) || (refused(s) && recent(s, at))
     }, &mut flags).await;
     let own = state.own_templates()?;
-    let spending = pending_everywhere(&state.sources, &coins, &own, &account.template.address, &mut flags).await?;
+    let spending = pending_everywhere(&state.sources, &coins, &own, &account.template.address, None, &mut flags).await?;
     let earlier = earlier_payments(&sent, &pending_account(pending), &coins.spendable, &spending);
     pending.sources = flags;
     pending.caution = earlier.spent || earlier.elsewhere || earlier.unrecorded || surfaced(&sent);
@@ -2496,12 +2507,34 @@ struct PendingCoins {
 /// The coins being spent by mempool transactions from any of the wallet's addresses (`coins` are those
 /// of `paying`, already fetched): a payment made before the wallet was restored here, or on another
 /// device, may have gone from any of them. No answer means no plan.
-async fn pending_everywhere(sources: &Sources, coins: &Coins, own: &[Template], paying: &str, flags: &mut Flags) -> Res<PendingCoins> {
+/// How long a lookup of an address's coins stands in for another (`AppState::seen_coins`): longer than the
+/// overview's refresh (30 s), so that the addresses a payment does not pay from are not asked for again.
+const SEEN_FOR: Duration = Duration::from_secs(60);
+
+type SeenCoins = Mutex<HashMap<String, (Instant, Coins)>>;
+
+/// Keeps a successful lookup of an address's coins (`AppState::seen_coins`).
+fn remember(state: &AppState, address: &str, found: &Result<Coins, ApiError>) {
+    if let Ok(coins) = found {
+        guard(&state.seen_coins).insert(address.to_string(), (Instant::now(), coins.clone()));
+    }
+}
+
+/// The pending coins of the paying address (`coins`, just looked up) and of the wallet's other addresses. With
+/// `seen` (a plan), an address a lookup of the last SEEN_FOR found is taken from there and only the others are
+/// looked up; without it (a confirmation's re-check), every address is looked up now, as before. The other
+/// addresses only feed the warning of a coin spent by a payment no record names; a risk that appears between
+/// the plan and its confirmation still sends the payment back to review.
+async fn pending_everywhere(sources: &Sources, coins: &Coins, own: &[Template], paying: &str, seen: Option<&SeenCoins>, flags: &mut Flags) -> Res<PendingCoins> {
     let mut pending = PendingCoins {
         coins: coins.pending.clone(), spent_by: coins.spent_by.clone(), unnamed_spenders: coins.unnamed_spenders.clone(),
     };
     for t in own.iter().filter(|t| t.address != paying) {
-        let coins = flags.take(sources.coins(&t.address).await)?;
+        let recent = seen.and_then(|seen| guard(seen).get(&t.address).filter(|(at, _)| at.elapsed() <= SEEN_FOR).map(|(_, c)| c.clone()));
+        let coins = match recent {
+            Some(c) => c,
+            None => flags.take(sources.coins(&t.address).await)?,
+        };
         pending.coins.extend(coins.pending);
         for (outpoint, txids) in coins.spent_by { pending.spent_by.entry(outpoint).or_default().extend(txids); }
         pending.unnamed_spenders.extend(coins.unnamed_spenders);
@@ -2800,7 +2833,7 @@ async fn run_drill<F: std::future::Future<Output = bool>>(
     let destination = parse_destination(&account.template.address)?;
     let plan = wallet::plan_spend(&account, std::slice::from_ref(&largest), &[], &destination, Amount::All, chain.lock_time())?;
     let own = { let (a, b, c) = state.templates()?; vec![a, b, c] };
-    let spending = pending_everywhere(&sources, &coins, &own, &account.template.address, &mut flags).await?;
+    let spending = pending_everywhere(&sources, &coins, &own, &account.template.address, None, &mut flags).await?;
     let pending = PendingSend {
         id: String::new(), created: Instant::now(), kind: Kind::Mixed, path, destination, plan,
         // The drill dialog does not authorize paying in addition to an earlier uncertain payment.
@@ -4163,7 +4196,7 @@ mod tests {
         let (b, second) = serve(replies);
         let sources = Sources::new(a, b);
         let coins = Coins { pending: vec![coin('a', 50_000)], spent_by: HashMap::from([(coin('a', 0).outpoint(), HashSet::from(["1".repeat(64)]))]), ..Coins::default() };
-        let mut pending = tauri::async_runtime::block_on(pending_everywhere(&sources, &coins, &own, &own[0].address, &mut Flags::default())).unwrap();
+        let mut pending = tauri::async_runtime::block_on(pending_everywhere(&sources, &coins, &own, &own[0].address, None, &mut Flags::default())).unwrap();
         assert_eq!(pending.coins.len(), 3);
         assert_eq!(pending.spent_by.len(), 3);
         let sent = [paid('1', "mempool", "schnorr", &['a']), paid('2', "mempool", "mldsa44", &['b']), paid('3', "mempool", "mixed", &['c'])];
@@ -4197,7 +4230,7 @@ mod tests {
             } else {
                 coins.spent_by.insert(coin('a', 0).outpoint(), HashSet::from(["9".repeat(64)]));
             }
-            let pending = tauri::async_runtime::block_on(pending_everywhere(&sources, &coins, &own, &own[0].address, &mut Flags::default())).unwrap();
+            let pending = tauri::async_runtime::block_on(pending_everywhere(&sources, &coins, &own, &own[0].address, None, &mut Flags::default())).unwrap();
             let expected = if unnamed { HashSet::from(["1".repeat(64)]) } else { HashSet::from(["1".repeat(64), "9".repeat(64)]) };
             assert_eq!(pending.spent_by[&coin('a', 0).outpoint()], expected);
             assert_eq!(pending.unnamed_spenders.contains(&coin('a', 0).outpoint()), unnamed);
@@ -5526,6 +5559,8 @@ mod pq2_tests {
         limited_once: Arc<Mutex<Vec<String>>>,
         /// When set, the deployed site's limits, on a clock of this unit per second.
         limits: Arc<Mutex<Option<SiteLimits>>>,
+        /// The address of every /api/utxos request.
+        asked: Arc<Mutex<Vec<String>>>,
     }
 
     /// The deployed site's limits (web/ark0web/wallet.py): /api/utxos 20 at once and 1 a second per visitor
@@ -5621,6 +5656,7 @@ mod pq2_tests {
             return response(200, &guard(&net.state).to_string());
         }
         if let Some(address) = path.strip_prefix("/api/utxos?address=") {
+            guard(&net.asked).push(address.to_string());
             let utxos = guard(&net.utxos).get(address).cloned().unwrap_or_default();
             let incoming = guard(&net.incoming).get(address).cloned().unwrap_or_default();
             return response(200, &json!({"utxos": utxos, "unconfirmed": incoming, "unconfirmed_complete": true, "truncated": false}).to_string());
@@ -6290,6 +6326,43 @@ mod pq2_tests {
         // Then an address is handed out, past the reserved range.
         *guard(&w.net.limits) = None;
         assert_eq!(block(new_pq2_address(&w.state)).unwrap().index, r.issued[0]);
+    }
+
+    #[test]
+    fn a_plan_and_its_confirmation_look_up_only_the_address_they_pay_from() {
+        let (w, address) = funded("asked");
+        // Two more pq2 addresses, and a coin of the ML-DSA-44 account that a payment no record names spends.
+        block(new_pq2_address(&w.state)).unwrap();
+        block(new_pq2_address(&w.state)).unwrap();
+        let mldsa44 = w.state.templates().unwrap().1.address;
+        guard(&w.net.utxos).insert(mldsa44, vec![held_by('9', 0, 40_000, 'e')]);
+        // The refresh looks up every address (3 accounts, 3 pq2 addresses, on both sources).
+        block(overview_of(&w.state)).unwrap();
+        assert_eq!(guard(&w.net.asked).len(), 12);
+        guard(&w.net.asked).clear();
+        let view = block(plan_pq2_payment(&w.state, address.clone(), elsewhere(), "0.001".into(), None, None)).unwrap();
+        assert!(guard(&w.net.asked).iter().all(|a| *a == address), "the plan asked for {:?}", guard(&w.net.asked));
+        // The warning of a coin spent by a payment no record names still comes, from the refresh's answer.
+        assert!(view.unrecorded);
+        // The confirmation's re-check still looks up every address afresh (a risk that appears after the plan
+        // sends it back to review), before and after its dialog.
+        guard(&w.net.asked).clear();
+        let own = w.state.own_templates().unwrap();
+        let result = block(send_plan(&w.state, &view.id, Some("en"), |_| std::future::ready(true))).unwrap();
+        assert!(matches!(result.result, BroadcastResult::Sent { .. }));
+        assert!(own.iter().all(|t| guard(&w.net.asked).contains(&t.address)), "the confirmation asked for {:?}", guard(&w.net.asked));
+        // Answers older than a minute are asked for again; a lock forgets them all.
+        for (_, (at, _)) in guard(&w.state.seen_coins).iter_mut() {
+            *at -= SEEN_FOR + Duration::from_secs(1);
+        }
+        guard(&w.net.asked).clear();
+        let funded_again = utxo('f', 0, 90_000, H4T + 9);
+        guard(&w.net.utxos).insert(address.clone(), vec![funded_again]);
+        block(plan_pq2_payment(&w.state, address.clone(), elsewhere(), "0.0001".into(), None, None)).unwrap();
+        // Every address asked again, the change address the payment handed out included, on both sources.
+        assert_eq!(guard(&w.net.asked).len(), 2 * w.state.own_templates().unwrap().len(), "every address asked again");
+        w.state.lock();
+        assert!(guard(&w.state.seen_coins).is_empty());
     }
 
     #[test]
