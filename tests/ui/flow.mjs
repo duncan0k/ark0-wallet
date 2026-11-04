@@ -166,7 +166,7 @@ await test('a refusal whose rebuild could not be planned says so', async (browse
   });
   await reviewFromPq2(page);
   await page.locator('.modal button', { hasText: 'Confirm' }).click();
-  await page.waitForSelector('text=could not be planned just now', { timeout: 3000 });
+  await page.waitForSelector('text=could not be prepared again with SLH-DSA just now', { timeout: 3000 });
   await page.waitForSelector(`text=${reason}`);
   assert(errors.length === 0, errors.join('; '));
 });
