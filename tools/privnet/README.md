@@ -59,7 +59,9 @@ The steps (`src-tauri/src/privnet_e2e.rs`): `overview`, `activity`, `scan`, `add
 wallet needs it), `plan` and `send` (`from`, `to`, `amount`, `path`: `mldsa44` or `slhdsa128s`), and `held` (a
 spend that waits, signed, right before it is recorded and sent, until `held-go` appears in
 `ARK0_PRIVNET_SIGNAL`; then it goes as the wallet sends it, and the plan the wallet offers after it is confirmed).
-The first step on a data directory makes the wallet as the create flow does, from fixed words (with `restore`
+A step uses only a wallet directory that is new or empty, or that carries the marker `privnet-network` (the
+network's challenge) the harness wrote when it made it; any other directory, a release wallet's above all, is
+refused before anything in it is opened. The first step on a data directory makes the wallet as the create flow does, from fixed words (with `restore`
 in the arguments, restored from them; with `legacy`, from a web-wallet backup code); later steps unlock it.
 
 ## The site's limits

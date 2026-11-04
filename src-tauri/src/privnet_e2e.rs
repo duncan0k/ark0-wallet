@@ -172,6 +172,61 @@ fn step(state: &AppState, name: &str, args: &Value) -> Value {
     }
 }
 
+/// The marker a wallet directory of the harness carries: the private network's challenge, written when the
+/// harness made the directory.
+const MARKER: &str = "privnet-network";
+
+/// Whether the harness may use `dir` for the network whose challenge is `challenge`: a directory that does not
+/// exist yet or is empty (it is then made, and marked), or one with this network's marker. Anything else (a
+/// release wallet's directory, one of another network) is refused, with nothing in it read but its listing and
+/// the marker, and nothing written.
+fn claim(dir: &std::path::Path, challenge: &str) -> Result<(), String> {
+    let marker = dir.join(MARKER);
+    match std::fs::read_dir(dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("{}: {e}", dir.display())),
+        Ok(mut entries) => {
+            if entries.next().is_some() {
+                return match std::fs::read_to_string(&marker) {
+                    Ok(m) if m.trim() == challenge => Ok(()),
+                    Ok(_) => Err(format!("{} belongs to another private network", dir.display())),
+                    Err(_) => Err(format!("{} is not a directory the harness made: it is not used", dir.display())),
+                };
+            }
+        }
+    }
+    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    std::fs::write(&marker, format!("{challenge}\n")).map_err(|e| format!("{}: {e}", marker.display()))
+}
+
+#[test]
+fn the_harness_uses_only_a_directory_it_made_for_this_network() {
+    let mut nonce = [0u8; 8];
+    getrandom::fill(&mut nonce).unwrap();
+    let root = std::env::temp_dir().join(format!("pqw-privnet-claim-{}", hex::encode(nonce)));
+    // New, or empty: made and marked.
+    let new = root.join("new");
+    assert_eq!(claim(&new, "51ab"), Ok(()));
+    assert_eq!(std::fs::read_to_string(new.join(MARKER)).unwrap(), "51ab\n");
+    let empty = root.join("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+    assert_eq!(claim(&empty, "51ab"), Ok(()));
+    // Marked for this network: used again; for another: refused.
+    assert_eq!(claim(&new, "51ab"), Ok(()));
+    assert!(claim(&new, "51cd").is_err());
+    // A release wallet's directory (a vault and a book, no marker): refused, and left exactly as it was.
+    let release = root.join("release");
+    std::fs::create_dir_all(&release).unwrap();
+    std::fs::write(release.join("vault.json"), b"{\"vault\": 1}").unwrap();
+    std::fs::write(release.join("pq2.json"), b"{\"book\": 1}").unwrap();
+    assert!(claim(&release, "51ab").is_err());
+    let mut names: Vec<String> = std::fs::read_dir(&release).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+    names.sort();
+    assert_eq!(names, ["pq2.json", "vault.json"]);
+    assert_eq!(std::fs::read(release.join("pq2.json")).unwrap(), b"{\"book\": 1}");
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
 #[test]
 fn privnet_e2e() {
     let Ok(name) = std::env::var("ARK0_PRIVNET_STEP") else {
@@ -180,7 +235,10 @@ fn privnet_e2e() {
     };
     crate::net::load().expect("the private network's file");
     let args: Value = serde_json::from_str(&std::env::var("ARK0_PRIVNET_ARGS").unwrap_or_else(|_| "{}".into())).expect("ARK0_PRIVNET_ARGS: JSON");
-    let state = AppState::new(var("ARK0_PRIVNET_WALLET_DIR").into()).expect("the wallet's directory");
+    let dir = std::path::PathBuf::from(var("ARK0_PRIVNET_WALLET_DIR"));
+    // Before anything in it is opened: only a directory the harness made for this network.
+    claim(&dir, crate::net::network().challenge).expect("ARK0_PRIVNET_WALLET_DIR");
+    let state = AppState::new(dir).expect("the wallet's directory");
     let opened = open(&state, &args);
     let answer = step(&state, &name, &args);
     let out = json!({"step": name, "args": args, "open": opened, "answer": answer});
