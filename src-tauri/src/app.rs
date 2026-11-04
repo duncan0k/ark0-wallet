@@ -2957,6 +2957,11 @@ fn page_url(
     }
 }
 
+// The privnet build against a private network (tools/privnet/README.md).
+#[cfg(all(test, feature = "privnet"))]
+#[path = "privnet_e2e.rs"]
+mod privnet_e2e;
+
 #[cfg(test)]
 mod tests {
     use super::*;
