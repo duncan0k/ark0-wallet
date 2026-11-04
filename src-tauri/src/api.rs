@@ -275,7 +275,15 @@ fn client_builder() -> reqwest::ClientBuilder {
 
 impl Api {
     pub fn new(base: &str) -> Self {
-        let client = client_builder().build().expect("an HTTP client");
+        // A private network's API on this machine, as its file names it, in that build only.
+        #[cfg(feature = "privnet")]
+        let builder = match base.starts_with("http://127.0.0.1:") && crate::net::network().api_bases.contains(&base.trim_end_matches('/')) {
+            true => client_builder().https_only(false).no_proxy(),
+            false => client_builder(),
+        };
+        #[cfg(not(feature = "privnet"))]
+        let builder = client_builder();
+        let client = builder.build().expect("an HTTP client");
         Api { base: base.trim_end_matches('/').to_string(), client }
     }
 

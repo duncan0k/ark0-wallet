@@ -10,6 +10,7 @@
 //! until the lattice tripwire state is known: read at the current tip, about Ark-0's three tripwires, with a
 //! flag that agrees with them; a node that does not report those rules at all is on Ark-0
 //! still, it just offers no pq2. Unknown state never opens anything: no pq2 address, no ML-DSA-44 leaf.
+#[cfg(test)]
 use crate::keys::ARK0_CHALLENGE;
 use crate::p2mr::{Path, LATTICE_TRIPWIRED_LEAF_VERSION, TRIPWIRED_LEAF_VERSION};
 use serde::Serialize;
@@ -32,7 +33,9 @@ pub const TRIPWIRE_HEIGHT: u32 = 30_000;
 /// reports other heights is not describing Ark-0.
 pub const SLHDSA128S_HEIGHT: u32 = 32_000;
 pub const H4T: u32 = 55_000;
-/// The transaction that made Ark-0's three lattice tripwires (outputs 0, 1 and 2).
+/// The transaction that made Ark-0's three lattice tripwires (outputs 0, 1 and 2; `net::RELEASE` lists
+/// them).
+#[cfg(test)]
 pub const LATTICE_TRIPWIRE_TXID: &str = "aac5a1fef01545c338de92bceda520684a49682f2ec546900a4dbe99eba8827c";
 
 /// M2: from this height every block carries an ML-DSA-44 signature by this key.
@@ -260,7 +263,7 @@ fn lattice_state(v: &Value, read_at: u32) -> Option<(u32, bool, Vec<LatticeTripw
         };
         tripwires.push(LatticeTripwire { outpoint: outpoint.to_string(), unspent, key_sha256, label });
     }
-    let ark0: HashSet<String> = (0..3).map(|vout| format!("{LATTICE_TRIPWIRE_TXID}:{vout}")).collect();
+    let ark0: HashSet<&str> = crate::net::network().lattice_tripwires.iter().copied().collect();
     if seen.len() != ark0.len() || !seen.iter().all(|o| ark0.contains(*o)) {
         return None;
     }
@@ -275,9 +278,10 @@ fn lattice_state(v: &Value, read_at: u32) -> Option<(u32, bool, Vec<LatticeTripw
 
 /// The chain the API's /api/state describes, when it is Ark-0 with P2MR active.
 pub fn check(state: &Value) -> Result<Chain, ChainProblem> {
+    let net = crate::net::network();
     let tip = state.get("blocks").and_then(height).ok_or(ChainProblem::WrongChain)?;
     if state.get("chain").and_then(Value::as_str) != Some("signet")
-        || state.get("signet_challenge").and_then(Value::as_str) != Some(ARK0_CHALLENGE)
+        || state.get("signet_challenge").and_then(Value::as_str) != Some(net.challenge)
     {
         return Err(ChainProblem::WrongChain);
     }
@@ -285,16 +289,16 @@ pub fn check(state: &Value) -> Result<Chain, ChainProblem> {
     if deployments.get("p2mr").and_then(|p| p.get("active")).and_then(Value::as_bool) != Some(true) {
         return Err(ChainProblem::P2mrInactive);
     }
-    if buried(deployments, "p2mr") != Some(P2MR_HEIGHT)
-        || buried(deployments, "p2mr_mldsa44") != Some(MLDSA44_HEIGHT)
-        || buried(deployments, "p2mr_tripwire") != Some(TRIPWIRE_HEIGHT)
+    if buried(deployments, "p2mr") != Some(net.p2mr_height)
+        || buried(deployments, "p2mr_mldsa44") != Some(net.mldsa44_height)
+        || buried(deployments, "p2mr_tripwire") != Some(net.tripwire_height)
     {
         return Err(ChainProblem::WrongChain);
     }
-    let (mldsa44_height, tripwire_height) = (Some(MLDSA44_HEIGHT), Some(TRIPWIRE_HEIGHT));
+    let (mldsa44_height, tripwire_height) = (Some(net.mldsa44_height), Some(net.tripwire_height));
     // Both M4 deployments, or no pq2: leaf B needs OP_CHECKSLHDSA128S, the 0xe2 leaves need H4T.
-    let slhdsa128s = optional_buried(deployments, "p2mr_slhdsa128s", SLHDSA128S_HEIGHT)?;
-    let lattice_height = optional_buried(deployments, "p2mr_lattice_tripwire", H4T)?.filter(|_| slhdsa128s.is_some());
+    let slhdsa128s = optional_buried(deployments, "p2mr_slhdsa128s", net.slhdsa128s_height)?;
+    let lattice_height = optional_buried(deployments, "p2mr_lattice_tripwire", net.h4t)?.filter(|_| slhdsa128s.is_some());
     // The state counts only for the height and leaf version the mixed address is built for, read at a
     // tip the node has reached.
     let known = state.get("tripwire").and_then(tripwire_state).filter(|(at, h3, leaf, _, _)| {

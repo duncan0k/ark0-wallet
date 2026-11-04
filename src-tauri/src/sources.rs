@@ -181,7 +181,8 @@ pub struct Sources {
 
 impl Default for Sources {
     fn default() -> Self {
-        Sources::new(Api::new(crate::api::DEFAULT_BASE), Api::new(SECOND_BASE))
+        let [first, second] = crate::net::network().api_bases;
+        Sources::new(Api::new(first), Api::new(second))
     }
 }
 

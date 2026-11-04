@@ -4,6 +4,7 @@ mod chain;
 mod confirm;
 mod keys;
 mod mldsa;
+mod net;
 mod p2mr;
 mod pq2;
 mod proof;
@@ -98,6 +99,15 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
+            // A private-network build: its network from its file, and its files under its own identifier
+            // (tauri.privnet.conf.json), never a release wallet's.
+            #[cfg(feature = "privnet")]
+            {
+                net::load()?;
+                if app.config().identifier != net::APP_IDENTIFIER {
+                    return Err(format!("a privnet build runs as {}, with tauri.privnet.conf.json", net::APP_IDENTIFIER).into());
+                }
+            }
             let dir = app.path().app_data_dir()?;
             match app::AppState::new(dir) {
                 Ok(state) => { app.manage(state); }

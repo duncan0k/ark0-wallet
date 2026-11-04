@@ -453,7 +453,7 @@ impl Keys {
         match secret {
             Secret::Bip39 { entropy } => {
                 let seed = bip39_seed(&entropy.0)?;
-                let network = network_id(ARK0_CHALLENGE);
+                let network = network_id(crate::net::network().challenge);
                 Ok(Keys {
                     schnorr: SchnorrKey::new(bip39_schnorr(&seed, &network, Kind::Schnorr)?),
                     mldsa44: keypair(&bip39_mldsa44_seed(&seed, &network, Kind::Mldsa44))?,
@@ -486,7 +486,7 @@ impl Keys {
         if chain > CHANGE_CHAIN || index > MAX_PQ2_INDEX {
             return Err(KeyError::Pq2Unavailable);
         }
-        let network = network_id(ARK0_CHALLENGE);
+        let network = network_id(crate::net::network().challenge);
         let mldsa44 = mldsa::keypair_from_seed(&pq2_mldsa44_seed(seed, &network, chain, index)).map_err(|_| KeyError::Mldsa44)?;
         let slhdsa128s = slhdsa::keypair_from_seed(&pq2_slhdsa128s_seed(seed, &network, chain, index)).map_err(|_| KeyError::Slhdsa128s)?;
         Ok(Pq2Keys { mldsa44, slhdsa128s })

@@ -1,6 +1,6 @@
 //! Proofs against Ark-0's block signatures: an API's confirmation count alone never settles a payment.
+#[cfg(test)]
 use crate::chain::{PQBLOCK_HEIGHT, PQBLOCK_KEY};
-use crate::keys::ARK0_CHALLENGE;
 use crate::mldsa;
 use crate::p2mr::{compact_size, tagged_hash};
 use serde_json::Value;
@@ -245,13 +245,13 @@ fn signature(script: &[u8]) -> Result<&[u8; mldsa::SIGNATURE_LEN], ProofError> {
 }
 
 fn message(header: &[u8; 80], root: &[u8; 32]) -> [u8; 32] {
-    let challenge = Sha256::digest(hex::decode(ARK0_CHALLENGE).expect("pinned challenge"));
+    let challenge = Sha256::digest(hex::decode(crate::net::network().challenge).expect("pinned challenge"));
     tagged_hash("SignetPQBlock", &[&challenge, &header[..36], root, &header[68..72]])
 }
 
 /// Only this uses the deployed key; a test key cannot come in from an API or a caller.
 pub fn verify(txid: &str, answer: &Value) -> Result<u32, ProofError> {
-    let key: [u8; mldsa::PUBLIC_KEY_LEN] = hex::decode(PQBLOCK_KEY).expect("pinned key").try_into().expect("ML-DSA-44 public key");
+    let key: [u8; mldsa::PUBLIC_KEY_LEN] = hex::decode(crate::net::network().pqblock_key).expect("pinned key").try_into().expect("ML-DSA-44 public key");
     verify_with_key(txid, answer, &key)
 }
 
@@ -263,7 +263,7 @@ fn verify_with_key(txid: &str, answer: &Value, key: &[u8; mldsa::PUBLIC_KEY_LEN]
     tx.reverse();
     let height = number(answer.get("height"))?;
     let tip = number(answer.get("tip"))?;
-    if height < PQBLOCK_HEIGHT {
+    if height < crate::net::network().pqblock_height {
         return Err(ProofError::BeforeActivation);
     }
     if tip < height {
