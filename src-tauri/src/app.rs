@@ -2098,6 +2098,18 @@ async fn send_plan<F: Future<Output = bool>>(
     if pending.created.elapsed() > PLAN_LIFETIME {
         return Err(Failure::new("no_plan"));
     }
+    // From here until the payment is recorded, the address book is this payment's: no scan, no address
+    // handed out, no history check writes to it (each holds book_ops), so the last look at it below stands.
+    let book_op = state.book_ops.lock().await;
+    state.still_current(&snapshot)?;
+    // The last check, after the dialog and before signing: whether the payment creates one of the wallet's own
+    // pq2 outputs (its destination, or its change, against the book as it is now). Such a payment must have
+    // been planned as one, which passed the gate (pq2 open) at the re-check, and carries nLockTime H4T.
+    // Otherwise nothing is signed or sent: a new plan is needed.
+    let creates_now = pending.pq2.is_some_and(|p| p.change.is_some()) || own_pq2(state).contains(&pending.destination.address);
+    if creates_now && (!pending.creates_pq2 || pending.plan.lock_time != crate::net::network().h4t) {
+        return Err(Failure::new("chain_changed"));
+    }
     let started = Instant::now();
     let signed = {
         let session = guard(&state.session);
@@ -2156,11 +2168,6 @@ async fn send_plan<F: Future<Output = bool>>(
             hook(state);
         }
     }
-    // Handing out the change address is an operation on the address book: it waits for one in progress.
-    let _book_op = match pending.pq2 {
-        Some(Pq2Pending { change: Some(_), .. }) => Some(state.book_ops.lock().await),
-        _ => None,
-    };
     {
         // One section, with no wait on the network, in this order and with no rollback: the checks (the
         // wallet and session the confirmation began in; for a rebuild, its anchor among the coins it
@@ -2207,6 +2214,8 @@ async fn send_plan<F: Future<Output = bool>>(
             let _ = state.edit_book_for(&snapshot, |b| b.add_version(&r.root, version));
         }
     }
+    // Recorded: the address book is free again.
+    drop(book_op);
     let result = state.sources.broadcast(&signed.hex, &signed.txid).await.value;
     // The answer is written for the session that sent it only: after a lock the record stays submitting, and is
     // looked up as unknown later.
@@ -6659,6 +6668,40 @@ mod pq2_tests {
     }
 
     #[test]
+    fn an_own_pq2_address_that_appears_during_the_dialog_stops_the_payment() {
+        for open in [false, true] {
+            let tip = if open { H4T + 10 } else { H4T - 2 };
+            let w = wallet("own-pq2-race", words(0x60 + open as u8), false, m4_state(tip, false));
+            block(scan_pq2(&w.state, false)).unwrap();
+            let mldsa44 = w.state.templates().unwrap().1.address;
+            guard(&w.net.utxos).insert(mldsa44, vec![utxo('8', 0, 500_000, 9_000)]);
+            // One of the wallet's own pq2 addresses the book does not know yet: the plan and the confirmation's
+            // re-check see a payment to a foreign address.
+            let later = pq2_address(&w, 0, 30);
+            let view = block(plan_payment(&w.state, Kind::Mldsa44, later.clone(), "0.001".into())).unwrap();
+            assert_ne!(guard(&w.state.pending).as_ref().unwrap().plan.lock_time, H4T);
+            // A scan writes it into the book while the system dialog is open.
+            let state = &w.state;
+            let result = block(send_plan(state, &view.id, Some("en"), |_| {
+                state.edit_book(|b| { b.chains[0].issued = 31; b.chains[0].addresses.insert(30, later.clone()); }).unwrap();
+                std::future::ready(true)
+            }));
+            assert_eq!(result.err().map(|f| f.code), Some("chain_changed".to_string()), "pq2 open: {open}");
+            assert!(guard(&w.net.broadcasts).is_empty(), "pq2 open: {open}");
+            assert!(store::load::<Vec<Sent>>(&w.state.sent_path()).is_empty(), "pq2 open: {open}");
+        }
+        // An ordinary payment holds the book from that last check until it is recorded: no scan comes between.
+        let (w, address) = funded("own-pq2-held");
+        let view = block(plan_pq2_payment(&w.state, address, elsewhere(), "0.001".into(), None, None)).unwrap();
+        let held = Arc::new(AtomicBool::new(false));
+        let h = held.clone();
+        *guard(&w.state.before_commit) = Some(Box::new(move |state: &AppState| h.store(state.book_ops.try_lock().is_err(), Ordering::SeqCst)));
+        block(send_plan(&w.state, &view.id, Some("en"), |_| std::future::ready(true))).unwrap();
+        assert!(held.load(Ordering::SeqCst));
+        assert!(w.state.book_ops.try_lock().is_ok());
+    }
+
+    #[test]
     fn a_late_scan_result_never_reaches_another_wallets_book() {
         for at_answer in [1usize, 2, 21, 40] {
             let w = wallet("scan-switch", words(0x5e), false, m4_state(H4T + 100, false));
@@ -7369,20 +7412,23 @@ mod pq2_tests {
         assert!(view.change > 0);
         let reached = Arc::new(AtomicBool::new(false));
         let r = reached.clone();
-        *guard(&w.state.before_commit) = Some(Box::new(move |_: &AppState| r.store(true, Ordering::SeqCst)));
         // Another operation on the book (a scan, say) holds it while the payment is confirmed.
         let held = w.state.book_ops.try_lock().unwrap();
         std::thread::scope(|s| {
             let state = &w.state;
             let id = view.id.clone();
-            let send = s.spawn(move || block(send_plan(state, &id, Some("en"), |_| std::future::ready(true))));
+            let send = s.spawn(move || block(send_plan(state, &id, Some("en"), move |_| {
+                r.store(true, Ordering::SeqCst);
+                std::future::ready(true)
+            })));
             let started = Instant::now();
             while !reached.load(Ordering::SeqCst) {
                 assert!(started.elapsed() < Duration::from_secs(120));
                 std::thread::sleep(Duration::from_millis(10));
             }
             std::thread::sleep(Duration::from_millis(200));
-            // Signed and through its last check on the network, it waits: nothing handed out or sent.
+            // Confirmed in its dialog, it waits for the book before its last check and signing: nothing handed
+            // out or sent.
             assert!(!send.is_finished());
             assert!(guard(&w.net.broadcasts).is_empty());
             assert!(w.state.book().unwrap().chains[1].handed_out.is_empty());
