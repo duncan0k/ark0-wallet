@@ -1687,6 +1687,8 @@ fn parse_amount(amount: &str) -> Res<Amount> {
 }
 
 /// The book's pq2 addresses this wallet may pay itself at: only those it handed out or saw used.
+/// Every pq2 address the wallet knows, from its book: handed out (receiving or change), seen used, or kept by
+/// a recovery scan. A payment to one of them creates the wallet's own pq2 output.
 fn own_pq2(state: &AppState) -> HashSet<String> {
     state.book().map(|b| b.chains.iter().flat_map(|c| c.addresses.values().cloned()).collect()).unwrap_or_default()
 }
@@ -1708,8 +1710,12 @@ async fn plan_payment(state: &AppState, from: Kind, to: String, amount: String) 
     if own.iter().any(|t| t.address == destination.address && !shown(t.kind, &chain)) {
         return Err(Failure::new("destination_not_ready"));
     }
-    // Paying one of its own pq2 addresses creates a pq2 output: lock time H4T.
+    // Paying one of its own pq2 addresses (handed out, change, or kept by a scan) creates a pq2 output: only once
+    // pq2 is open (H4T + 6 and the state known), whatever account pays, and with lock time H4T.
     let creates_pq2 = own_pq2(state).contains(&destination.address);
+    if creates_pq2 && !chain.pq2_allowed {
+        return Err(Failure::new("destination_not_ready"));
+    }
     let account = account_for(template, &chain, None)?;
     let view_from_address = account.template.address.clone();
     let coins = flags.take(sources.coins(&account.template.address).await);
@@ -2305,9 +2311,15 @@ async fn recheck_payment(state: &AppState, snapshot: &Snapshot, pending: &mut Pe
     let chain = current_chain(&state.sources, &mut flags).await;
     state.current(snapshot)?;
     let chain = chain?;
+    // Whatever account pays: a payment that creates one of the wallet's own pq2 outputs (as planned, or to an
+    // address the book has come to know since) goes only while pq2 is open, with lock time H4T (checked below).
+    pending.creates_pq2 |= own_pq2(state).contains(&pending.destination.address);
+    if pending.creates_pq2 && !chain.pq2_allowed {
+        return Err(Failure::new("chain_changed"));
+    }
     let account = match pending.pq2 {
         Some(p) => {
-            if !chain.pq2_spendable || (pending.creates_pq2 && !chain.pq2_allowed) {
+            if !chain.pq2_spendable {
                 return Err(Failure::new("chain_changed"));
             }
             // Through the ML-DSA-44 leaf only while the node reports it on; otherwise rebuilt (send_plan).
@@ -6537,6 +6549,42 @@ mod pq2_tests {
             assert_eq!(mark(&w), before, "lookup succeeds: {lookup_succeeds}");
             assert!(guard(&w.state.pending).is_none());
         }
+    }
+
+    #[test]
+    fn a_payment_to_an_own_pq2_address_waits_for_pq2_whatever_account_pays() {
+        // At 54998 a restored wallet's scan keeps its empty pq2 addresses; its fixed accounts hold coins.
+        let w = wallet("own-pq2-gate", words(0x7d), false, m4_state(H4T - 2, false));
+        block(scan_pq2(&w.state, false)).unwrap();
+        let kept = pq2_address(&w, 0, 3);
+        assert!(w.state.book().unwrap().chains[0].addresses.values().any(|a| *a == kept));
+        let (schnorr, mldsa44, mixed) = w.state.templates().unwrap();
+        for (t, c) in [(&schnorr, '7'), (&mldsa44, '8'), (&mixed, '9')] {
+            guard(&w.net.utxos).insert(t.address.clone(), vec![utxo(c, 0, 500_000, 9_000)]);
+        }
+        // Planning: no payment from any account creates a pq2 output before the gate.
+        for kind in [Kind::Schnorr, Kind::Mldsa44, Kind::Mixed] {
+            assert_eq!(block(plan_payment(&w.state, kind, kept.clone(), "0.001".into())).unwrap_err().code, "destination_not_ready", "{kind:?}");
+        }
+        // Confirming: a plan made before the book knew its destination is refused once a scan has kept it.
+        let later = pq2_address(&w, 0, 30);
+        let view = block(plan_payment(&w.state, Kind::Mldsa44, later.clone(), "0.001".into())).unwrap();
+        assert_ne!(guard(&w.state.pending).as_ref().unwrap().plan.lock_time, H4T);
+        w.state.edit_book(|b| { b.chains[0].issued = 31; b.chains[0].addresses.insert(30, later.clone()); }).unwrap();
+        assert_eq!(block(send_plan(&w.state, &view.id, Some("en"), |_| std::future::ready(true))).unwrap_err().code, "chain_changed");
+        assert!(guard(&w.net.broadcasts).is_empty());
+        // Once pq2 is open, every account pays an own pq2 address with nLockTime H4T.
+        *guard(&w.net.state) = m4_state(H4T + 10, false);
+        for kind in [Kind::Schnorr, Kind::Mldsa44, Kind::Mixed] {
+            block(plan_payment(&w.state, kind, kept.clone(), "0.001".into())).unwrap();
+            let pending = guard(&w.state.pending).take().unwrap();
+            assert!(pending.creates_pq2, "{kind:?}");
+            assert_eq!(pending.plan.lock_time, H4T, "{kind:?}");
+        }
+        let from = pq2_address(&w, 0, 1);
+        guard(&w.net.utxos).insert(from.clone(), vec![utxo('6', 0, 500_000, H4T + 7)]);
+        block(plan_pq2_payment(&w.state, from, kept, "0.001".into(), None, None)).unwrap();
+        assert_eq!(guard(&w.state.pending).take().unwrap().plan.lock_time, H4T);
     }
 
     #[test]
