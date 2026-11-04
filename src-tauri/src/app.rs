@@ -2003,6 +2003,9 @@ pub struct SendResult {
     /// state unknown): rebuilt through the SLH-DSA leaf, this plan waits for review and confirmation. When
     /// the state flipped before broadcasting, the old transaction was dropped unsent (`txid` is empty).
     rebuilt: Option<SendPlan>,
+    /// That rebuild was due but could not be planned now (its error code, e.g. "limit"): it can be started
+    /// from the activity view. None when it was planned or not needed.
+    rebuild_error: Option<String>,
 }
 
 /// Signs and broadcasts the plan the interface showed, if its coins are still unspent, the chain's rules
@@ -2175,6 +2178,7 @@ async fn send_plan<F: Future<Output = bool>>(
     // A refused payment through the ML-DSA-44 leaf: whether to rebuild it is decided from the node's state,
     // not from the words of the refusal.
     let mut rebuilt = None;
+    let mut rebuild_error = None;
     if pending.pq2.is_some() && pending.path == Path::Mldsa44 && matches!(result, BroadcastResult::Rejected { .. } | BroadcastResult::Failed { .. }) {
         let recorded: Vec<Sent> = store::load(&state.sent_path());
         let chain = current_chain(&state.sources, &mut Flags::default()).await;
@@ -2184,10 +2188,13 @@ async fn send_plan<F: Future<Output = bool>>(
             Err(_) => true,
         };
         if flipped {
-            rebuilt = rebuild_plan_in(state, &snapshot, &signed.txid).await.ok();
+            match rebuild_plan_in(state, &snapshot, &signed.txid).await {
+                Ok(plan) => rebuilt = Some(plan),
+                Err(f) => rebuild_error = Some(f.code),
+            }
         }
     }
-    Ok(SendResult { result, txid: signed.txid, sign_ms, rebuilt })
+    Ok(SendResult { result, txid: signed.txid, sign_ms, rebuilt, rebuild_error })
 }
 
 /// The payment through the ML-DSA-44 leaf was not recorded or sent; the same payment through the SLH-DSA
@@ -2208,7 +2215,7 @@ async fn rebuild_unsent(state: &AppState, pending: &PendingSend, snapshot: &Snap
     }
     let plan = plan?;
     state.current(snapshot)?;
-    Ok(SendResult { result: BroadcastResult::Unknown, txid: String::new(), sign_ms: 0.0, rebuilt: Some(plan) })
+    Ok(SendResult { result: BroadcastResult::Unknown, txid: String::new(), sign_ms: 0.0, rebuilt: Some(plan), rebuild_error: None })
 }
 
 fn signed_record(pending: &PendingSend, signed: &wallet::Signed, sign_ms: f64) -> Sent {
@@ -6851,6 +6858,7 @@ mod pq2_tests {
             assert!(matches!(result.result, BroadcastResult::Rejected { .. }));
             let records: Vec<Sent> = store::load(&w.state.sent_path());
             assert_eq!((records[0].status.as_str(), records[0].signature.as_str()), ("rejected", "mldsa44"));
+            assert_eq!(result.rebuild_error, None);
             if flips {
                 let rebuilt = result.rebuilt.unwrap();
                 assert_eq!(rebuilt.signature, Path::Slhdsa128s);
@@ -6863,6 +6871,30 @@ mod pq2_tests {
                 assert!(result.rebuilt.is_none());
             }
         }
+    }
+
+    #[test]
+    fn a_rebuild_that_cannot_be_planned_after_a_refusal_says_why() {
+        let (w, address) = funded("rebuild-error");
+        let view = block(plan_pq2_payment(&w.state, address, elsewhere(), "0.001".into(), Some(Path::Mldsa44), None)).unwrap();
+        *guard(&w.net.refuse) = Some("mempool-script-verify-flag-failed (ML-DSA-44 signature checks are disabled in this leaf)".into());
+        *guard(&w.net.on_broadcast) = Some(m4_state(H4T + 11, true));
+        // Once the payment is committed the site takes no more coin lookups: the rebuild's are refused (limit).
+        let net = w.net.clone();
+        *guard(&w.state.before_commit) = Some(Box::new(move |_: &AppState| {
+            let mut limits = SiteLimits::deployed(Duration::from_millis(10));
+            limits.utxos = Bucket { tokens: 0.0, burst: 0.0, rate: 0.0, at: Instant::now() };
+            *guard(&net.limits) = Some(limits);
+        }));
+        let result = block(send_plan(&w.state, &view.id, Some("en"), |_| std::future::ready(true))).unwrap();
+        assert!(matches!(result.result, BroadcastResult::Rejected { .. }));
+        assert!(result.rebuilt.is_none());
+        assert_eq!(result.rebuild_error.as_deref(), Some("limit"));
+        // The activity view offers it once the site answers again.
+        *guard(&w.net.limits) = None;
+        let activity = block(activity_of(&w.state)).unwrap();
+        assert!(activity.iter().any(|a| a.sent.txid == result.txid && a.rebuild));
+        assert_eq!(block(rebuild_plan(&w.state, &result.txid)).unwrap().signature, Path::Slhdsa128s);
     }
 
     #[test]

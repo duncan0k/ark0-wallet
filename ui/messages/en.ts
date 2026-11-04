@@ -171,6 +171,7 @@ export const en = {
     changeBlocked: '20 change addresses of earlier payments have not been seen on the network yet, so this payment can only go without change: choose “All”, or wait until earlier payments are in a block.',
     rebuiltBefore: 'Before it was sent, the node began reporting ML-DSA-44 checks in pq2 addresses off. That payment was not sent. Here it is again through SLH-DSA, with a new fee: review it and confirm.',
     rebuiltRefused: 'The node refused the payment, and it now reports ML-DSA-44 checks in pq2 addresses off. Here it is again through SLH-DSA, spending the same coins, with a new fee: review it and confirm. Only one of the two can go through.',
+    rebuildLater: 'The node refused the payment, and it now reports ML-DSA-44 checks in pq2 addresses off. The switch to SLH-DSA could not be planned just now: start it again from Activity.',
     rebuild: 'Pay again through SLH-DSA',
     rebuildNote: 'This payment through ML-DSA-44 did not go through, and the node now reports ML-DSA-44 checks in pq2 addresses off. It can be paid again through SLH-DSA from the same coins; only one of the two can go through.',
     network: 'pq2 addresses (M4)',

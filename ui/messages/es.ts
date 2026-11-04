@@ -173,6 +173,7 @@ export const es: Messages = {
     changeBlocked: '20 direcciones de cambio de pagos anteriores aún no aparecen en la red, así que este pago solo puede ir sin cambio: elige «Todo», o espera a que los pagos anteriores estén en un bloque.',
     rebuiltBefore: 'Antes de enviarlo, el nodo empezó a informar de que las comprobaciones ML-DSA-44 en direcciones pq2 están desactivadas. Ese pago no se envió. Aquí está de nuevo con SLH-DSA y una comisión nueva: revísalo y confírmalo.',
     rebuiltRefused: 'El nodo rechazó el pago y ahora informa de que las comprobaciones ML-DSA-44 en direcciones pq2 están desactivadas. Aquí está de nuevo con SLH-DSA, con las mismas monedas y una comisión nueva: revísalo y confírmalo. Solo uno de los dos puede salir.',
+    rebuildLater: 'El nodo rechazó el pago y ahora informa de que las comprobaciones ML-DSA-44 en direcciones pq2 están desactivadas. El paso a SLH-DSA no se pudo preparar ahora: vuelve a empezarlo desde «Registro».',
     rebuild: 'Pagar de nuevo con SLH-DSA',
     rebuildNote: 'Este pago con ML-DSA-44 no salió, y el nodo informa ahora de que las comprobaciones ML-DSA-44 en direcciones pq2 están desactivadas. Puede pagarse de nuevo con SLH-DSA desde las mismas monedas; solo uno de los dos puede salir.',
     network: 'Direcciones pq2 (M4)',

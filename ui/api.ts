@@ -108,7 +108,8 @@ export type BroadcastResult =
   | { kind: 'failed'; error: string }
   | { kind: 'unknown' };
 
-export interface SendResult { result: BroadcastResult; txid: string; sign_ms: number; rebuilt: SendPlan | null }
+/** rebuild_error: the SLH-DSA rebuild of a refused ML-DSA-44 payment was due but could not be planned now (its error code). */
+export interface SendResult { result: BroadcastResult; txid: string; sign_ms: number; rebuilt: SendPlan | null; rebuild_error: string | null }
 
 export interface Sent {
   txid: string;

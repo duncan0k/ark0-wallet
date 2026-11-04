@@ -277,6 +277,7 @@ function ResultPanel({ result, onAgain, onActivity }: { result: SendResult; onAg
       {r.kind === 'sent' && <p class="muted">{s.sentBody}</p>}
       {r.kind === 'unknown' && <p class="muted">{s.unknownBody}</p>}
       {r.kind === 'rejected' && <pre class="node-says">{r.reason}</pre>}
+      {result.rebuild_error && <Notice tone="warn">{m().pq2.rebuildLater}</Notice>}
       {r.kind === 'failed' && <p class="muted">{errorText(r.error)}</p>}
       <div class="txid-box">
         <Mono title={result.txid}>{result.txid}</Mono>

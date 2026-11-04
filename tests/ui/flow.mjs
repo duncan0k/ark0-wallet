@@ -157,6 +157,20 @@ await test('after a rebuild the review can be cancelled', async (browser) => {
   await page.waitForSelector('.modal', { state: 'detached', timeout: 2000 });
 });
 
+await test('a refusal whose rebuild could not be planned says so', async (browser) => {
+  const reason = 'mempool-script-verify-flag-failed (ML-DSA-44 signature checks are disabled in this leaf)';
+  const { page, errors } = await open(browser, (cmd) => {
+    if (cmd === 'plan_send') return plan('first', 'mldsa44');
+    if (cmd === 'confirm_send') return { result: { kind: 'rejected', reason }, txid: 'b'.repeat(64), sign_ms: 900, rebuilt: null, rebuild_error: 'limit' };
+    return common(cmd);
+  });
+  await reviewFromPq2(page);
+  await page.locator('.modal button', { hasText: 'Confirm' }).click();
+  await page.waitForSelector('text=could not be planned just now', { timeout: 3000 });
+  await page.waitForSelector(`text=${reason}`);
+  assert(errors.length === 0, errors.join('; '));
+});
+
 await test('a failed confirmation leaves the review usable', async (browser) => {
   const { page } = await open(browser, (cmd) => {
     if (cmd === 'plan_send') return plan('first', 'slhdsa128s');

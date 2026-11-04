@@ -173,6 +173,7 @@ export const zhHant: Messages = {
     changeBlocked: '之前付款的 20 個找零地址還沒在網路上出現，所以這筆付款只能不帶找零：請選擇「全部」，或等之前的付款進塊。',
     rebuiltBefore: '傳送之前，節點開始報告 pq2 地址中的 ML-DSA-44 檢查已關閉。那筆付款沒有發出。這裡改用 SLH-DSA 重新產生，手續費也重算了：請核對後確認。',
     rebuiltRefused: '節點拒絕了這筆付款，並且現在報告 pq2 地址中的 ML-DSA-44 檢查已關閉。這裡用同樣的幣改用 SLH-DSA 重新產生，手續費也重算了：請核對後確認。兩筆之中只有一筆能成功。',
+    rebuildLater: '節點拒絕了這筆付款，並且現在報告 pq2 地址中的 ML-DSA-44 檢查已關閉。暫時無法改用 SLH-DSA 重新產生：請在「紀錄」裡重新開始。',
     rebuild: '改用 SLH-DSA 重新付款',
     rebuildNote: '這筆用 ML-DSA-44 的付款沒有成功，節點現在報告 pq2 地址中的 ML-DSA-44 檢查已關閉。可以用同樣的幣改用 SLH-DSA 重新付款；兩筆之中只有一筆能成功。',
     network: 'pq2 地址（M4）',
