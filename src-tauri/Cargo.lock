@@ -99,7 +99,7 @@ dependencies = [
 
 [[package]]
 name = "ark0-wallet"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "aes-gcm",
  "argon2",
