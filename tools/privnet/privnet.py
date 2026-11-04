@@ -270,10 +270,15 @@ def drill():
 
 
 def on_every_node(method, height):
+    """invalidateblock or reconsiderblock of the block at HEIGHT on every node. The block's hash is the one
+    invalidated last (kept in network.json): after invalidateblock no node has a block at that height."""
     net = network()
     out = {}
+    if method == "invalidateblock":
+        net["invalidated"] = cli("n1", "getblockhash", height, net=net)
+        save_network(net)
+    block = net["invalidated"]
     for n in NODES:
-        block = cli(n, "getblockhash", height, net=net)
         cli(n, method, block, net=net)
         out[n] = {"block": block, "tip": cli(n, "getblockcount", net=net)}
     return out

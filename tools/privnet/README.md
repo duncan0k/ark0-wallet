@@ -62,6 +62,17 @@ spend that waits, signed, right before it is recorded and sent, until `held-go` 
 The first step on a data directory makes the wallet as the create flow does, from fixed words (with `restore`
 in the arguments, restored from them; with `legacy`, from a web-wallet backup code); later steps unlock it.
 
+## The site's limits
+
+The sites run with the limits of the deployed site, except those it reads from its settings for browsers
+(`RATE_*`, `FRESH_STATE_*`, raised here). Two that it does not read apply as on Ark-0, and every step here
+comes from one visitor, 127.0.0.1: `/api/utxos` takes 20 lookups from a visitor at once and one a second after
+that, and the node's UTXO scans 10 at once and two a second for all visitors. On this network a refresh of the
+wallet looks up 7 addresses on each site, a plan 7 and its confirmation 13 more, so `checks.py` waits
+`PRIVNET_PACE` seconds (25) before each step and between a plan and its confirmation, as a person would; with
+no wait, a confirmation right after a plan is refused (`limit`). A recovery scan cannot be paced from outside:
+it makes one lookup per index, and stops at the eleventh.
+
 ## Building the app itself
 
 ```bash

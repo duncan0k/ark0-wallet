@@ -22,6 +22,10 @@ import privnet  # noqa: E402
 from privnet import H4T, MARGIN, cli, mine, path  # noqa: E402
 
 WALLET_SRC = os.environ.get("PRIVNET_WALLET_SRC", "")
+# Seconds a person takes before each step and between a plan and its confirmation. The site lets one visitor
+# (here every step, from 127.0.0.1) look up 20 addresses at once and one a second after that; a refresh looks
+# up 7 here, a plan 7 and its confirmation 13 more (README.md, "The site's limits").
+PACE = int(os.environ.get("PRIVNET_PACE", "25"))
 OPENS = H4T + MARGIN
 RESULTS = {}
 
@@ -45,7 +49,9 @@ def step(name, label, wallet="wallet-created", config="wallet-ab.json", signal=N
                ARK0_PRIVNET_STEP=name, ARK0_PRIVNET_ARGS=json.dumps(args), ARK0_PRIVNET_OUT=out)
     if signal:
         env["ARK0_PRIVNET_SIGNAL"] = signal
+    env["ARK0_PRIVNET_PACE"] = str(PACE)
     os.makedirs(path(wallet), exist_ok=True)
+    time.sleep(PACE)
     run = subprocess.run(["cargo", "test", "--locked", "-j", "4", "--features", "privnet", "--lib", "--",
                           "--exact", "app::privnet_e2e::privnet_e2e", "--nocapture"],
                          cwd=WALLET_SRC, env=env, capture_output=True, text=True)

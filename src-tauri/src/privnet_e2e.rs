@@ -67,6 +67,14 @@ fn confirm(state: &AppState, id: &str) -> Value {
     run(send_plan(state, id, Some("en"), |_| std::future::ready(true)))
 }
 
+/// A person's pause between reading a plan and confirming it (ARK0_PRIVNET_PACE seconds, 0 by default): the
+/// site lets one visitor look up 20 addresses at once and one a second after that, and a plan and its
+/// confirmation together come close to it.
+fn review() {
+    let seconds: u64 = std::env::var("ARK0_PRIVNET_PACE").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+    std::thread::sleep(Duration::from_secs(seconds));
+}
+
 fn step(state: &AppState, name: &str, args: &Value) -> Value {
     match name {
         "overview" => run(overview_of(state)),
@@ -86,6 +94,7 @@ fn step(state: &AppState, name: &str, args: &Value) -> Value {
         "send" => match plan(state, args) {
             Ok(view) => {
                 let id = view.id.clone();
+                review();
                 json!({"plan": view, "send": confirm(state, &id)})
             }
             Err(f) => json!({"plan": {"error": f.code}}),
@@ -108,10 +117,12 @@ fn step(state: &AppState, name: &str, args: &Value) -> Value {
                 }
             }));
             let id = view.id.clone();
+            review();
             let sent = tauri::async_runtime::block_on(send_plan(state, &id, Some("en"), |_| std::future::ready(true)));
             let records: Vec<Sent> = store::load(&state.sent_path());
             let mut out = json!({"plan": view, "send": now_json(sent.as_ref().map(|r| r).map_err(|f| Failure::new(&f.code))), "records": records});
             if let Ok(SendResult { rebuilt: Some(rebuilt), .. }) = &sent {
+                review();
                 out["rebuilt_send"] = confirm(state, &rebuilt.id);
             }
             out
