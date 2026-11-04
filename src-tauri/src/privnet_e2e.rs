@@ -154,6 +154,20 @@ fn step(state: &AppState, name: &str, args: &Value) -> Value {
                 other => json!({"plan": now_json(other)}),
             }
         }
+        // A refresh, a plan and its confirmation at once, as a person who confirms without reading, each timed.
+        "timed_send" => {
+            let started = Instant::now();
+            let overview = run(overview_of(state));
+            let refreshed = started.elapsed().as_secs_f64();
+            let planned = plan(state, args);
+            let plan_seconds = started.elapsed().as_secs_f64() - refreshed;
+            let Ok(view) = planned else { return json!({"overview": overview, "plan": now_json(planned)}) };
+            let id = view.id.clone();
+            let confirming = Instant::now();
+            let sent = confirm(state, &id);
+            json!({"refresh_seconds": refreshed, "plan_seconds": plan_seconds, "confirm_seconds": confirming.elapsed().as_secs_f64(),
+                   "plan": view, "send": sent})
+        }
         other => json!({"error": format!("no step {other}")}),
     }
 }
