@@ -17,6 +17,7 @@ import sys
 import threading
 import time
 
+sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import privnet  # noqa: E402
 from privnet import H4T, MARGIN, cli, mine, path  # noqa: E402
