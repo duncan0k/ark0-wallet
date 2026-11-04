@@ -2238,6 +2238,9 @@ async fn send_plan<F: Future<Output = bool>>(
             }
         }
     }
+    // Whether the rebuild failed, succeeded or was not tried: a confirmation whose wallet was locked at any point
+    // ends locked (its record, written while the session was current, stays; a lock leaves no plan kept).
+    state.current(&snapshot)?;
     Ok(SendResult { result, txid: signed.txid, sign_ms, rebuilt, rebuild_error })
 }
 
@@ -7062,6 +7065,31 @@ mod pq2_tests {
         let activity = block(activity_of(&w.state)).unwrap();
         assert!(activity.iter().any(|a| a.sent.txid == result.txid && a.rebuild));
         assert_eq!(block(rebuild_plan(&w.state, &result.txid)).unwrap().signature, Path::Slhdsa128s);
+    }
+
+    #[test]
+    fn a_lock_while_the_rebuild_after_a_refusal_waits_ends_the_confirmation_locked() {
+        let (w, address) = funded("rebuild-locked");
+        let view = block(plan_pq2_payment(&w.state, address, elsewhere(), "0.001".into(), Some(Path::Mldsa44), None)).unwrap();
+        *guard(&w.net.refuse) = Some("mempool-script-verify-flag-failed (ML-DSA-44 signature checks are disabled in this leaf)".into());
+        *guard(&w.net.on_broadcast) = Some(m4_state(H4T + 11, true));
+        // After the commit: the state query right after the refusal passes; the wallet is locked during the
+        // rebuild's first wait on the network.
+        *guard(&w.state.before_commit) = Some(Box::new(|state: &AppState| {
+            let mut answers = 0;
+            *guard(&state.after_network_answer) = Some(Box::new(move |state: &AppState| {
+                answers += 1;
+                if answers == 2 {
+                    state.lock();
+                }
+            }));
+        }));
+        let result = block(send_plan(&w.state, &view.id, Some("en"), |_| std::future::ready(true)));
+        *guard(&w.state.after_network_answer) = None;
+        assert_eq!(result.err().map(|f| f.code), Some("locked".to_string()));
+        let records: Vec<Sent> = store::load(&w.state.sent_path());
+        assert_eq!(records[0].status, "rejected");
+        assert!(guard(&w.state.pending).is_none());
     }
 
     #[test]
