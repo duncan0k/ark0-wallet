@@ -5524,6 +5524,52 @@ mod pq2_tests {
         history_ok: Arc<Mutex<Option<usize>>>,
         /// Paths answered once "too many requests" (429 limit, Retry-After 2) before they are answered.
         limited_once: Arc<Mutex<Vec<String>>>,
+        /// When set, the deployed site's limits, on a clock of this unit per second.
+        limits: Arc<Mutex<Option<SiteLimits>>>,
+    }
+
+    /// The deployed site's limits (web/ark0web/wallet.py): /api/utxos 20 at once and 1 a second per visitor
+    /// (429 limit, Retry-After 5), the node's scans 10 at once and 2 a second for all (503 busy, Retry-After
+    /// 5), /api/history 20 at once and 1 a second per visitor. Both test sources share them: stricter than
+    /// two sites.
+    struct SiteLimits {
+        unit: Duration,
+        utxos: Bucket,
+        scans: Bucket,
+        history: Bucket,
+        /// Requests refused, by path kind.
+        refused: Vec<String>,
+    }
+
+    struct Bucket {
+        tokens: f64,
+        burst: f64,
+        rate: f64,
+        at: Instant,
+    }
+
+    impl Bucket {
+        fn new(burst: f64, rate: f64) -> Bucket {
+            Bucket { tokens: burst, burst, rate, at: Instant::now() }
+        }
+
+        fn take(&mut self, unit: Duration) -> bool {
+            let now = Instant::now();
+            self.tokens = (self.tokens + now.duration_since(self.at).as_secs_f64() / unit.as_secs_f64() * self.rate).min(self.burst);
+            self.at = now;
+            if self.tokens >= 1.0 {
+                self.tokens -= 1.0;
+                true
+            } else {
+                false
+            }
+        }
+    }
+
+    impl SiteLimits {
+        fn deployed(unit: Duration) -> SiteLimits {
+            SiteLimits { unit, utxos: Bucket::new(20.0, 1.0), scans: Bucket::new(10.0, 2.0), history: Bucket::new(20.0, 1.0), refused: Vec::new() }
+        }
     }
 
     struct Wallet {
@@ -5549,6 +5595,26 @@ mod pq2_tests {
             if let Some(i) = limited.iter().position(|p| path.starts_with(p.as_str())) {
                 limited.remove(i);
                 return crate::api::tests::response_with(429, "Retry-After: 2\r\n", r#"{"error":"limit"}"#);
+            }
+        }
+        if let Some(limits) = guard(&net.limits).as_mut() {
+            let unit = limits.unit;
+            let refusal = if path.starts_with("/api/utxos") {
+                if !limits.utxos.take(unit) {
+                    Some((429, r#"{"error":"limit"}"#))
+                } else if !limits.scans.take(unit) {
+                    Some((503, r#"{"error":"busy"}"#))
+                } else {
+                    None
+                }
+            } else if path.starts_with("/api/history") && !limits.history.take(unit) {
+                Some((429, r#"{"error":"limit"}"#))
+            } else {
+                None
+            };
+            if let Some((status, body)) = refusal {
+                limits.refused.push(format!("{status} {}", path.split('?').next().unwrap_or("")));
+                return crate::api::tests::response_with(status, "Retry-After: 5\r\n", body);
             }
         }
         if path == "/api/state" {
@@ -6200,6 +6266,30 @@ mod pq2_tests {
         });
         let book: Book = serde_json::from_slice(&std::fs::read(w.state.pq2_path()).unwrap()).unwrap();
         assert!(book.chains.iter().all(|c| c.handed_out.is_empty() && c.issued == 0));
+    }
+
+    #[test]
+    fn a_restored_wallet_completes_its_scan_within_the_sites_limits() {
+        let unit = Duration::from_millis(10);
+        let w = wallet_waiting("scan-limits", words(0x7a), false, m4_state(H4T + 100, false), Some(unit));
+        // Coins on receiving indices 0 and 5 (one confirmed long ago, one on its way) and change index 2.
+        guard(&w.net.history).insert(pq2_address(&w, 0, 0), H4T + 20);
+        guard(&w.net.utxos).insert(pq2_address(&w, 0, 0), vec![utxo('a', 0, 10_000, H4T + 20)]);
+        guard(&w.net.incoming).insert(pq2_address(&w, 0, 5), vec![json!({"txid": "b".repeat(64), "vout": 1, "sats": 20_000})]);
+        guard(&w.net.history).insert(pq2_address(&w, 1, 2), H4T + 30);
+        guard(&w.net.utxos).insert(pq2_address(&w, 1, 2), vec![utxo('c', 0, 30_000, H4T + 30)]);
+        *guard(&w.net.limits) = Some(SiteLimits::deployed(unit));
+        let r = block(scan_pq2(&w.state, false)).unwrap();
+        let refused = guard(&w.net.limits).as_ref().unwrap().refused.clone();
+        // Every coin found, the site refused along the way and the wallet waited instead of failing.
+        assert_eq!(r.found, 3);
+        let book = w.state.book().unwrap();
+        assert!(book.chains[0].used.contains(&0) && book.chains[0].used.contains(&5) && book.chains[1].used.contains(&2));
+        assert!(!book.scan_needed);
+        assert!(refused.iter().any(|r| r.starts_with("503")) && refused.iter().any(|r| r.starts_with("429")), "{refused:?}");
+        // Then an address is handed out, past the reserved range.
+        *guard(&w.net.limits) = None;
+        assert_eq!(block(new_pq2_address(&w.state)).unwrap().index, r.issued[0]);
     }
 
     #[test]
