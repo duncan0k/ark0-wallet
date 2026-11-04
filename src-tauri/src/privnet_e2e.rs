@@ -95,6 +95,16 @@ fn step(state: &AppState, name: &str, args: &Value) -> Value {
         }
         // A plan only: what the review offers.
         "plan" => now_json(plan(state, args)),
+        // A plan from one of the fixed accounts ("kind": schnorr, mldsa44 or mixed).
+        "plan_account" => {
+            let s = |k: &str| args.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
+            let kind = match s("kind").as_str() {
+                "schnorr" => Kind::Schnorr,
+                "mixed" => Kind::Mixed,
+                _ => Kind::Mldsa44,
+            };
+            now_json(tauri::async_runtime::block_on(plan_payment(state, kind, s("to"), s("amount"))))
+        }
         // A plan, confirmed at once.
         "send" => match plan(state, args) {
             Ok(view) => {

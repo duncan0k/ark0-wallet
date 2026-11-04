@@ -299,6 +299,29 @@ def check6b():
            activity_item=item, offers=offers, rebuild=rebuild, txid=txid)
 
 
+def check10():
+    """Below H4T + 6: a restored wallet's scan keeps its empty pq2 addresses, and a payment from its funded
+    ML-DSA-44 account to one of them is refused (no pq2 output before pq2 opens)."""
+    mine_to(OPENS - 4)
+    scan = step("scan", "c10-scan", wallet="wallet-gate", restore=True)
+    overview = step("overview", "c10-overview", wallet="wallet-gate", restore=True)
+    mldsa44 = next(a["address"] for a in overview["ok"]["accounts"] if a["kind"] == "mldsa44")
+    funding = privnet.pay(mldsa44, "0.002")
+    mined = mine(1)
+    kept = step("overview", "c10-overview-funded", wallet="wallet-gate", restore=True)
+    spendable = next(a["spendable"] for a in kept["ok"]["accounts"] if a["kind"] == "mldsa44")
+    with open(path("wallet-gate", "pq2.json")) as f:
+        book = json.load(f)
+    reserved = sorted(int(i) for i in book["chains"][0]["addresses"] if int(i) not in book["chains"][0]["handed_out"])
+    to = book["chains"][0]["addresses"][str(reserved[3])]
+    plan = step("plan_account", "c10-plan", wallet="wallet-gate", restore=True, kind="mldsa44", to=to, amount="0.001")
+    ok = (scan.get("scan", {}).get("ok") is not None and spendable == 200_000 and tip() < OPENS
+          and plan == {"error": "destination_not_ready"})
+    record("10", ok, f"tip {tip()} (below {OPENS}): scan {scan.get('scan')}, ML-DSA-44 account funded {funding} at {mined} "
+           f"({spendable} sat); a payment from it to kept pq2 index {reserved[3]}: {plan}",
+           scan=scan, funding=funding, kept_index=reserved[3], to=to, plan=plan)
+
+
 def check9():
     """At H4T + 6, after check 2: the same words restored on another device (not made here). Its recovery scan
     completes within the site's limits, finds every index check 2 paid, and an address is then issued."""
@@ -315,7 +338,7 @@ def check9():
            seconds=scan.get("seconds"), scan=scan, pq2=pq2(overview), address=address)
 
 
-CHECKS = {"1": check1, "3": check3, "2": check2, "9": check9, "4": check4, "5": check5, "6": check6, "6b": check6b, "7": check7, "8": check8}
+CHECKS = {"10": check10, "1": check1, "3": check3, "2": check2, "9": check9, "4": check4, "5": check5, "6": check6, "6b": check6b, "7": check7, "8": check8}
 
 
 def main():
