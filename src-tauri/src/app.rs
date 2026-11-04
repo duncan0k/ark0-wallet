@@ -1264,7 +1264,10 @@ async fn pq2_overview(state: &AppState, bound: Option<&Bound>, chain: &Chain, so
                 view.complete = false;
                 continue;
             }
-            let found = flags.take(sources.coins(&address).await);
+            let answer = sources.coins(&address).await;
+            // The two sources disagreeing on the address's coins: its view may be incomplete.
+            let disagree = answer.flags.disagree;
+            let found = flags.take(answer);
             state.answered(bound)?;
             remember(state, bound.generation, &address, &found);
             let Ok(coins) = found else {
@@ -1285,7 +1288,7 @@ async fn pq2_overview(state: &AppState, bound: Option<&Bound>, chain: &Chain, so
                 list.push(Pq2CoinView { txid: i.txid.clone(), vout: i.vout, sats: i.sats, height: None, status: Pq2Status::Pending, spending: false });
             }
             let incoming: u64 = coins.incoming.iter().map(|i| i.sats).sum();
-            let complete = coins.incoming_complete && !coins.truncated;
+            let complete = coins.incoming_complete && !coins.truncated && !disagree;
             view.complete &= complete;
             view.spendable += sum(&coins.spendable);
             view.pending += sum(&coins.pending);
@@ -1336,12 +1339,14 @@ async fn overview_of(state: &AppState) -> Res<Overview> {
     let mut accounts = Vec::new();
     for t in [schnorr, mldsa44, mixed] {
         // Coins are looked up for every address, shown or not: the seed alone makes it, and coins may be there.
-        let found = flags.take(sources.coins(&t.address).await);
+        let answer = sources.coins(&t.address).await;
+        let disagree = answer.flags.disagree;
+        let found = flags.take(answer);
         state.current(&snapshot)?;
         remember(state, snapshot.generation, &t.address, &found);
         let sum = |c: &[Coin]| c.iter().map(|c| c.sats).sum::<u64>();
         let (spendable, pending, incoming, n, complete) = match &found {
-            Ok(c) => (sum(&c.spendable), sum(&c.pending), c.incoming.iter().map(|i| i.sats).sum(), c.spendable.len(), c.incoming_complete && !c.truncated),
+            Ok(c) => (sum(&c.spendable), sum(&c.pending), c.incoming.iter().map(|i| i.sats).sum(), c.spendable.len(), c.incoming_complete && !c.truncated && !disagree),
             Err(_) => (0, 0, 0, 0, false),
         };
         let ready = shown(t.kind, &chain);
@@ -5672,6 +5677,8 @@ mod pq2_tests {
         asked: Arc<Mutex<Vec<String>>>,
         /// When set, what the second source answers to /api/state (the first answers `state`).
         state_b: Arc<Mutex<Option<Value>>>,
+        /// When set, the second source's confirmed outputs by address, instead of `utxos`.
+        utxos_b: Arc<Mutex<Option<HashMap<String, Vec<Value>>>>>,
     }
 
     /// The deployed site's limits (web/ark0web/wallet.py): /api/utxos 20 at once and 1 a second per visitor
@@ -5894,9 +5901,16 @@ mod pq2_tests {
         let (a, stop_a) = { let n = net.clone(); routed(move |first, body| answer(&n, first, body)) };
         let (b, stop_b) = {
             let n = net.clone();
-            routed(move |first, body| match guard(&n.state_b).clone() {
-                Some(state) if first.split(' ').nth(1) == Some("/api/state") => response(200, &state.to_string()),
-                _ => answer(&n, first, body),
+            routed(move |first, body| {
+                let path = first.split(' ').nth(1).unwrap_or("");
+                if let Some(state) = guard(&n.state_b).clone().filter(|_| path == "/api/state") {
+                    return response(200, &state.to_string());
+                }
+                if let (Some(address), Some(utxos)) = (path.strip_prefix("/api/utxos?address="), guard(&n.utxos_b).clone()) {
+                    let listed = utxos.get(address).cloned().unwrap_or_default();
+                    return response(200, &json!({"utxos": listed, "unconfirmed": [], "unconfirmed_complete": true, "truncated": false}).to_string());
+                }
+                answer(&n, first, body)
             })
         };
         let (a, b) = match unit {
@@ -6585,6 +6599,31 @@ mod pq2_tests {
         guard(&w.net.utxos).insert(from.clone(), vec![utxo('6', 0, 500_000, H4T + 7)]);
         block(plan_pq2_payment(&w.state, from, kept, "0.001".into(), None, None)).unwrap();
         assert_eq!(guard(&w.state.pending).take().unwrap().plan.lock_time, H4T);
+    }
+
+    #[test]
+    fn a_coin_one_source_does_not_list_yet_stays_in_view_and_is_never_spent() {
+        // A watched pq2 address with one confirmed output; the second source, a block behind, lists nothing.
+        let w = wallet("one-source-coin", words(0x7e), true, m4_state(H4T + 10, false));
+        let address = block(new_pq2_address(&w.state)).unwrap().address;
+        guard(&w.net.utxos).insert(address.clone(), vec![utxo('a', 0, 100_000, H4T + 9)]);
+        *guard(&w.net.utxos_b) = Some(HashMap::new());
+        let o = block(overview_of(&w.state)).unwrap();
+        let p = o.pq2.unwrap();
+        // The row stays, the coin is shown as on its way, the view says it may be incomplete; nothing spendable.
+        let row = p.addresses.iter().find(|a| a.address == address).expect("the address row");
+        assert_eq!((row.spendable, row.incoming), (0, 100_000));
+        assert_eq!(row.coins.len(), 1);
+        assert_eq!(row.coins[0].status, Pq2Status::Pending);
+        assert!(!row.complete && !p.complete);
+        assert_eq!(p.spendable, 0);
+        // Nothing spends it.
+        assert_eq!(block(plan_pq2_payment(&w.state, address.clone(), elsewhere(), "0.0001".into(), None, None)).unwrap_err().code, "no_coins");
+        // Both list it: spendable, and complete again.
+        *guard(&w.net.utxos_b) = None;
+        let p = block(overview_of(&w.state)).unwrap().pq2.unwrap();
+        assert_eq!(p.spendable, 100_000);
+        assert!(p.complete);
     }
 
     #[test]

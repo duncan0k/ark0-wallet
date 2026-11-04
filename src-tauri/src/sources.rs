@@ -1,5 +1,5 @@
 //! Two independently hosted APIs: what can be spent needs both, what may already have been paid needs either.
-use crate::api::{Api, ApiError, BroadcastResult, CheckResult, Coin, Coins, History, TxStatus};
+use crate::api::{Api, ApiError, BroadcastResult, CheckResult, Coin, Coins, History, Incoming, TxStatus};
 use crate::chain::{self, Chain, ChainProblem};
 use crate::proof;
 use std::collections::{HashMap, HashSet};
@@ -136,9 +136,17 @@ fn merge_coins(mut a: Coins, b: Coins) -> (Coins, bool) {
     let disagree = amounts(&a.spendable) != other || amounts(&a.pending) != amounts(&b.pending)
         || incoming(&a) != incoming(&b) || a.spent_by != b.spent_by || a.unnamed_spenders != b.unnamed_spenders
         || a.truncated != b.truncated || a.incoming_complete != b.incoming_complete;
+    // A confirmed coin only one source lists at all (say the other is a block behind) is shown as not yet
+    // confirmed by both: among the payments on their way, which are never spent, and never as spendable.
+    let listed = |c: &Coins| c.spendable.iter().chain(&c.pending).map(Coin::outpoint).collect::<HashSet<_>>();
+    let (in_a, in_b) = (listed(&a), listed(&b));
+    let lone: Vec<Incoming> = a.spendable.iter().filter(|c| !in_b.contains(&c.outpoint()))
+        .chain(b.spendable.iter().filter(|c| !in_a.contains(&c.outpoint())))
+        .map(|c| Incoming { txid: c.txid.clone(), vout: c.vout, sats: c.sats })
+        .collect();
     a.spendable.retain(|c| other.get(&c.outpoint()) == Some(&c.sats));
     a.pending = union(a.pending, b.pending, Coin::outpoint);
-    a.incoming = union(a.incoming, b.incoming, |i| format!("{}:{}", i.txid, i.vout));
+    a.incoming = union(union(a.incoming, b.incoming, |i| format!("{}:{}", i.txid, i.vout)), lone, |i| format!("{}:{}", i.txid, i.vout));
     for (outpoint, txids) in b.spent_by { a.spent_by.entry(outpoint).or_default().extend(txids); }
     a.unnamed_spenders.extend(b.unnamed_spenders);
     a.incoming_complete &= b.incoming_complete;
@@ -491,9 +499,30 @@ pub(crate) mod tests {
             assert_eq!(found.pending.len(), 3);
             assert_eq!(found.pending.iter().map(|c| c.sats).sum::<u64>(), 15_000);
             assert_eq!(found.spent_by.len(), 3);
-            assert_eq!(found.incoming.len(), 3);
-            assert_eq!(found.incoming.iter().map(|i| i.sats).sum::<u64>(), 600);
+            // c, listed by one source only, is among the payments on their way, never spendable.
+            assert_eq!(found.incoming.len(), 4);
+            assert_eq!(found.incoming.iter().map(|i| i.sats).sum::<u64>(), 3_600);
+            assert!(found.incoming.iter().any(|i| i.txid == "c".repeat(64) && i.sats == 3_000));
             assert!(found.truncated && !found.incoming_complete);
+        }
+    }
+
+    #[test]
+    fn a_coin_only_one_source_lists_is_shown_on_its_way_never_spendable() {
+        // Source B a block behind: A lists a confirmed 100,000 sat output, B nothing; both answers complete.
+        let a = json!({"utxos": [utxo('a', 0, 100_000)], "unconfirmed": [], "unconfirmed_complete": true, "truncated": false});
+        let b = json!({"utxos": [], "unconfirmed": [], "unconfirmed_complete": true, "truncated": false});
+        for reverse in [false, true] {
+            let (a, b) = if reverse { (&b, &a) } else { (&a, &b) };
+            let (left, first) = serve(vec![response(200, &a.to_string())]);
+            let (right, second) = serve(vec![response(200, &b.to_string())]);
+            let answer = block_on(Sources::new(left, right).coins("tb1ztest"));
+            first.join().unwrap();
+            second.join().unwrap();
+            assert!(answer.flags.disagree);
+            let found = answer.value.unwrap();
+            assert!(found.spendable.is_empty() && found.pending.is_empty() && found.spent_by.is_empty());
+            assert_eq!(found.incoming, vec![Incoming { txid: "a".repeat(64), vout: 0, sats: 100_000 }]);
         }
     }
 
