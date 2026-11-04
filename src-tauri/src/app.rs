@@ -6419,11 +6419,17 @@ mod pq2_tests {
         assert_eq!((p.blocked, p.allowed, p.spend_allowed, p.opens_at), (Some("source_not_upgraded"), false, false, H4T + crate::chain::MARGIN));
         assert!(p.addresses.is_empty() && !p.complete);
         assert_eq!(block(new_pq2_address(&w.state)).unwrap_err().code, "pq2_source_not_upgraded");
-        // Listing one M4 deployment of the two is not that case: no pq2 view, as before.
-        let mut partial = m4_state(H4T + 10, false);
-        partial["deployments"].as_object_mut().unwrap().remove("p2mr_lattice_tripwire");
-        partial["tripwire"].as_object_mut().unwrap().remove("lattice");
-        *guard(&w.net.state_b) = Some(partial);
+        // A node of the release before M4-T lists OP_CHECKSLHDSA128S alone: the same reason.
+        let mut m4s = m4_state(H4T + 10, false);
+        m4s["deployments"].as_object_mut().unwrap().remove("p2mr_lattice_tripwire");
+        m4s["tripwire"].as_object_mut().unwrap().remove("lattice");
+        *guard(&w.net.state_b) = Some(m4s);
+        assert_eq!(block(overview_of(&w.state)).unwrap().pq2.unwrap().blocked, Some("source_not_upgraded"));
+        assert_eq!(block(new_pq2_address(&w.state)).unwrap_err().code, "pq2_source_not_upgraded");
+        // The lattice tripwire without OP_CHECKSLHDSA128S is no node's: no pq2 view, as before.
+        let mut odd = m4_state(H4T + 10, false);
+        odd["deployments"].as_object_mut().unwrap().remove("p2mr_slhdsa128s");
+        *guard(&w.net.state_b) = Some(odd);
         assert!(block(overview_of(&w.state)).unwrap().pq2.is_none());
         assert_eq!(block(new_pq2_address(&w.state)).unwrap_err().code, "address_not_ready");
         // Both upgraded: an address, as before.

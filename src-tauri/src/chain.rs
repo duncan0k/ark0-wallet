@@ -121,10 +121,11 @@ pub struct Chain {
     /// H4T + 6.
     pub pq2_spendable: bool,
     /// What the source lists of the two M4 deployments: Some(true) both, at this network's heights;
-    /// Some(false) neither; None anything else.
+    /// Some(false) not the lattice tripwire: neither, or OP_CHECKSLHDSA128S alone at its height (a node of the
+    /// release before M4-T); None anything else.
     pub m4_listed: Option<bool>,
-    /// Of the two sources, one lists both M4 deployments and the other neither (`Sources::state`): one node
-    /// has not upgraded, which is why there is no pq2.
+    /// Of the two sources, one lists both M4 deployments and the other has not upgraded (`m4_listed` false):
+    /// which is why there is no pq2.
     pub source_not_upgraded: bool,
 }
 
@@ -307,6 +308,7 @@ pub fn check(state: &Value) -> Result<Chain, ChainProblem> {
     let lattice_height = optional_buried(deployments, "p2mr_lattice_tripwire", net.h4t)?.filter(|_| slhdsa128s.is_some());
     let m4_listed = match (deployments.get("p2mr_slhdsa128s").is_some(), deployments.get("p2mr_lattice_tripwire").is_some()) {
         (false, false) => Some(false),
+        (true, false) if slhdsa128s.is_some() => Some(false),
         _ => lattice_height.map(|_| true),
     };
     // The state counts only for the height and leaf version the mixed address is built for, read at a
