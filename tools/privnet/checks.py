@@ -209,8 +209,10 @@ def check6():
     # possible without its hex; the API passed the node's reason on.
     mined = mine(1) if rebuilt_txid else None
     confirmed = {n: confirmations(n, rebuilt_txid) for n in ("n1", "n2")} if rebuilt_txid else {}
-    offers = step("plan", "c6-offers-plan", to=to, amount="0.0005", path="mldsa44", **{"from": a2})
     overview = step("overview", "c6-offers-overview")
+    # Asked for ML-DSA-44 from an address that still holds coins (the held coin may have gone in the rebuild).
+    holding = next(a["address"] for a in overview["ok"]["pq2"]["addresses"] if a["spendable"] > 0)
+    offers = step("plan", "c6-offers-plan", to=to, amount="0.0005", path="mldsa44", **{"from": holding})
     reason = result.get("reason") if isinstance(result, dict) and result.get("kind") == "rejected" else None
     # The node adds the input and the transaction after its message.
     expected = "mempool-script-verify-flag-failed (ML-DSA-44 signature checks are disabled in this leaf)"
@@ -234,13 +236,31 @@ def check7():
            pq2=pq2(overview), address=address)
 
 
+def wait_sites(height):
+    """Until sites A and B report this tip: the site keeps its view of the node for five seconds."""
+    for _ in range(200):
+        blocks = []
+        for site in "AB":
+            try:
+                body = subprocess.run(["curl", "-s", f"http://127.0.0.1:{privnet.SITES[site][1]}/api/state"], capture_output=True, text=True).stdout
+                blocks.append(json.loads(body).get("blocks"))
+            except ValueError:
+                blocks.append(None)
+        if blocks == [height, height]:
+            return
+        time.sleep(0.1)
+    raise SystemExit(f"the sites did not reach {height}")
+
+
 def check8():
     height = tip()
     invalidated = privnet.on_every_node("invalidateblock", OPENS)
+    wait_sites(OPENS - 1)
     below = step("overview", "c8-overview-invalidated")
     address_below = step("address", "c8-address-invalidated")
     reconsidered = privnet.on_every_node("reconsiderblock", OPENS)
     privnet.wait_synced(privnet.network(), height)
+    wait_sites(height)
     above = step("overview", "c8-overview-reconsidered")
     address_above = step("address", "c8-address-reconsidered")
     ok = (below["ok"]["pq2"]["blocked"] == "waiting" and address_below["address"] == {"error": "pq2_waiting"}
