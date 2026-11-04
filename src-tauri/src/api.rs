@@ -259,6 +259,11 @@ fn tls_config() -> rustls::ClientConfig {
         .with_no_client_auth()
 }
 
+/// A 503 that asks to try again later: the site is busy, or cannot reach its node.
+fn try_later(status: u16, body: &Value) -> bool {
+    status == 503 && matches!(body.get("error").and_then(Value::as_str), Some("busy" | "unavailable"))
+}
+
 pub struct Api {
     base: String,
     client: reqwest::Client,
@@ -329,6 +334,10 @@ impl Api {
 
     pub async fn coins(&self, address: &str) -> Result<Coins, ApiError> {
         let (status, body) = self.get(&format!("/api/utxos?address={address}")).await?;
+        // "Try later", as for history: the site is busy or cannot reach its node, which says nothing of the answer.
+        if try_later(status, &body) {
+            return Err(ApiError::Unreachable);
+        }
         coins_from(status, &body)
     }
 
@@ -346,7 +355,7 @@ impl Api {
             path.push_str(a);
         }
         let (status, body) = self.get(&path).await?;
-        if status == 503 && matches!(body.get("error").and_then(Value::as_str), Some("busy" | "unavailable")) {
+        if try_later(status, &body) {
             return Err(ApiError::Unreachable);
         }
         history_from(status, &body, addresses, from)
@@ -648,6 +657,23 @@ pub(crate) mod tests {
         let too_many: Vec<String> = (0..21).map(|i| format!("tb1z{i}")).collect();
         assert_eq!(tauri::async_runtime::block_on(api.history(&too_many, 0)), Err(ApiError::Malformed));
         assert_eq!(tauri::async_runtime::block_on(api.history(&["tb1z&x=1".to_string()], 0)), Err(ApiError::Malformed));
+    }
+
+    #[test]
+    fn a_coin_lookup_the_site_cannot_answer_now_is_unreachable_not_malformed() {
+        let (api, server) = serve(vec![
+            response(503, r#"{"error":"busy"}"#),
+            response(503, r#"{"error":"unavailable"}"#),
+            response(503, r#"{"error":"other"}"#),
+            response(500, r#"{"error":"internal"}"#),
+        ]);
+        let results = tauri::async_runtime::block_on(async {
+            let mut r = Vec::new();
+            for _ in 0..4 { r.push(api.coins("tb1zaa").await.map(|_| ())); }
+            r
+        });
+        server.join().unwrap();
+        assert_eq!(results, [Err(ApiError::Unreachable), Err(ApiError::Unreachable), Err(ApiError::Malformed), Err(ApiError::Malformed)]);
     }
 
     pub(crate) fn utxo(txid: char, vout: u32, sats: u64) -> Value {
